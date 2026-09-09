@@ -23,11 +23,30 @@ X11 forwarding, and no need to copy the PDF to your local machine first.
 
 ## Screenshots
 
-| | |
-| --- | --- |
-| ![Fit to width](docs/screenshots/pdfless-width-fit.png)<br>Fit to width (default) | ![Fit to height](docs/screenshots/pdfless-height-fit.png)<br>Fit to height (`-h`) |
-| ![Zoomed in](docs/screenshots/pdfless-zoom.png)<br>Zoomed in and panned | ![Search in PDF mode](docs/screenshots/pdfless-search-pdf-mode.png)<br>Search — PDF mode, match boxed |
-| ![Search in text mode](docs/screenshots/pdfless-search-text-mode.png)<br>Search — text mode, match highlighted | |
+<p align="center">
+  <img src="docs/screenshots/pdfless-width-fit.png" alt="Fit to width"><br>
+  <em>Fit to width (default)</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-height-fit.png" alt="Fit to height"><br>
+  <em>Fit to height (<code>-h</code>)</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-zoom.png" alt="Zoomed in"><br>
+  <em>Zoomed in and panned</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-search-pdf-mode.png" alt="Search in PDF mode"><br>
+  <em>Search — PDF mode, match boxed</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-search-text-mode.png" alt="Search in text mode"><br>
+  <em>Search — text mode, match highlighted</em>
+</p>
 
 ## Requirements
 

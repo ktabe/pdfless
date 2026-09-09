@@ -14,11 +14,30 @@
 
 ## スクリーンショット
 
-| | |
-| --- | --- |
-| ![横幅に合わせる](docs/screenshots/pdfless-width-fit.png)<br>横幅に合わせる（デフォルト） | ![縦幅に合わせる](docs/screenshots/pdfless-height-fit.png)<br>縦幅に合わせる（`-h`） |
-| ![ズームイン](docs/screenshots/pdfless-zoom.png)<br>ズームイン + パン | ![PDFモードでの検索](docs/screenshots/pdfless-search-pdf-mode.png)<br>検索 — PDFモード（枠でマーク） |
-| ![テキストモードでの検索](docs/screenshots/pdfless-search-text-mode.png)<br>検索 — テキストモード（ハイライト表示） | |
+<p align="center">
+  <img src="docs/screenshots/pdfless-width-fit.png" alt="横幅に合わせる"><br>
+  <em>横幅に合わせる（デフォルト）</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-height-fit.png" alt="縦幅に合わせる"><br>
+  <em>縦幅に合わせる（<code>-h</code>）</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-zoom.png" alt="ズームイン"><br>
+  <em>ズームイン + パン</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-search-pdf-mode.png" alt="PDFモードでの検索"><br>
+  <em>検索 — PDFモード（枠でマーク）</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-search-text-mode.png" alt="テキストモードでの検索"><br>
+  <em>検索 — テキストモード（ハイライト表示）</em>
+</p>
 
 ## 必要なもの
 
