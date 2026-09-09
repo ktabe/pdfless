@@ -149,7 +149,7 @@ Keys (mirroring less(1)):
   u ^U              backward half window
   g / G / HOME / END      jump to first / last page of the document
   <N> g                   jump straight to page N
-  n / p                   next / previous page
+  n / p                   next / previous page (match while searching)
   PAGEUP / PAGEDOWN       backward / forward one window
   + / -                   zoom in / out
   0                       reset zoom and pan
@@ -187,10 +187,19 @@ def die(msg):
     sys.exit(1)
 
 
+POPPLER_INSTALL_HINT = (
+    "install poppler (e.g. apt install poppler-utils, brew install poppler)"
+)
+
+
 def check_deps():
     for tool in ("pdftoppm", "pdfinfo"):
         if shutil.which(tool) is None:
-            die(f"requires poppler's '{tool}' (brew install poppler)")
+            die(f"requires poppler's '{tool}' ({POPPLER_INSTALL_HINT})")
+
+    r = subprocess.run(["pdftoppm", "-h"], capture_output=True, text=True)
+    if "-png" not in r.stdout + r.stderr:
+        die(f"pdftoppm is not poppler-compatible ({POPPLER_INSTALL_HINT})")
 
 
 def pdf_page_count(pdf_path):
@@ -493,6 +502,34 @@ def wrap_for_tmux(osc):
     return f"\x1bPtmux;{escaped}\x1b\\"
 
 
+def iterm2_like():
+    """True when running under iTerm2 (or a close OSC-1337 clone)."""
+    if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+        return True
+    if os.environ.get("ITERM_SESSION_ID"):
+        return True
+    return "iterm" in os.environ.get("LC_TERMINAL", "").lower()
+
+
+def _format_ech_clear(char_w, char_h):
+    """Erase `char_w` x `char_h` cells at the home position (ECH/CUU)."""
+    out = ["\x1b[H"]
+    for i in range(char_h):
+        out.append(f"\x1b[{char_w}X")
+        if i < char_h - 1:
+            out.append("\x1b[1B")
+    if char_h > 0:
+        out.append(f"\x1b[{char_h}A")
+    return "".join(out)
+
+
+def _strip_leading_home(s):
+    home = "\x1b[H"
+    if s.startswith(home):
+        return s[len(home):]
+    return s
+
+
 class PageCache:
     def __init__(self, pdf_path, tmpdir, size=CACHE_SIZE):
         self.pdf_path = pdf_path
@@ -534,6 +571,28 @@ class PageCache:
         return img
 
 
+class EncodeCache:
+    """Cache JPEG/PNG payloads keyed by viewport position."""
+
+    def __init__(self, size=CACHE_SIZE * 4):
+        self.size = size
+        self._cache = OrderedDict()  # encode_key -> bytes
+
+    def clear(self):
+        self._cache.clear()
+
+    def get(self, key):
+        if key not in self._cache:
+            return None
+        self._cache.move_to_end(key)
+        return self._cache[key]
+
+    def put(self, key, data):
+        self._cache[key] = data
+        if len(self._cache) > self.size:
+            self._cache.popitem(last=False)
+
+
 class Viewer:
     def __init__(self, pdf_path, npages, page, tmpdir, fd, fit="width", frame=True):
         self.pdf_path = pdf_path
@@ -543,6 +602,7 @@ class Viewer:
         self.fd = fd
         self.fit = fit
         self.cache = PageCache(pdf_path, tmpdir)
+        self.encode_cache = EncodeCache()
         self.scroll = 0
         self.zoom = 1.0
         self.resized = True
@@ -572,6 +632,11 @@ class Viewer:
         # text mode; can be swept up along with the text if you
         # select-and-copy it, so it's toggled off with --no-frame or
         # the f key
+        self._last_viewport_w = 0
+        self._last_viewport_h = 0
+        self._last_viewport_set = False
+        self._last_char_h = 0
+        self._last_marker_bounds = None  # (row0, col0, row1, col1) or None
 
     def request_resize(self):
         self.resized = True
@@ -592,8 +657,13 @@ class Viewer:
         self.cell_w_px = cell_w
         self.avail_height_px = cell_h * max(1, rows - 1)
         self.cache.clear()
+        self.encode_cache.clear()
+        self._last_viewport_set = False
+        self._last_char_h = 0
+        self._last_marker_bounds = None
 
     def _load_page(self):
+        self.encode_cache.clear()
         if self.fit == "height":
             target_height = max(1, round(self.avail_height_px * self.zoom))
             self.img = self.cache.get(self.page, target_height, fit="height")
@@ -648,10 +718,14 @@ class Viewer:
 
     def hide_help(self):
         self.help_active = False
+        self._last_viewport_set = False  # help chars overlay the page
+        self._last_marker_bounds = None
         self.refresh()
 
     def enter_text_mode(self):
         self.text_mode = True
+        self._last_viewport_set = False
+        self._last_marker_bounds = None
         self._load_text_page()
         # If there's a search match highlighted/boxed on this same page,
         # follow it across into text mode too, scrolled into view.
@@ -662,6 +736,8 @@ class Viewer:
 
     def exit_text_mode(self):
         self.text_mode = False
+        self._last_viewport_set = False
+        self._last_marker_bounds = None
         # self.page may have moved while browsing in text mode (n/p, g/G,
         # <N>g all update it), but self.img was never touched during that
         # - refresh() only reloads it on a resize - so without this it'd
@@ -981,9 +1057,9 @@ class Viewer:
             start_col = (left_col if left_visible else content_start) + 1
             out.append(f"\x1b[{screen_row};{start_col}H{''.join(parts)}")
 
+        out.append(self.format_status())
         sys.stdout.write("".join(out))
         sys.stdout.flush()
-        self.draw_status()
 
     def _draw_help(self):
         # Overlay the help as a boxed panel centered over the page, instead
@@ -1011,34 +1087,101 @@ class Viewer:
         sys.stdout.flush()
         self.draw_status("q to close help")
 
+    def _encode_crop(self, crop):
+        buf = io.BytesIO()
+        if iterm2_like():
+            # JPEG encodes much faster than PNG; iTerm2 accepts it inline.
+            crop.convert("RGB").save(buf, format="JPEG", quality=90)
+        else:
+            crop.save(buf, format="PNG", compress_level=1)
+        return buf.getvalue()
+
+    def _format_viewport_clear(self, crop_w, crop_h, full_clear):
+        char_w = max(1, -(-crop_w // self.cell_w_px))
+        char_h = max(1, -(-crop_h // self.cell_h_px))
+        prev_char_h = self._last_char_h or char_h
+
+        if full_clear:
+            self._last_char_h = char_h
+            return "\x1b[H\x1b[2J"
+
+        out = ["\x1b[H"]
+        if self._last_viewport_set and crop_h > self._last_viewport_h:
+            out.append(_strip_leading_home(_format_ech_clear(char_w, char_h)))
+        if prev_char_h > char_h:
+            for row in range(char_h, min(prev_char_h, self.rows - 1)):
+                out.append(f"\x1b[{row + 1};1H\x1b[2K")
+        total_rows = max(1, -(-self.avail_height_px // self.cell_h_px))
+        blank_from = char_h
+        if prev_char_h > char_h:
+            blank_from = max(char_h, prev_char_h)
+        for row in range(blank_from, min(self.rows - 1, total_rows)):
+            out.append(f"\x1b[{row + 1};1H\x1b[2K")
+        self._last_char_h = char_h
+        return "".join(out)
+
+    def _needs_full_clear(self, crop_w, crop_h):
+        if not self._last_viewport_set:
+            return True
+        if self._last_viewport_w != crop_w:
+            return True
+        if crop_h > self._last_viewport_h:
+            return True
+        return False
+
     def _draw(self):
         crop_bottom = min(self.scroll + self.avail_height_px, self.img.height)
         crop = self.img.crop(
             (self.x_offset, self.scroll, self.x_offset + self.crop_width, crop_bottom)
         )
+        crop_w, crop_h = crop.width, crop.height
 
-        buf = io.BytesIO()
-        crop.save(buf, format="PNG", compress_level=1)
-        data = buf.getvalue()
+        encode_key = (
+            self.page, self.scroll, self.x_offset, crop_w, crop_h,
+            round(self.zoom * 100),
+        )
+        data = self.encode_cache.get(encode_key)
+        if data is None:
+            data = self._encode_crop(crop)
+            self.encode_cache.put(encode_key, data)
+
         b64 = base64.b64encode(data).decode("ascii")
         osc = (
-            f"\x1b]1337;File=inline=1;size={len(data)};"
-            f"width={crop.width}px;height={crop.height}px;"
+            f"\x1b]1337;File=inline=1;doNotMoveCursor=1;size={len(data)};"
+            f"width={crop_w}px;height={crop_h}px;"
             f"preserveAspectRatio=0:{b64}\x07"
         )
 
-        out = []
-        out.append("\x1b[H\x1b[2J")
-        out.append(STATUS_COLOR_OFF)  # see _draw_text()'s comment on this
-        out.append(wrap_for_tmux(osc))
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        full_clear = self._needs_full_clear(crop_w, crop_h)
+        self._last_viewport_w = crop_w
+        self._last_viewport_h = crop_h
+        self._last_viewport_set = True
 
         match = self._active_search_page_match()
-        if match:
-            self._draw_match_marker(*self._match_bbox_px(match))
+        new_bounds = (
+            self._match_marker_bounds(*self._match_bbox_px(match))
+            if match else None
+        )
 
-        self.draw_status()
+        out = [self._format_viewport_clear(crop_w, crop_h, full_clear)]
+        # Erase the previous marker before the new image lands; otherwise
+        # box-drawing chars linger on iTerm2 inline-image cells (especially
+        # when search is cleared or n/p jumps to another match).
+        if self._last_marker_bounds and self._last_marker_bounds != new_bounds:
+            out.append(self._format_marker_erase(*self._last_marker_bounds))
+        out.extend([
+            "\x1b[H",  # erase leaves the cursor elsewhere; doNotMoveCursor=1
+            # draws the inline image at the current cell, not home.
+            STATUS_COLOR_OFF,  # see _draw_text()'s comment on this
+            wrap_for_tmux(osc),
+        ])
+        if new_bounds:
+            out.append(self._format_marker_at_bounds(*new_bounds))
+        self._last_marker_bounds = new_bounds
+
+        out.append(self.format_status())
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
 
     def status_segments(self):
         """The default status line, as (text, color) fields in order."""
@@ -1064,14 +1207,14 @@ class Viewer:
             (" ? help ", STATUS_COLOR_HELP),
         ]
 
-    def draw_status(self, text=None):
+    def format_status(self, text=None):
+        """Return escape sequence for the status line (no write)."""
         if text is not None:
             status = pad_to_width(truncate_to_width(f" {text} ", self.cols), self.cols)
-            sys.stdout.write(
-                f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K{status}{STATUS_COLOR_OFF}"
+            return (
+                f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K"
+                f"{status}{STATUS_COLOR_OFF}"
             )
-            sys.stdout.flush()
-            return
 
         # Truncate/pad by terminal column width, not Python string length:
         # search queries or the filename can contain wide (e.g. Japanese)
@@ -1092,9 +1235,10 @@ class Viewer:
         if width_used < self.cols:
             out.append(f"{STATUS_COLOR_OFF}{' ' * (self.cols - width_used)}")
 
-        sys.stdout.write(
-            f"\x1b[{self.rows};1H\x1b[2K{''.join(out)}{STATUS_COLOR_OFF}"
-        )
+        return f"\x1b[{self.rows};1H\x1b[2K{''.join(out)}{STATUS_COLOR_OFF}"
+
+    def draw_status(self, text=None):
+        sys.stdout.write(self.format_status(text))
         sys.stdout.flush()
 
     def draw_search_prompt(self, buf):
@@ -1205,10 +1349,8 @@ class Viewer:
             f"(page {self.page})"
         )
 
-    def _draw_match_marker(self, px_left, px_top, px_right, px_bottom):
-        """Draw a box around the just-jumped-to search match, in the
-        already-drawn page image, without touching any other cell (same
-        non-destructive technique as _draw_help)."""
+    def _match_marker_bounds(self, px_left, px_top, px_right, px_bottom):
+        """Screen-cell bounds for a search-match box, or None if off-screen."""
         available_rows = max(1, self.rows - 1)  # bottom row is the status bar
 
         col0 = (px_left - self.x_offset) // self.cell_w_px
@@ -1222,8 +1364,19 @@ class Viewer:
         col0, col1 = max(0, int(col0)), min(self.cols - 1, int(col1))
         row0, row1 = max(0, int(row0)), min(available_rows - 1, int(row1))
         if col0 > col1 or row0 > row1:
-            return  # the match scrolled fully out of view; nothing to draw
+            return None
+        return row0, col0, row1, col1
 
+    def _format_marker_erase(self, row0, col0, row1, col1):
+        """Wipe a previously drawn search-match box without clearing the screen."""
+        width = col1 - col0 + 1
+        out = [SEARCH_MARKER_RESET]
+        for row in range(row0, row1 + 1):
+            out.append(f"\x1b[{row + 1};{col0 + 1}H\x1b[{width}X")
+        return "".join(out)
+
+    def _format_marker_at_bounds(self, row0, col0, row1, col1):
+        """Return escape sequence for a search-match box overlay."""
         width = col1 - col0 + 1
         out = [SEARCH_MARKER_COLOR, f"\x1b[{row0 + 1};{col0 + 1}H┏{'━' * (width - 2)}┓"]
         for row in range(row0 + 1, row1):
@@ -1232,8 +1385,7 @@ class Viewer:
         if row1 > row0:
             out.append(f"\x1b[{row1 + 1};{col0 + 1}H┗{'━' * (width - 2)}┛")
         out.append(SEARCH_MARKER_RESET)
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        return "".join(out)
 
     def scroll_down(self, step):
         if self.scroll < self.scroll_max:
@@ -1472,13 +1624,13 @@ def run_viewer(pdf_path, npages, start_page, tmpdir, fd, fit="width", frame=True
             viewer.draw_search_prompt(search_buf)
             continue
 
-        if key == "N":
-            viewer.repeat_search(forward=True)
-            continue
-
-        if key == "P":
-            viewer.repeat_search(forward=False)
-            continue
+        if viewer.search_query is not None:
+            if key in ("n", "N"):
+                viewer.repeat_search(forward=True)
+                continue
+            if key in ("p", "P"):
+                viewer.repeat_search(forward=False)
+                continue
 
         if key in ("q", "\x1b") and viewer.search_query is not None:
             # With a search active, "q"/Esc dismiss it (removing the
