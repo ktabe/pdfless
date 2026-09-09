@@ -9,12 +9,14 @@ iTerm2 and [WezTerm](https://wezterm.org).
 Lets you view a PDF right in the terminal, using almost the same
 keybindings as `less(1)` — scroll by line, by half/full window, jump to a
 page, and so on. On top of that, since a PDF page is an image rather than
-text, `pdfless` also supports zoom in and out.
+text, `pdfless` also supports zooming in and out.
+
+`pdfless` also has a plain-text mode, which extracts the text from the
+PDF — handy for copying text out. You can switch between PDF mode and
+text mode any time with `t`.
 
 You can search the whole document with a regex, jumping straight to each
-match, and toggle (`t`) into a plain-text view of the current page any
-time — handy for copying text out, or just reading it as text rather
-than a rendered image.
+match. Searching works in both PDF mode and text mode.
 
 Since it's just a terminal program, it works the same way over SSH — no
 X11 forwarding, and no need to copy the PDF to your local machine first.
@@ -31,7 +33,7 @@ X11 forwarding, and no need to copy the PDF to your local machine first.
 
 - A terminal that supports iTerm2's inline image protocol — confirmed
   working on [iTerm2](https://iterm2.com) and
-  [WezTerm](https://wezterm.org); others may work too, but terminals
+  [WezTerm](https://wezterm.org); terminals
   without this protocol will not display anything.
 - [poppler](https://poppler.freedesktop.org) (`pdftoppm` / `pdfinfo`)
 - Python 3.9+
@@ -128,8 +130,7 @@ Navigation mirrors `less(1)`:
 | `<N> g` | jump straight to page `N` |
 | `n` / `p` | next / previous page |
 
-Zoom and pan (pdfless-specific, since a plain PDF page has no scrollable
-"lines" of its own until it's rasterized):
+Zoom and pan:
 
 | Keys | Action |
 | --- | --- |
