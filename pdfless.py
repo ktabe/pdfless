@@ -1882,7 +1882,7 @@ class Viewer:
 
 def run_viewer(
     pdf_path, npages, start_page, tmpdir, fd, old_termios, fit="width", frame=True,
-    follow=False, wheel_scroll_step=1,
+    follow=False, wheel_scroll_step=1, keep=False,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
     caller can inspect its final geometry (e.g. to tidy up the screen)."""
@@ -1970,11 +1970,18 @@ def run_viewer(
             # ^Z: suspend, like a normal shell job-control app would -
             # raw mode disables the tty's own ^Z-to-SIGTSTP translation
             # (see RawTerminal), so this does it by hand: leave the
-            # alternate screen/mouse modes and cooked-mode the tty before
-            # actually stopping, then reverse all of that once `fg`
-            # resumes us. Takes priority over everything else (even
-            # typing a search query), same as a real terminal's ^Z would.
-            sys.stdout.write(MOUSE_OFF + ALT_SCROLL_OFF + "\x1b[?25h\x1b[?1049l")
+            # mouse modes and cooked-mode the tty before actually
+            # stopping, then reverse all of that once `fg` resumes us.
+            # Takes priority over everything else (even typing a search
+            # query), same as a real terminal's ^Z would.
+            #
+            # --keep leaves the alternate screen buffer alone (no
+            # \x1b[?1049l) so the page stays on screen while suspended,
+            # the same trick main() uses to leave it up after quitting;
+            # otherwise leave the alternate screen like normal, so the
+            # shell prompt lands on the real scrollback instead.
+            leave_screen = "" if keep else "\x1b[?1049l"
+            sys.stdout.write(MOUSE_OFF + ALT_SCROLL_OFF + "\x1b[?25h" + leave_screen)
             sys.stdout.flush()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
             # SIGSTOP rather than SIGTSTP: the cleanup above already does
@@ -1992,8 +1999,9 @@ def run_viewer(
             os.kill(0, signal.SIGSTOP)
             # ... stopped here until `fg` sends SIGCONT ...
             tty.setraw(fd)
+            enter_screen = "" if keep else "\x1b[?1049h"
             sys.stdout.write(
-                "\x1b[?1049h\x1b[?25l" + ALT_SCROLL_ON
+                enter_screen + "\x1b[?25l" + ALT_SCROLL_ON
                 + ("" if viewer.text_mode else MOUSE_ON)
             )
             sys.stdout.flush()
@@ -2197,7 +2205,7 @@ def main():
                 viewer = run_viewer(
                     pdf_path, npages, start_page, tmpdir, fd, rt.old,
                     fit=fit, frame=args.frame, follow=args.follow,
-                    wheel_scroll_step=args.wheel_scroll_step,
+                    wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
                 )
             finally:
                 if args.keep and viewer is not None:
