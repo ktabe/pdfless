@@ -3,6 +3,7 @@
 # requires-python = ">=3.9"
 # dependencies = [
 #     "pillow",
+#     "pypdf",
 # ]
 # ///
 """pdfless - a less(1)-like full-screen PDF pager for terminals that
@@ -33,6 +34,7 @@ import termios
 import time
 import tty
 import unicodedata
+import webbrowser
 from collections import OrderedDict
 
 from PIL import Image
@@ -62,6 +64,22 @@ TEXT_HIGHLIGHT_RESET = "\x1b[0m"
 SEARCH_MARKER_COLOR = "\x1b[93m"  # bright yellow
 SEARCH_MARKER_RESET = "\x1b[0m"
 CACHE_SIZE = 6
+
+# SGR mouse reporting (buttons + motion, extended coordinates): only
+# enabled while showing the page image, where a click can hit a PDF
+# hyperlink - never in text mode, where mouse tracking would swallow the
+# terminal's own click-drag text selection.
+MOUSE_ON = "\x1b[?1000h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1000l\x1b[?1006l"
+
+# Alternate Scroll Mode: whenever the above button/motion reporting is
+# NOT active (i.e. in text mode) - and only then, terminals ignore this
+# while it's on - the terminal turns wheel scrolling into UP/DOWN key
+# presses instead, which handle_key_text() already treats as one-line
+# scrolling. Left on for the whole run: it's a no-op while MOUSE_ON is
+# in effect, so it doesn't need to be toggled alongside it.
+ALT_SCROLL_ON = "\x1b[?1007h"
+ALT_SCROLL_OFF = "\x1b[?1007l"
 
 
 def char_width(ch):
@@ -141,12 +159,12 @@ FOLLOW_INTERVAL = 3.0  # seconds between checks, under -F/--follow
 
 KEY_TABLE = """\
 Keys (mirroring less(1)):
-  e ^E j ^N CR DOWN forward  one line
-  y ^Y k ^K ^P UP   backward one line
-  f ^F ^V SPACE     forward  one window
-  b ^B ESC-v        backward one window
-  d ^D              forward  half window
-  u ^U              backward half window
+  e ^E j ^N CR DOWN       forward  one line
+  y ^Y k ^K ^P UP         backward one line
+  f ^F ^V SPACE           forward  one window
+  b ^B ESC-v              backward one window
+  d ^D                    forward  half window
+  u ^U                    backward half window
   g / G / HOME / END      jump to first / last page of the document
   <N> g                   jump straight to page N
   n / p                   next / previous page (match while searching)
@@ -158,15 +176,25 @@ Keys (mirroring less(1)):
   H / L / SHIFT-LEFT/RIGHT   jump to left / right edge (when zoomed in)
   K / U / SHIFT-UP        jump to top of the current page
   J / D / SHIFT-DOWN      jump to bottom of the current page
+  click                   (page image, not text mode) open a PDF
+                          hyperlink under the pointer - a URL in the
+                          system browser, an internal link by jumping
+                          to its target page/position
+  mouse wheel             scroll up / down - in the page image, one line
+                          at a time like e/y (--wheel-scroll-step to
+                          change that); in text mode, the terminal turns
+                          it into UP/DOWN key presses instead, so it
+                          still works there without clashing with
+                          click-drag text selection
+  [ / ]                   back / forward, through the positions internal
+                          links have jumped from (a mouse's back/forward
+                          side buttons, where it has them, do the same)
   t                       toggle plain-text view of the current page
                           (page/line navigation and h/l/H/L pan for
                           lines wider than the terminal - no zoom/fit)
   f                       (text mode) toggle a border around the page's
                           edges - on by default (--no-frame to start
-                          with it off; it can get swept up when you
-                          select-and-copy the text). Scroll/pan
-                          (h/l/H/L, j/k, ...) to bring it into view if
-                          the terminal is too small to show it already
+                          with it off).
   /<regex> ENTER          search the whole document for <regex>
                           (a Python regex; falls back to a literal
                           substring if it isn't valid regex syntax)
@@ -185,6 +213,13 @@ BACKWARD_WINDOW_KEYS = {"b", "\x02", "ESC-v", "PAGEUP"}
 def die(msg):
     print(f"pdfless: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def positive_int(s):
+    n = int(s)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
 
 
 POPPLER_INSTALL_HINT = (
@@ -286,6 +321,130 @@ def build_search_index(pdf_path):
             }
         )
     return pages
+
+
+def _resolve_link_dest(reader, page_num_by_ref, dest):
+    """A /Dest or action /D value - either an explicit destination array,
+    or a name/bytestring to look up among the document's named
+    destinations. Returns (page_num, top_pt) - top_pt is the target's y
+    position in PDF points (bottom-up, i.e. still in the PDF's own
+    coordinate system - the caller converts it), or None if it isn't
+    specified by this destination type. Returns None outright if the
+    destination can't be resolved at all (e.g. it points outside this
+    document, or the PDF is malformed)."""
+    from pypdf.generic import IndirectObject
+
+    if isinstance(dest, (str, bytes)):
+        name = dest if isinstance(dest, str) else dest.decode("utf-8", "replace")
+        named = reader.named_destinations.get(name)
+        if named is None:
+            return None
+        dest = getattr(named, "dest_array", named)
+    if not dest:
+        return None
+
+    target = dest[0]
+    ref = target if isinstance(target, IndirectObject) else getattr(
+        target, "indirect_reference", None
+    )
+    if ref is None:
+        return None
+    page_num = page_num_by_ref.get((ref.idnum, ref.generation))
+    if page_num is None:
+        return None
+
+    top_pt = None
+    fit_type = str(dest[1]) if len(dest) > 1 else None
+    try:
+        if fit_type == "/XYZ" and len(dest) > 3 and dest[3] is not None:
+            top_pt = float(dest[3])
+        elif fit_type in ("/FitH", "/FitBH") and len(dest) > 2 and dest[2] is not None:
+            top_pt = float(dest[2])
+    except (TypeError, ValueError):
+        top_pt = None
+    return page_num, top_pt
+
+
+def build_link_index(pdf_path, npages):
+    """Extract clickable link annotations for every page, via pypdf.
+    Returns a list of `npages` dicts, one per page in order, each
+    {"width_pt": float, "height_pt": float, "links": [...]}, where each
+    link is {"xmin", "ymin", "xmax", "ymax"} (points, top-down - flipped
+    from the PDF's own bottom-up rects to match this file's coordinate
+    system elsewhere, e.g. build_search_index()) plus either
+    {"kind": "uri", "uri": str} for an external link or
+    {"kind": "page", "page": int, "top_pt": float | None} for a jump to
+    another page in the same document."""
+    empty = [{"width_pt": 0.0, "height_pt": 0.0, "links": []} for _ in range(npages)]
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return empty
+
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception:
+        return empty
+
+    page_num_by_ref = {}
+    for i, p in enumerate(reader.pages):
+        ref = p.indirect_reference
+        if ref is not None:
+            page_num_by_ref[(ref.idnum, ref.generation)] = i + 1
+
+    result = []
+    for i in range(npages):
+        links = []
+        width_pt = height_pt = 0.0
+        try:
+            page = reader.pages[i]
+            box = page.mediabox
+            width_pt, height_pt = float(box.width), float(box.height)
+            for annot_ref in page.get("/Annots") or []:
+                try:
+                    annot = annot_ref.get_object()
+                    if annot.get("/Subtype") != "/Link":
+                        continue
+                    rect = annot.get("/Rect")
+                    if rect is None or len(rect) != 4:
+                        continue
+                    x0, y0, x1, y1 = (float(v) for v in rect)
+                    xmin, xmax = min(x0, x1), max(x0, x1)
+                    ymin_bu, ymax_bu = min(y0, y1), max(y0, y1)
+                    # Flip the PDF's bottom-up rect into the top-down
+                    # system used everywhere else here.
+                    ymin, ymax = height_pt - ymax_bu, height_pt - ymin_bu
+
+                    action = annot.get("/A")
+                    if action is not None and action.get("/S") == "/URI":
+                        uri = action.get("/URI")
+                        if uri:
+                            links.append({
+                                "xmin": xmin, "ymin": ymin,
+                                "xmax": xmax, "ymax": ymax,
+                                "kind": "uri", "uri": str(uri),
+                            })
+                        continue
+
+                    dest = annot.get("/Dest")
+                    if dest is None and action is not None and action.get("/S") == "/GoTo":
+                        dest = action.get("/D")
+                    if dest is None:
+                        continue
+                    resolved = _resolve_link_dest(reader, page_num_by_ref, dest)
+                    if resolved is None:
+                        continue
+                    page_num, top_pt = resolved
+                    links.append({
+                        "xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax,
+                        "kind": "page", "page": page_num, "top_pt": top_pt,
+                    })
+                except Exception:
+                    continue  # one malformed annotation shouldn't lose the rest
+        except Exception:
+            pass
+        result.append({"width_pt": width_pt, "height_pt": height_pt, "links": links})
+    return result
 
 
 def compile_search_pattern(query):
@@ -438,6 +597,53 @@ def decode_csi_key(seq):
     return f"SHIFT-{name}" if modifier == "2" else name
 
 
+def decode_sgr_mouse(seq):
+    """Parse an SGR mouse-reporting sequence body (after ESC [), e.g.
+    "<0;42;17M" - a left-button press at column 42, row 17 (both
+    1-based, in terminal cells). Returns (kind, col, row) where kind is
+    "MOUSE_CLICK", "MOUSE_WHEEL_UP"/"MOUSE_WHEEL_DOWN", or
+    "MOUSE_BACK"/"MOUSE_FORWARD" (a mouse's side buttons, where it has
+    them - button 8/9 in the xterm protocol). Returns None for anything
+    else (button release, drag, a button not covered above) - those
+    aren't a recognized action here, and are ignored."""
+    if not seq.startswith("<") or seq[-1] not in "Mm":
+        return None
+    body, final = seq[1:-1], seq[-1]
+    parts = body.split(";")
+    if len(parts) != 3:
+        return None
+    try:
+        cb, cx, cy = (int(p) for p in parts)
+    except ValueError:
+        return None
+    if cb & 0x80:
+        # Side buttons 8-11: bit 7 (0x80) marks the group, low 2 bits
+        # pick which one - button 8 (back) and 9 (forward) are the
+        # common "browser navigation" buttons; 10/11 aren't mapped to
+        # anything here. Reported as a press/release pair like the
+        # ordinary buttons, so only act on the press.
+        if final != "M":
+            return None
+        offset = cb & 0x03
+        if offset == 0:
+            return "MOUSE_BACK", cx, cy
+        if offset == 1:
+            return "MOUSE_FORWARD", cx, cy
+        return None
+    if cb & 0x40:
+        # The scroll wheel: bit 6 (0x40) marks it, and bit 0 then tells
+        # up from down. Always reported as a "press" (final "M"), never
+        # a release.
+        if final != "M":
+            return None
+        return ("MOUSE_WHEEL_DOWN" if cb & 1 else "MOUSE_WHEEL_UP"), cx, cy
+    if final != "M" or (cb & 0x20) or (cb & 3) != 0:
+        # final "m" is a release, bit 5 (0x20) is drag/motion, and
+        # (cb & 3) != 0 is a button other than the left one.
+        return None
+    return "MOUSE_CLICK", cx, cy
+
+
 def get_term_cells(fd):
     packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
     rows, cols, xpix, ypix = struct.unpack("HHHH", packed)
@@ -503,10 +709,12 @@ def wrap_for_tmux(osc):
 
 
 def iterm2_like():
-    """True when running under iTerm2 (or a close OSC-1337 clone)."""
-    if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+    """True when running under iTerm2, WezTerm, or a close OSC-1337
+    clone - terminals that support the OSC 1337 inline image protocol
+    well enough to accept a JPEG-encoded payload, not just PNG."""
+    if os.environ.get("TERM_PROGRAM") in ("iTerm.app", "WezTerm"):
         return True
-    if os.environ.get("ITERM_SESSION_ID"):
+    if os.environ.get("ITERM_SESSION_ID") or os.environ.get("WEZTERM_PANE"):
         return True
     return "iterm" in os.environ.get("LC_TERMINAL", "").lower()
 
@@ -594,13 +802,17 @@ class EncodeCache:
 
 
 class Viewer:
-    def __init__(self, pdf_path, npages, page, tmpdir, fd, fit="width", frame=True):
+    def __init__(
+        self, pdf_path, npages, page, tmpdir, fd, fit="width", frame=True,
+        wheel_scroll_step=1,
+    ):
         self.pdf_path = pdf_path
         self.pdf_name = os.path.basename(pdf_path)
         self.npages = npages
         self.page = page
         self.fd = fd
         self.fit = fit
+        self.wheel_scroll_step = wheel_scroll_step
         self.cache = PageCache(pdf_path, tmpdir)
         self.encode_cache = EncodeCache()
         self.scroll = 0
@@ -615,7 +827,11 @@ class Viewer:
         self.crop_width = 0
         self.x_offset = 0
         self.help_active = False
+        self.help_scroll = 0
         self._search_index = None  # lazily built, via build_search_index()
+        self._link_index = None  # lazily built, via build_link_index()
+        self._history_back = []  # [(page, scroll, x_offset), ...]
+        self._history_forward = []
         self.search_query = None
         self.search_matches = []
         self.search_pos = None
@@ -714,7 +930,20 @@ class Viewer:
 
     def show_help(self):
         self.help_active = True
+        self.help_scroll = 0
         self._draw_help()
+
+    def scroll_help(self, delta):
+        """Scroll the help box by `delta` lines (negative = up), for when
+        KEY_TABLE has grown taller than the box can show at once."""
+        lines = KEY_TABLE.splitlines()
+        available_rows = max(1, self.rows - 1)
+        content_h = min(max(1, available_rows - 2), len(lines))
+        max_scroll = max(0, len(lines) - content_h)
+        new_scroll = max(0, min(max_scroll, self.help_scroll + delta))
+        if new_scroll != self.help_scroll:
+            self.help_scroll = new_scroll
+            self._draw_help()
 
     def hide_help(self):
         self.help_active = False
@@ -724,6 +953,10 @@ class Viewer:
 
     def enter_text_mode(self):
         self.text_mode = True
+        # Mouse reporting is only useful (and only turned on) for
+        # clicking hyperlinks in the page image; leave it off here so
+        # the terminal's own click-drag text selection works normally.
+        sys.stdout.write(MOUSE_OFF)
         self._last_viewport_set = False
         self._last_marker_bounds = None
         self._load_text_page()
@@ -736,6 +969,7 @@ class Viewer:
 
     def exit_text_mode(self):
         self.text_mode = False
+        sys.stdout.write(MOUSE_ON)
         self._last_viewport_set = False
         self._last_marker_bounds = None
         # self.page may have moved while browsing in text mode (n/p, g/G,
@@ -1067,12 +1301,17 @@ class Viewer:
         # the exact cells the box covers, so the PDF still showing in the
         # rest of the terminal is left untouched.
         available_rows = max(1, self.rows - 1)  # bottom row is the status bar
-        lines = KEY_TABLE.splitlines()
+        all_lines = KEY_TABLE.splitlines()
 
-        content_w = min(max(20, self.cols - 4), max(len(l) for l in lines))
-        lines = [l[:content_w] for l in lines]
-        content_h = min(max(1, available_rows - 2), len(lines))
-        lines = lines[:content_h]
+        content_w = min(max(20, self.cols - 4), max(len(l) for l in all_lines))
+        all_lines = [l[:content_w] for l in all_lines]
+        content_h = min(max(1, available_rows - 2), len(all_lines))
+        # KEY_TABLE may be taller than the box can show at once; clamp the
+        # scroll position (e.g. after a resize shrank the box) and slice
+        # out just the window of lines currently in view.
+        max_scroll = max(0, len(all_lines) - content_h)
+        self.help_scroll = max(0, min(max_scroll, self.help_scroll))
+        lines = all_lines[self.help_scroll:self.help_scroll + content_h]
 
         box_w = content_w + 4  # border (2) + padding (2)
         box_h = content_h + 2  # top/bottom border
@@ -1085,7 +1324,11 @@ class Viewer:
         out.append(f"\x1b[{row0 + box_h - 1};{col0}H└{'─' * (box_w - 2)}┘")
         sys.stdout.write("".join(out))
         sys.stdout.flush()
-        self.draw_status("q to close help")
+        if max_scroll:
+            pct = round(100 * self.help_scroll / max_scroll)
+            self.draw_status(f"q to close help - j/k or wheel to scroll ({pct}%)")
+        else:
+            self.draw_status("q to close help")
 
     def _encode_crop(self, crop):
         buf = io.BytesIO()
@@ -1261,6 +1504,132 @@ class Viewer:
         self.page = max(1, min(self.npages, page))
         self._load_page()
         self.scroll = scroll
+
+    def _ensure_link_index(self):
+        if self._link_index is None:
+            self._link_index = build_link_index(self.pdf_path, self.npages)
+
+    def handle_click(self, col, row):
+        """A left-click at 1-based terminal cell (col, row): if it landed
+        on a PDF hyperlink in the currently displayed crop, follow it -
+        open a URL in the system browser, or jump to an internal link's
+        target page/position."""
+        if self.text_mode or self.help_active or row >= self.rows:
+            return  # row == self.rows is the status bar
+        self._ensure_link_index()
+        page_info = self._link_index[self.page - 1]
+        if not page_info["links"] or not page_info["width_pt"] or not page_info["height_pt"]:
+            return
+
+        # The clicked cell -> the pixel rectangle it covers on the full
+        # page raster (undoing the current pan/scroll) -> a PDF-point
+        # rectangle, in the same coordinate system build_link_index()
+        # stored link rects in. A whole-cell rectangle, not just its
+        # center point, matters here: a citation-style link (e.g. just
+        # "5.7" in "figure 5.7") is often tightly boxed around the
+        # digits by whatever generated the PDF, so its rect can be
+        # thinner than one terminal row is tall - a single sampled point
+        # would frequently land just outside it and miss the click.
+        scale_x = page_info["width_pt"] / self.img.width
+        scale_y = page_info["height_pt"] / self.img.height
+        cell_xmin = (self.x_offset + (col - 1) * self.cell_w_px) * scale_x
+        cell_xmax = cell_xmin + self.cell_w_px * scale_x
+        cell_ymin = (self.scroll + (row - 1) * self.cell_h_px) * scale_y
+        cell_ymax = cell_ymin + self.cell_h_px * scale_y
+
+        best = None
+        best_area = None
+        for link in page_info["links"]:
+            if (
+                link["xmax"] < cell_xmin or link["xmin"] > cell_xmax
+                or link["ymax"] < cell_ymin or link["ymin"] > cell_ymax
+            ):
+                continue  # no overlap between the link and the clicked cell
+            area = (link["xmax"] - link["xmin"]) * (link["ymax"] - link["ymin"])
+            if best is None or area < best_area:
+                best, best_area = link, area
+        if best is not None:
+            self._activate_link(best)
+
+    def handle_wheel(self, direction):
+        """A scroll-wheel step: direction -1 (up) or +1 (down),
+        self.wheel_scroll_step lines each (--wheel-scroll-step) - the
+        same page-boundary roll-over as e/y. Only meaningful in the page
+        image (mouse reporting is off in text mode, so this shouldn't
+        normally fire there, but the guard is cheap insurance)."""
+        if self.text_mode or self.help_active:
+            return
+        step = self.cell_h_px * self.wheel_scroll_step
+        if direction < 0:
+            self.scroll_up(step)
+        else:
+            self.scroll_down(step)
+        self.refresh()
+
+    def _activate_link(self, link):
+        if link["kind"] == "uri":
+            try:
+                opened = webbrowser.open(link["uri"])
+            except webbrowser.Error:
+                opened = False
+            self.draw_status(
+                f"opened {link['uri']}" if opened else f"couldn't open {link['uri']}"
+            )
+        else:
+            self._push_history()
+            self.go_to_link_target(link["page"], link["top_pt"])
+            self.refresh()
+
+    def _push_history(self):
+        """Record the position an internal-link jump is about to leave,
+        so `[`/`]` (or a mouse back/forward button) can return to it -
+        the same "back stack, forward stack, a fresh jump clears
+        forward" model a web browser uses."""
+        self._history_back.append((self.page, self.scroll, self.x_offset))
+        self._history_forward.clear()
+
+    def go_back(self):
+        self._go_history(self._history_back, self._history_forward, "earlier")
+
+    def go_forward(self):
+        self._go_history(self._history_forward, self._history_back, "later")
+
+    def _go_history(self, from_stack, to_stack, label):
+        if self.text_mode or self.help_active:
+            return
+        if not from_stack:
+            self.draw_status(f"no {label} position")
+            return
+        to_stack.append((self.page, self.scroll, self.x_offset))
+        page, scroll, x_offset = from_stack.pop()
+        self._restore_position(page, scroll, x_offset)
+        self.refresh()
+
+    def _restore_position(self, page, scroll, x_offset):
+        self.page = max(1, min(self.npages, page))
+        self._load_page()  # re-centers x_offset and recomputes scroll_max
+        self.scroll = max(0, min(self.scroll_max, scroll))
+        max_x_offset = max(0, self.img.width - self.crop_width)
+        self.x_offset = max(0, min(max_x_offset, x_offset))
+
+    def go_to_link_target(self, page, top_pt):
+        """Jump to `page`, scrolled so the link's target y-position
+        (`top_pt`, in PDF points, bottom-up - or None if the link didn't
+        specify one) lands a little below the top of the window, the
+        same placement _scroll_image_to_match() uses for search matches."""
+        self.page = max(1, min(self.npages, page))
+        self._load_page()
+        if top_pt is None:
+            self.scroll = 0
+            return
+        _, height_pt = pdf_page_size_pt(self.pdf_path, self.page)
+        if not height_pt:
+            self.scroll = 0
+            return
+        scale_y = self.img.height / height_pt
+        px_top = (height_pt - top_pt) * scale_y  # bottom-up -> top-down
+        margin = self.avail_height_px // 4
+        self.scroll = max(0, min(self.scroll_max, round(px_top) - margin))
 
     def reload(self):
         """Re-read the PDF from disk (e.g. -F/--follow noticed it changed
@@ -1502,15 +1871,25 @@ class Viewer:
         elif key == "p":
             if self.page > 1:
                 self.go_page(self.page - 1, 0)
+        elif key == "[":
+            self.go_back()
+        elif key == "]":
+            self.go_forward()
         elif key == "q":
             return False
         return True
 
 
-def run_viewer(pdf_path, npages, start_page, tmpdir, fd, fit="width", frame=True, follow=False):
+def run_viewer(
+    pdf_path, npages, start_page, tmpdir, fd, old_termios, fit="width", frame=True,
+    follow=False, wheel_scroll_step=1,
+):
     """Run the interactive viewer loop. Returns the Viewer instance so the
     caller can inspect its final geometry (e.g. to tidy up the screen)."""
-    viewer = Viewer(pdf_path, npages, start_page, tmpdir, fd, fit=fit, frame=frame)
+    viewer = Viewer(
+        pdf_path, npages, start_page, tmpdir, fd, fit=fit, frame=frame,
+        wheel_scroll_step=wheel_scroll_step,
+    )
 
     def on_winch(signum, frame):
         viewer.request_resize()
@@ -1565,7 +1944,62 @@ def run_viewer(pdf_path, npages, start_page, tmpdir, fd, fit="width", frame=True
                     key = "ESC-v"
                 elif nxt == b"[":
                     seq = read_csi_sequence(fd)
+                    mouse = decode_sgr_mouse(seq) if seq else None
+                    if mouse:
+                        kind, mcol, mrow = mouse
+                        if search_buf is None:
+                            if viewer.help_active:
+                                if kind == "MOUSE_WHEEL_UP":
+                                    viewer.scroll_help(-1)
+                                elif kind == "MOUSE_WHEEL_DOWN":
+                                    viewer.scroll_help(1)
+                            elif kind == "MOUSE_CLICK":
+                                viewer.handle_click(mcol, mrow)
+                            elif kind == "MOUSE_WHEEL_UP":
+                                viewer.handle_wheel(-1)
+                            elif kind == "MOUSE_WHEEL_DOWN":
+                                viewer.handle_wheel(1)
+                            elif kind == "MOUSE_BACK":
+                                viewer.go_back()
+                            elif kind == "MOUSE_FORWARD":
+                                viewer.go_forward()
+                        continue
                     key = decode_csi_key(seq) or ""
+
+        if key == "\x1a":
+            # ^Z: suspend, like a normal shell job-control app would -
+            # raw mode disables the tty's own ^Z-to-SIGTSTP translation
+            # (see RawTerminal), so this does it by hand: leave the
+            # alternate screen/mouse modes and cooked-mode the tty before
+            # actually stopping, then reverse all of that once `fg`
+            # resumes us. Takes priority over everything else (even
+            # typing a search query), same as a real terminal's ^Z would.
+            sys.stdout.write(MOUSE_OFF + ALT_SCROLL_OFF + "\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
+            # SIGSTOP rather than SIGTSTP: the cleanup above already does
+            # everything SIGTSTP's catchability would be for, so there's
+            # no downside to using the one stop signal that's guaranteed
+            # to actually stop the process - it can't be caught, blocked,
+            # or ignored, unlike SIGTSTP (which, at least on some
+            # setups, can silently fail to stop it on the first try).
+            # Sent to the whole process group (pid 0), not just our own
+            # pid: when launched via `uv run --script` (its shebang),
+            # this process is a *child* of uv, which is what the shell
+            # actually sees as the foreground job - stopping only
+            # ourselves would leave uv running and still attached to the
+            # tty, so the shell would never notice anything stopped.
+            os.kill(0, signal.SIGSTOP)
+            # ... stopped here until `fg` sends SIGCONT ...
+            tty.setraw(fd)
+            sys.stdout.write(
+                "\x1b[?1049h\x1b[?25l" + ALT_SCROLL_ON
+                + ("" if viewer.text_mode else MOUSE_ON)
+            )
+            sys.stdout.flush()
+            viewer.request_resize()  # the terminal may have been resized
+            # while stopped, and its contents are gone either way
+            continue
 
         if search_buf is not None:
             # Typing a search pattern after "/": collect characters until
@@ -1599,11 +2033,20 @@ def run_viewer(pdf_path, npages, start_page, tmpdir, fd, fit="width", frame=True
             break
 
         if viewer.help_active:
-            # While the help screen is up, only "q" does anything: it
-            # closes help and returns to the page. Everything else is
-            # swallowed so page keys can't leak through underneath it.
+            # While the help screen is up, only "q" and the scroll keys
+            # (for when KEY_TABLE is taller than the box) do anything.
+            # Everything else is swallowed so page keys can't leak
+            # through underneath it.
             if key == "q":
                 viewer.hide_help()
+            elif key in FORWARD_LINE_KEYS:
+                viewer.scroll_help(1)
+            elif key in BACKWARD_LINE_KEYS:
+                viewer.scroll_help(-1)
+            elif key in FORWARD_WINDOW_KEYS:
+                viewer.scroll_help(max(1, viewer.rows - 3))
+            elif key in BACKWARD_WINDOW_KEYS:
+                viewer.scroll_help(-max(1, viewer.rows - 3))
             continue
 
         if key == "\x0c":  # ^L: repaint the screen (e.g. after other
@@ -1724,6 +2167,11 @@ def main():
              f"(checked every {FOLLOW_INTERVAL:.0f}s), staying on the "
              "same page and in the same mode",
     )
+    parser.add_argument(
+        "--wheel-scroll-step", type=positive_int, default=1, metavar="N",
+        help="scroll N lines per mouse wheel step, in the page image "
+             "(default: 1)",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.pdf):
@@ -1740,15 +2188,16 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
     fd = sys.stdin.fileno()
     try:
-        with RawTerminal(fd):
-            sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        with RawTerminal(fd) as rt:
+            sys.stdout.write("\x1b[?1049h\x1b[?25l" + MOUSE_ON + ALT_SCROLL_ON)
             sys.stdout.flush()
             viewer = None
             try:
                 fit = "height" if args.fit_height else "width"
                 viewer = run_viewer(
-                    pdf_path, npages, start_page, tmpdir, fd,
+                    pdf_path, npages, start_page, tmpdir, fd, rt.old,
                     fit=fit, frame=args.frame, follow=args.follow,
+                    wheel_scroll_step=args.wheel_scroll_step,
                 )
             finally:
                 if args.keep and viewer is not None:
@@ -1757,10 +2206,13 @@ def main():
                     # line and bring the cursor back so the shell prompt
                     # lands cleanly below the image.
                     sys.stdout.write(
-                        f"\x1b[{viewer.rows};1H\x1b[2K\x1b[?25h"
+                        MOUSE_OFF + ALT_SCROLL_OFF
+                        + f"\x1b[{viewer.rows};1H\x1b[2K\x1b[?25h"
                     )
                 else:
-                    sys.stdout.write("\x1b[?25h\x1b[?1049l")
+                    sys.stdout.write(
+                        MOUSE_OFF + ALT_SCROLL_OFF + "\x1b[?25h\x1b[?1049l"
+                    )
                 sys.stdout.flush()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

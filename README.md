@@ -18,6 +18,10 @@ text mode any time with `t`.
 You can search the whole document with a regex, jumping straight to each
 match. Searching works in both PDF mode and text mode.
 
+PDF hyperlinks are clickable in the page image — both external URLs
+(opened in your system browser) and internal links to another page in
+the same document. The mouse wheel is supported too, for scrolling.
+
 Since it's just a terminal program, it works the same way over SSH — no
 X11 forwarding, and no need to copy the PDF to your local machine first.
 
@@ -98,34 +102,39 @@ chmod +x /usr/local/bin/pdfless
 pdfless some.pdf
 ```
 
-Without `uv`, install Pillow yourself and run it with `python3` directly:
+Without `uv`, install its Python dependencies yourself and run it with
+`python3` directly:
 
 ```sh
-pip install pillow
+pip install pillow pypdf
 python3 pdfless.py some.pdf
 ```
 
 ## Usage
 
 ```
-usage: pdfless [--help] [-v] [-p PAGE] [-k] [-h] [--no-frame] [-F] pdf
+usage: pdfless [--help] [-v] [-p PAGE] [-k] [-h] [--no-frame] [-F]
+               [--wheel-scroll-step N] pdf
 
 positional arguments:
-  pdf               path to the PDF file
+  pdf                     path to the PDF file
 
 options:
-  --help            show this help message and exit
-  -v, --version     show program's version number and exit
-  -p, --page PAGE   page to start on (default: 1)
-  -k, --keep        leave the last page on screen when quitting (q or ^C)
-                    instead of restoring the terminal screen
-  -h, --fit-height  fit each page to the terminal's full height instead of its
-                    full width (default: fit width)
-  --no-frame        don't draw a border around the page's edges in text mode
-                    (t); on by default, toggle any time with f
-  -F, --follow      watch the PDF file and reload it if it changes on disk
-                    (checked every 3s), staying on the same page and in the
-                    same mode
+  --help                  show this help message and exit
+  -v, --version           show program's version number and exit
+  -p, --page PAGE         page to start on (default: 1)
+  -k, --keep              leave the last page on screen when quitting (q or
+                          ^C) instead of restoring the terminal screen
+  -h, --fit-height        fit each page to the terminal's full height
+                          instead of its full width (default: fit width)
+  --no-frame              don't draw a border around the page's edges in
+                          text mode (t); on by default, toggle any time
+                          with f
+  -F, --follow            watch the PDF file and reload it if it changes on
+                          disk (checked every 3s), staying on the same page
+                          and in the same mode
+  --wheel-scroll-step N   scroll N lines per mouse wheel step, in the page
+                          image (default: 1)
 ```
 
 `-F`/`--follow` is handy while editing/regenerating a PDF (e.g. from a build
@@ -147,7 +156,7 @@ Navigation mirrors `less(1)`:
 | `g` / `Home` | first page |
 | `G` / `End` | last page |
 | `<N> g` | jump straight to page `N` |
-| `n` / `p` | next / previous page |
+| `n` / `p` | next / previous page (see below for their other job during a search) |
 
 Zoom and pan:
 
@@ -164,19 +173,22 @@ Zoom and pan:
 Search (a case-insensitive [Python regex](https://docs.python.org/3/library/re.html)
 against the PDF's extracted text, across the whole document — not just
 the current page; falls back to a literal substring match if the
-pattern isn't valid regex syntax, e.g. `C++`. Note the case: uppercase
-`N`/`P`, since lowercase `n`/`p` above already means next/previous
-page). Jumping to a match scrolls it into view and draws a box around it:
+pattern isn't valid regex syntax, e.g. `C++`). Jumping to a match
+scrolls it into view and draws a box around it:
 
 | Keys | Action |
 | --- | --- |
 | `/<regex>` `Enter` | search the whole document for `<regex>` |
 | `N` / `P` | jump to the next / previous match |
+| `n` / `p` | while a search is active, the same as `N` / `P` above (otherwise next / previous page) |
 
 Misc:
 
 | Keys | Action |
 | --- | --- |
+| click | (page image, not text mode) open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
+| mouse wheel | scroll up / down - in the page image, one line at a time like `e`/`y` (`--wheel-scroll-step` to change that); in text mode, the terminal turns it into `Up`/`Down` key presses instead, so it still works there without clashing with click-drag text selection |
+| `[` / `]` | back / forward, through the positions internal links have jumped from |
 | `t` | toggle a plain-text view of the current page (its extracted text, scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) |
 | `f` | (text mode) toggle a border around the page's edges - on by default (`--no-frame` to start with it off) |
 | `^L` | redraw the screen |
