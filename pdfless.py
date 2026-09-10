@@ -37,7 +37,7 @@ import unicodedata
 import webbrowser
 from collections import OrderedDict
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 __version__ = "1.0.0"
 
@@ -48,6 +48,7 @@ STATUS_COLOR_OFF = "\x1b[0m"
 # filename/page/loc%/zoom% each stand out, with the trailing key-hints
 # text in a plainer, subdued color.
 STATUS_COLOR_FILENAME = "\x1b[44;97m"  # white on blue
+STATUS_COLOR_FILE_INDEX = "\x1b[46;30m"  # black on cyan
 STATUS_COLOR_PAGE = "\x1b[42;30m"  # black on green
 STATUS_COLOR_LOC = "\x1b[43;30m"  # black on yellow
 STATUS_COLOR_ZOOM = "\x1b[45;97m"  # white on magenta
@@ -168,6 +169,10 @@ Keys (mirroring less(1)):
   g / G / HOME / END      jump to first / last page of the document
   <N> g                   jump straight to page N
   n / p                   next / previous page (match while searching)
+  x / X                   jump to the first / last file in the list
+  <N> x                   jump straight to file N
+  :n / :p                 next / previous file, when more than one was
+                          given on the command line
   PAGEUP / PAGEDOWN       backward / forward one window
   + / -                   zoom in / out
   0                       reset zoom and pan
@@ -225,6 +230,16 @@ def positive_int(s):
 POPPLER_INSTALL_HINT = (
     "install poppler (e.g. apt install poppler-utils, brew install poppler)"
 )
+
+
+def is_pdf_file(path):
+    """Sniff the file's own content rather than trusting its extension -
+    a PDF always starts with "%PDF-", regardless of what it's named."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except OSError:
+        return False
 
 
 def check_deps():
@@ -739,19 +754,29 @@ def _strip_leading_home(s):
 
 
 class PageCache:
-    def __init__(self, pdf_path, tmpdir, size=CACHE_SIZE):
-        self.pdf_path = pdf_path
+    def __init__(self, doc_path, tmpdir, is_pdf, size=CACHE_SIZE):
+        self.doc_path = doc_path
         self.tmpdir = tmpdir
+        self.is_pdf = is_pdf
         self.size = size
         self._cache = OrderedDict()  # (page, dpi_rounded) -> PIL.Image
+        self._native_image = None  # image mode only, loaded once - see _get_image()
 
     def clear(self):
         self._cache.clear()
+        self._native_image = None  # re-read the file, e.g. for -F/--follow
 
     def get(self, page, target_px, fit="width"):
+        """The page (PDF) or the whole file (a plain image), scaled so
+        it's `target_px` wide (fit="width") or tall (fit="height")."""
+        if self.is_pdf:
+            return self._get_pdf_page(page, target_px, fit)
+        return self._get_image(target_px, fit)
+
+    def _get_pdf_page(self, page, target_px, fit):
         """Rasterize `page` at whatever DPI makes it `target_px` wide
         (fit="width") or tall (fit="height")."""
-        width_pt, height_pt = pdf_page_size_pt(self.pdf_path, page)
+        width_pt, height_pt = pdf_page_size_pt(self.doc_path, page)
         page_pt = width_pt if fit == "width" else height_pt
         dpi = 72.0 * target_px / page_pt
         key = (page, round(dpi))
@@ -765,7 +790,7 @@ class PageCache:
             [
                 "pdftoppm", "-png", "-r", str(dpi),
                 "-f", str(page), "-l", str(page),
-                "-singlefile", self.pdf_path, prefix,
+                "-singlefile", self.doc_path, prefix,
             ],
             check=True,
         )
@@ -773,6 +798,49 @@ class PageCache:
         img.load()
         os.unlink(prefix + ".png")
 
+        self._cache[key] = img
+        if len(self._cache) > self.size:
+            self._cache.popitem(last=False)
+        return img
+
+    def _get_image(self, target_px, fit):
+        """Scale the source image (loaded once and cached natively) to
+        `target_px` wide or tall, mirroring _get_pdf_page()'s DPI-based
+        resize but by pixel ratio instead - there's no "page size in
+        points" for a plain image file."""
+        if self._native_image is None:
+            try:
+                img = Image.open(self.doc_path)
+                img = ImageOps.exif_transpose(img)  # also .load()s it
+                if img.mode in ("RGBA", "LA") or (
+                    img.mode == "P" and "transparency" in img.info
+                ):
+                    img = img.convert("RGBA")
+                else:
+                    img = img.convert("RGB")
+            except Exception as e:
+                # Reached from -F/--follow noticing the file changed into
+                # something that fails to decode - main() already checks
+                # this once up front, but the file can always go bad
+                # again later. Re-raised as a plain RuntimeError so
+                # callers (reload()'s caller in run_viewer) don't need to
+                # know anything PIL-specific to catch it.
+                raise RuntimeError(f"cannot load {self.doc_path}: {e}") from e
+            self._native_image = img
+
+        native = self._native_image
+        native_dim = native.width if fit == "width" else native.height
+        key = round(target_px)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+
+        scale = target_px / native_dim
+        new_size = (
+            max(1, round(native.width * scale)),
+            max(1, round(native.height * scale)),
+        )
+        img = native.resize(new_size, Image.Resampling.LANCZOS)
         self._cache[key] = img
         if len(self._cache) > self.size:
             self._cache.popitem(last=False)
@@ -803,17 +871,17 @@ class EncodeCache:
 
 class Viewer:
     def __init__(
-        self, pdf_path, npages, page, tmpdir, fd, fit="width", frame=True,
-        wheel_scroll_step=1,
+        self, files, file_index, page, tmpdir, fd, fit="width",
+        frame=True, wheel_scroll_step=1,
     ):
-        self.pdf_path = pdf_path
-        self.pdf_name = os.path.basename(pdf_path)
-        self.npages = npages
-        self.page = page
+        self.files = files  # [(path, is_pdf, npages), ...] - one per CLI argument
+        self.file_index = file_index
+        self.tmpdir = tmpdir
         self.fd = fd
         self.fit = fit
         self.wheel_scroll_step = wheel_scroll_step
-        self.cache = PageCache(pdf_path, tmpdir)
+        self.page = page
+        self._set_current_file()  # sets pdf_path/pdf_name/is_pdf/npages/cache
         self.encode_cache = EncodeCache()
         self.scroll = 0
         self.zoom = 1.0
@@ -860,6 +928,50 @@ class Viewer:
         # both stale after a resize; simplest is to just drop back to the
         # normal view, which always does a full redraw at the new size.
         self.help_active = False
+
+    def _set_current_file(self):
+        """Point pdf_path/pdf_name/is_pdf/npages/cache at
+        self.files[self.file_index] - just the file's identity, not the
+        page/zoom/search/etc. state, which __init__ sets up once and
+        go_to_file() resets explicitly on every later switch."""
+        path, is_pdf, npages = self.files[self.file_index]
+        self.pdf_path = path  # a plain image file, when not is_pdf
+        self.pdf_name = os.path.basename(path)
+        self.is_pdf = is_pdf
+        self.npages = npages
+        self.cache = PageCache(path, self.tmpdir, is_pdf)
+
+    def next_file(self):
+        self.go_to_file(self.file_index + 1, "no next file")
+
+    def previous_file(self):
+        self.go_to_file(self.file_index - 1, "no previous file")
+
+    def go_to_file(self, index, boundary_message="no such file"):
+        """Switch to files[index], starting fresh at its first page -
+        zoom, search, link history, and text mode all reset, the same
+        as if pdfless had been started fresh on that file. A no-op
+        (with a status message) if index is out of range."""
+        if index < 0 or index >= len(self.files):
+            self.draw_status(boundary_message)
+            return
+        self.file_index = index
+        self._set_current_file()
+        self.encode_cache.clear()
+        self._search_index = None
+        self.clear_search()
+        self._link_index = None
+        self._history_back = []
+        self._history_forward = []
+        self.text_mode = False
+        self.zoom = 1.0
+        self.page = 1
+        self.scroll = 0
+        self.x_offset = 0
+        self._last_viewport_set = False
+        self._last_marker_bounds = None
+        self._load_page()
+        self.refresh()  # its normal status line already includes "file i/N"
 
     def _recompute_geometry(self):
         rows, cols, _, _ = get_term_cells(self.fd)
@@ -1442,13 +1554,19 @@ class Viewer:
                 else int(100 * self.scroll / self.scroll_max)
             )
             mode_field = f" zoom {round(self.zoom * 100)}% "
-        return [
-            (f" {self.pdf_name} ", STATUS_COLOR_FILENAME),
+        segments = [(f" {self.pdf_name} ", STATUS_COLOR_FILENAME)]
+        if len(self.files) > 1:
+            segments.append((
+                f" file {self.file_index + 1}/{len(self.files)} ",
+                STATUS_COLOR_FILE_INDEX,
+            ))
+        segments += [
             (f" page {self.page}/{self.npages} ", STATUS_COLOR_PAGE),
             (f" {pct}% ", STATUS_COLOR_LOC),
             (mode_field, STATUS_COLOR_ZOOM),
             (" ? help ", STATUS_COLOR_HELP),
         ]
+        return segments
 
     def format_status(self, text=None):
         """Return escape sequence for the status line (no write)."""
@@ -1507,7 +1625,10 @@ class Viewer:
 
     def _ensure_link_index(self):
         if self._link_index is None:
-            self._link_index = build_link_index(self.pdf_path, self.npages)
+            if self.is_pdf:
+                self._link_index = build_link_index(self.pdf_path, self.npages)
+            else:
+                self._link_index = [{"width_pt": 0.0, "height_pt": 0.0, "links": []}]
 
     def handle_click(self, col, row):
         """A left-click at 1-based terminal cell (col, row): if it landed
@@ -1638,8 +1759,9 @@ class Viewer:
         both keyed off content that's now stale, so both get dropped;
         any in-progress search is cleared too, since its match list may
         no longer correspond to anything in the new file."""
-        self.npages = pdf_page_count(self.pdf_path)
-        self.page = max(1, min(self.npages, self.page))
+        if self.is_pdf:
+            self.npages = pdf_page_count(self.pdf_path)
+            self.page = max(1, min(self.npages, self.page))
         self.cache.clear()
         self._search_index = None
         self.clear_search()
@@ -1881,14 +2003,14 @@ class Viewer:
 
 
 def run_viewer(
-    pdf_path, npages, start_page, tmpdir, fd, old_termios, fit="width", frame=True,
-    follow=False, wheel_scroll_step=1, keep=False,
+    files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
+    frame=True, follow=False, wheel_scroll_step=1, keep=False,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
     caller can inspect its final geometry (e.g. to tidy up the screen)."""
     viewer = Viewer(
-        pdf_path, npages, start_page, tmpdir, fd, fit=fit, frame=frame,
-        wheel_scroll_step=wheel_scroll_step,
+        files, start_file_index, start_page, tmpdir, fd, fit=fit,
+        frame=frame, wheel_scroll_step=wheel_scroll_step,
     )
 
     def on_winch(signum, frame):
@@ -1898,9 +2020,11 @@ def run_viewer(
 
     num_buf = ""
     search_buf = None  # None: not typing; otherwise the "/query" in progress
+    colon_pending = False  # True right after ":", awaiting n/p (next/previous file)
 
+    last_follow_path = viewer.pdf_path
     try:
-        last_mtime = os.path.getmtime(pdf_path) if follow else None
+        last_mtime = os.path.getmtime(last_follow_path) if follow else None
     except OSError:
         last_mtime = None
     last_follow_check = time.monotonic()
@@ -1909,10 +2033,20 @@ def run_viewer(
     while True:
         r, _, _ = select.select([fd], [], [], 0.3)
 
-        if follow and time.monotonic() - last_follow_check >= FOLLOW_INTERVAL:
+        if follow and viewer.pdf_path != last_follow_path:
+            # :n/:p switched to a different file - start tracking that
+            # one instead, rather than comparing its mtime against
+            # whatever the previous file's was.
+            last_follow_path = viewer.pdf_path
+            try:
+                last_mtime = os.path.getmtime(last_follow_path)
+            except OSError:
+                last_mtime = None
+            last_follow_check = time.monotonic()
+        elif follow and time.monotonic() - last_follow_check >= FOLLOW_INTERVAL:
             last_follow_check = time.monotonic()
             try:
-                mtime = os.path.getmtime(pdf_path)
+                mtime = os.path.getmtime(last_follow_path)
             except OSError:
                 mtime = None  # e.g. mid save-as-replace; try again next tick
             if mtime is not None and mtime != last_mtime:
@@ -2037,6 +2171,20 @@ def run_viewer(
                 viewer.draw_search_prompt(search_buf)
             continue
 
+        if colon_pending:
+            # ":" was just pressed - less(1)'s :n/:p, next/previous file
+            # (only meaningful with more than one file on the command
+            # line; harmless otherwise, since go_to_file() just reports
+            # there's nowhere to go). Any other key cancels quietly.
+            colon_pending = False
+            if key == "n":
+                viewer.next_file()
+            elif key == "p":
+                viewer.previous_file()
+            else:
+                viewer.draw_status()
+            continue
+
         if key == "\x03":
             break
 
@@ -2066,13 +2214,24 @@ def run_viewer(
             viewer.show_help()
             continue
 
+        if key == ":":
+            colon_pending = True
+            viewer.draw_status(":")
+            continue
+
         if key == "t":
-            viewer.toggle_text_mode()
+            if viewer.is_pdf:
+                viewer.toggle_text_mode()
+            else:
+                viewer.draw_status("text mode isn't available for image files")
             continue
 
         if key == "/":
-            search_buf = ""
-            viewer.draw_search_prompt(search_buf)
+            if viewer.is_pdf:
+                search_buf = ""
+                viewer.draw_search_prompt(search_buf)
+            else:
+                viewer.draw_status("search isn't available for image files")
             continue
 
         if viewer.search_query is not None:
@@ -2093,10 +2252,10 @@ def run_viewer(
             continue
 
         # A lone "0" (no pending page number) resets the zoom/pan instead
-        # of starting a page-number entry.
+        # of starting a number entry.
         if key.isdigit() and not (key == "0" and not num_buf):
             num_buf += key
-            viewer.draw_status(f"page: {num_buf}")
+            viewer.draw_status(f"number: {num_buf}")
             continue
 
         if key == "g" and num_buf:
@@ -2107,6 +2266,25 @@ def run_viewer(
                 viewer.go_page(int(num_buf), 0)
             num_buf = ""
             viewer.refresh()
+            continue
+
+        if key == "x":
+            # "x" jumps to the first file in the list; "<number>x" jumps
+            # straight to that file (1-based, matching <number>g's page
+            # numbering) - meaningful only with more than one file, but
+            # harmless otherwise (go_to_file() just reports there's
+            # nowhere to go).
+            target = int(num_buf) - 1 if num_buf else 0
+            num_buf = ""
+            viewer.go_to_file(target, "no such file")
+            continue
+
+        if key == "X":
+            # "X" jumps to the last file in the list, mirroring "x" for
+            # the first - matches G/End for the last page vs g/Home for
+            # the first.
+            num_buf = ""
+            viewer.go_to_file(len(viewer.files) - 1, "no such file")
             continue
 
         if num_buf:
@@ -2133,7 +2311,7 @@ def run_viewer(
 def main():
     parser = argparse.ArgumentParser(
         prog="pdfless",
-        description="Display a PDF in iTerm2 or WezTerm, less(1)-style.",
+        description="Display a PDF or image in iTerm2 or WezTerm, less(1)-style.",
         epilog=KEY_TABLE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
@@ -2144,9 +2322,13 @@ def main():
     parser.add_argument(
         "-v", "--version", action="version", version=f"%(prog)s {__version__}"
     )
-    parser.add_argument("pdf", help="path to the PDF file")
     parser.add_argument(
-        "-p", "--page", type=int, default=1, help="page to start on (default: 1)"
+        "files", nargs="+", metavar="file",
+        help="path to one or more PDF or image files",
+    )
+    parser.add_argument(
+        "-p", "--page", type=int, default=1,
+        help="page to start on, in the first file (default: 1)",
     )
     parser.add_argument(
         "-k", "--keep",
@@ -2171,7 +2353,7 @@ def main():
     parser.add_argument(
         "-F", "--follow",
         action="store_true",
-        help="watch the PDF file and reload it if it changes on disk "
+        help="watch the file and reload it if it changes on disk "
              f"(checked every {FOLLOW_INTERVAL:.0f}s), staying on the "
              "same page and in the same mode",
     )
@@ -2182,16 +2364,54 @@ def main():
     )
     args = parser.parse_args()
 
-    if not os.path.isfile(args.pdf):
-        die(f"no such file: {args.pdf}")
-    check_deps()
+    # Validate every file up front - each one is checked (existence,
+    # type, and that it actually decodes) before the terminal ever goes
+    # into raw/alternate-screen mode. An invalid file is skipped (with a
+    # warning) rather than aborting the whole thing, so one bad path in
+    # a big batch doesn't stop you from seeing the rest.
+    candidates = []  # [(abs_path, is_pdf), ...] - files that at least exist
+    for arg in args.files:
+        if not os.path.isfile(arg):
+            print(f"pdfless: no such file, skipping: {arg}", file=sys.stderr)
+            continue
+        path = os.path.abspath(arg)
+        candidates.append((path, is_pdf_file(path)))
+    if any(is_pdf for _, is_pdf in candidates):
+        check_deps()
+
+    files = []  # [(abs_path, is_pdf, npages), ...], in the given order
+    for path, is_pdf in candidates:
+        if is_pdf:
+            try:
+                npages = pdf_page_count(path)
+            except Exception as e:
+                print(f"pdfless: not a usable PDF, skipping: {path} ({e})", file=sys.stderr)
+                continue
+            files.append((path, True, npages))
+        else:
+            try:
+                # .load() rather than the lighter .verify(): some formats
+                # (e.g. WMF without a system loader available) pass
+                # verify() - which only sanity-checks the file structure
+                # - but still fail to actually decode, which we'd rather
+                # catch here than mid-session once the raw/alternate-
+                # screen terminal is up.
+                with Image.open(path) as probe:
+                    probe.load()
+            except Exception as e:
+                print(
+                    f"pdfless: not a PDF or a recognized image format, "
+                    f"skipping: {path} ({e})", file=sys.stderr,
+                )
+                continue
+            files.append((path, False, 1))
+
+    if not files:
+        die("no valid PDF or image files given")
+    start_page = max(1, min(files[0][2], args.page))
 
     if not sys.stdout.isatty() or not sys.stdin.isatty():
         die("stdin/stdout must be a terminal")
-
-    pdf_path = os.path.abspath(args.pdf)
-    npages = pdf_page_count(pdf_path)
-    start_page = max(1, min(npages, args.page))
 
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
     fd = sys.stdin.fileno()
@@ -2203,7 +2423,7 @@ def main():
             try:
                 fit = "height" if args.fit_height else "width"
                 viewer = run_viewer(
-                    pdf_path, npages, start_page, tmpdir, fd, rt.old,
+                    files, 0, start_page, tmpdir, fd, rt.old,
                     fit=fit, frame=args.frame, follow=args.follow,
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
                 )
