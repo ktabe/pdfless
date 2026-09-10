@@ -39,7 +39,7 @@ from collections import OrderedDict
 
 from PIL import Image, ImageOps
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 STATUS_COLOR_ON = "\x1b[44;97m"  # white on blue - used for one-off messages
 STATUS_COLOR_OFF = "\x1b[0m"
