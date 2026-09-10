@@ -9,18 +9,15 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
 Lets you view a PDF (or a plain image - PNG, JPEG, and whatever else
 [Pillow](https://python-pillow.org) can decode) right in the terminal,
 using almost the same keybindings as `less(1)` — scroll by line, by
-half/full window, jump to a page, and so on. On top of that, since a
-page is an image rather than text, `pdfless` also supports zooming in
-and out.
+half/full window, jump to a page, and so on.
+On top of that, `pdfless` also supports zooming in/out and panning.
 
 For a PDF, `pdfless` also has a plain-text mode, which extracts the
 text from the page — handy for copying text out. You can switch
 between image mode and text mode any time with `t`.
 
-You can also search a PDF's whole document with a regex, jumping
-straight to each match. Searching works in both image mode and text
-mode. (Text mode and search aren't available for a plain image, which
-has no text to extract.)
+You can also search a PDF with a regex, jumping straight to each
+match — works in both image mode and text mode.
 
 PDF hyperlinks are clickable in the page image — both external URLs
 (opened in your system browser) and internal links to another page in
@@ -28,6 +25,9 @@ the same document. The mouse wheel is supported too, for scrolling.
 
 You can also open more than one file at once (`pdfless a.pdf b.png ...`)
 and switch between them with `:n`/`:p`, `less(1)`-style.
+
+(As a bonus, `pdfless` can open a plain text file too, shown straight in
+that same text mode and searchable the same way as a PDF's.)
 
 Since it's just a terminal program, it works the same way over SSH — no
 X11 forwarding, and no need to copy the PDF to your local machine first.
@@ -126,7 +126,7 @@ usage: pdfless [--help] [-v] [-p PAGE] [-k] [-h] [--no-frame] [-F]
                [--wheel-scroll-step N] file [file ...]
 
 positional arguments:
-  file                    path to one or more PDF or image files
+  file                    path to one or more PDF, image, or text files
 
 options:
   --help                  show this help message and exit
@@ -164,9 +164,8 @@ Navigation mirrors `less(1)`:
 | `b` `^B` `Esc-v` `PageUp` | backward one window |
 | `d` `^D` | forward half window |
 | `u` `^U` | backward half window |
-| `g` / `Home` | first page |
-| `G` / `End` | last page |
-| `<N> g` | jump straight to page `N` |
+| `g` / `G` | jump to top / bottom of the current page (text mode: type a number first to jump to that line instead, e.g. `10g` → line 10) |
+| `<` / `>` / `Home` / `End` | first / last page of the document (type a number first to jump to that page instead, e.g. `10<` → page 10) |
 | `n` / `p` | next / previous page (see below for their other job during a search) |
 | `:n` / `:p` | next / previous file, when more than one was given on the command line |
 | `x` / `X` | jump to the first / last file in the list |
@@ -181,14 +180,15 @@ Zoom and pan:
 | `m` / `M` | fit page to terminal height / width |
 | `h` / `l` / `Left` / `Right` | pan left / right (when zoomed in) |
 | `H` / `L` / `Shift-Left` / `Shift-Right` | jump to left / right edge |
-| `K` / `U` / `Shift-Up` | jump to top of the current page |
-| `J` / `D` / `Shift-Down` | jump to bottom of the current page |
+| `K` / `U` / `Shift-Up` | jump to top of the current page (same as `g`) |
+| `J` / `D` / `Shift-Down` | jump to bottom of the current page (same as `G`) |
 
-Search (PDFs only - a case-insensitive [Python regex](https://docs.python.org/3/library/re.html)
-against the PDF's extracted text, across the whole document — not just
-the current page; falls back to a literal substring match if the
-pattern isn't valid regex syntax, e.g. `C++`). Jumping to a match
-scrolls it into view and draws a box around it:
+Search (PDFs and plain text files only, not images - a case-insensitive
+[Python regex](https://docs.python.org/3/library/re.html) against the
+extracted/file text, across the whole document — not just the current
+page; falls back to a literal substring match if the pattern isn't
+valid regex syntax, e.g. `C++`). Jumping to a match scrolls it into
+view, boxed on a PDF page image or highlighted in text:
 
 | Keys | Action |
 | --- | --- |
@@ -203,7 +203,7 @@ Misc:
 | click | (page image, not text mode) open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
 | mouse wheel | scroll up / down - in the page image, one line at a time like `e`/`y` (`--wheel-scroll-step` to change that); in text mode, the terminal turns it into `Up`/`Down` key presses instead, so it still works there without clashing with click-drag text selection |
 | `[` / `]` | back / forward, through the positions internal links have jumped from |
-| `t` | toggle a plain-text view of the current page (its extracted text, scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) - PDFs only; on a plain image, this just reports that there's no text to show |
+| `t` | toggle a plain-text view of the current page (its extracted text, scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) - PDFs only; on a plain image, this just reports that there's no text to show (a plain text file is already shown this way, with nothing to toggle) |
 | `f` | (text mode) toggle a border around the page's edges - on by default (`--no-frame` to start with it off) |
 | `^L` | redraw the screen |
 | `?` | show a keybinding help box (`q` to close it) |

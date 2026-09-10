@@ -166,8 +166,12 @@ Keys (mirroring less(1)):
   b ^B ESC-v              backward one window
   d ^D                    forward  half window
   u ^U                    backward half window
-  g / G / HOME / END      jump to first / last page of the document
-  <N> g                   jump straight to page N
+  g / G                   jump to top / bottom of the current page
+                          (text mode: type a number first to jump to
+                          that line instead, e.g. 10g -> line 10)
+  < / > / HOME / END      jump to the first / last page of the document
+                          (type a number first to jump to that page
+                          instead, e.g. 10< -> page 10)
   n / p                   next / previous page (match while searching)
   x / X                   jump to the first / last file in the list
   <N> x                   jump straight to file N
@@ -179,8 +183,8 @@ Keys (mirroring less(1)):
   m / M                   fit page to terminal height / width
   h / l / LEFT / RIGHT    pan left / right (when zoomed in)
   H / L / SHIFT-LEFT/RIGHT   jump to left / right edge (when zoomed in)
-  K / U / SHIFT-UP        jump to top of the current page
-  J / D / SHIFT-DOWN      jump to bottom of the current page
+  K / U / SHIFT-UP        jump to top of the current page (same as g)
+  J / D / SHIFT-DOWN      jump to bottom of the current page (same as G)
   click                   (page image, not text mode) open a PDF
                           hyperlink under the pointer - a URL in the
                           system browser, an internal link by jumping
@@ -287,6 +291,34 @@ def extract_page_text(pdf_path, page):
         check=True,
     ).stdout
     return out.splitlines()
+
+
+def is_probably_text(path, sniff_bytes=8000):
+    """The same binary/text heuristic git and file(1) use: if the first
+    few KB contain a NUL byte, treat it as binary. (NUL is technically
+    valid UTF-8, but genuine text essentially never contains it.)"""
+    try:
+        with open(path, "rb") as f:
+            return b"\x00" not in f.read(sniff_bytes)
+    except OSError:
+        return False
+
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def read_plain_text_lines(path, tab_width=8):
+    """A plain text file's lines, as pdftotext -layout's output is for a
+    PDF page: ready to hand straight to the existing text-mode renderer.
+    Tabs are expanded (there's no terminal-native tab stop handling in
+    that renderer's column math) and stray control characters (e.g. a
+    raw ESC) are stripped, so odd file content can't corrupt the
+    terminal display the way passing it through raw would."""
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    content = content.expandtabs(tab_width)
+    content = _CONTROL_CHAR_RE.sub("", content)
+    return content.splitlines()
 
 
 _BBOX_PAGE_RE = re.compile(
@@ -874,14 +906,14 @@ class Viewer:
         self, files, file_index, page, tmpdir, fd, fit="width",
         frame=True, wheel_scroll_step=1,
     ):
-        self.files = files  # [(path, is_pdf, npages), ...] - one per CLI argument
+        self.files = files  # [(path, kind, npages), ...] - one per CLI argument
         self.file_index = file_index
         self.tmpdir = tmpdir
         self.fd = fd
         self.fit = fit
         self.wheel_scroll_step = wheel_scroll_step
         self.page = page
-        self._set_current_file()  # sets pdf_path/pdf_name/is_pdf/npages/cache
+        self._set_current_file()  # sets pdf_path/pdf_name/kind/npages/cache
         self.encode_cache = EncodeCache()
         self.scroll = 0
         self.zoom = 1.0
@@ -903,7 +935,9 @@ class Viewer:
         self.search_query = None
         self.search_matches = []
         self.search_pos = None
-        self.text_mode = False
+        # A plain text file has no image view at all - it's permanently
+        # "in text mode", the same rendering PDF's `t` key switches to.
+        self.text_mode = self.kind == "text"
         self.text_lines = []
         self.text_scroll = 0
         self.text_scroll_min = 0
@@ -930,16 +964,20 @@ class Viewer:
         self.help_active = False
 
     def _set_current_file(self):
-        """Point pdf_path/pdf_name/is_pdf/npages/cache at
+        """Point pdf_path/pdf_name/kind/npages/cache at
         self.files[self.file_index] - just the file's identity, not the
         page/zoom/search/etc. state, which __init__ sets up once and
         go_to_file() resets explicitly on every later switch."""
-        path, is_pdf, npages = self.files[self.file_index]
-        self.pdf_path = path  # a plain image file, when not is_pdf
+        path, kind, npages = self.files[self.file_index]
+        self.pdf_path = path  # a plain image or text file, when not a PDF
         self.pdf_name = os.path.basename(path)
-        self.is_pdf = is_pdf
+        self.kind = kind  # "pdf", "image", or "text"
         self.npages = npages
-        self.cache = PageCache(path, self.tmpdir, is_pdf)
+        self.cache = PageCache(path, self.tmpdir, kind == "pdf")
+
+    @property
+    def is_pdf(self):
+        return self.kind == "pdf"
 
     def next_file(self):
         self.go_to_file(self.file_index + 1, "no next file")
@@ -963,14 +1001,23 @@ class Viewer:
         self._link_index = None
         self._history_back = []
         self._history_forward = []
-        self.text_mode = False
+        self.text_mode = self.kind == "text"
+        # Mouse reporting is only useful in the page image (clicking
+        # hyperlinks, wheel scroll); off in any kind of text view, the
+        # same as enter_text_mode()/exit_text_mode() do for a PDF's `t`
+        # toggle - needed here too since a text-kind file goes straight
+        # into text_mode without ever calling those.
+        sys.stdout.write(MOUSE_OFF if self.text_mode else MOUSE_ON)
         self.zoom = 1.0
         self.page = 1
         self.scroll = 0
         self.x_offset = 0
         self._last_viewport_set = False
         self._last_marker_bounds = None
-        self._load_page()
+        if self.kind == "text":
+            self._load_text_page()
+        else:
+            self._load_page()
         self.refresh()  # its normal status line already includes "file i/N"
 
     def _recompute_geometry(self):
@@ -1029,7 +1076,9 @@ class Viewer:
         if self.resized:
             self._recompute_geometry()
             self.resized = False
-            if self.text_mode:
+            if self.kind == "text":
+                self._load_text_page()  # (re)read the file - it's always "page 1"
+            elif self.text_mode:
                 self._clamp_text_scroll()
             else:
                 self._load_page()
@@ -1105,7 +1154,10 @@ class Viewer:
             self.enter_text_mode()
 
     def _load_text_page(self):
-        self.text_lines = extract_page_text(self.pdf_path, self.page)
+        if self.kind == "text":
+            self.text_lines = read_plain_text_lines(self.pdf_path)
+        else:
+            self.text_lines = extract_page_text(self.pdf_path, self.page)
         self.text_scroll = 0
         self.text_x_offset = 0
         self._clamp_text_scroll()
@@ -1303,6 +1355,17 @@ class Viewer:
                 self.text_scroll_min, min(self.text_scroll_max, scroll)
             )
 
+    def go_to_text_line(self, n):
+        """Jump to line `n` (1-based) within the current page's text -
+        <N>g/<N>G in text mode. Lands it at the very top of the screen,
+        same as less(1)'s own <N>g, even if that leaves blank space
+        below near the end of the page - unlike normal scrolling, which
+        never scrolls past showing a full screen of content, in order
+        to guarantee the requested line is the one that ends up on top."""
+        self.text_scroll = max(
+            self.text_scroll_min, min(len(self.text_lines) - 1, n - 1)
+        )
+
     def text_scroll_down(self, n):
         if self.text_scroll < self.text_scroll_max:
             self.text_scroll = min(self.text_scroll_max, self.text_scroll + n)
@@ -1326,13 +1389,23 @@ class Viewer:
         # nothing falls at its current position.
         avail_rows = self._text_avail_rows()
         avail_cols = self._text_avail_cols()
-        highlight = self._text_highlight_for_match(self._active_search_page_match())
-        # Reset text attributes explicitly: \x1b[2J clears the screen's
-        # contents but not a still-active SGR state (e.g. a background
-        # color left on by draw_search_prompt(), which doesn't reset it
-        # since it's mid-edit) - without this, that stale color bleeds
-        # into everything drawn here.
-        out = ["\x1b[H\x1b[2J", STATUS_COLOR_OFF]
+        if self.kind == "text":
+            # No PDF page/bbox structure to reconcile against here - the
+            # match tuple already is (line_idx, start, end), exactly
+            # what a highlight needs, so use it directly.
+            highlight = (
+                self.search_matches[self.search_pos]
+                if self.search_pos is not None else None
+            )
+        else:
+            highlight = self._text_highlight_for_match(self._active_search_page_match())
+        # Reset text attributes *before* clearing, not after: a
+        # still-active SGR state (e.g. a background color left on by
+        # draw_search_prompt(), which doesn't reset it since it's
+        # mid-edit) is what \x1b[2J fills the newly-blanked cells with -
+        # resetting only afterwards colors future writes but leaves
+        # every cell the clear itself touched stuck in that stale color.
+        out = [STATUS_COLOR_OFF, "\x1b[H\x1b[2J"]
 
         left_col = -1 - self.text_x_offset
         right_col = self.text_max_line_width - self.text_x_offset
@@ -1518,7 +1591,12 @@ class Viewer:
             if match else None
         )
 
-        out = [self._format_viewport_clear(crop_w, crop_h, full_clear)]
+        # Reset *before* any clearing/erasing below, not after: a
+        # still-active SGR state (e.g. a background color left on by
+        # draw_search_prompt(), which doesn't reset it since it's
+        # mid-edit) is what a \x1b[2J/ECH fills the newly-blanked cells
+        # with - see _draw_text()'s longer version of this comment.
+        out = [STATUS_COLOR_OFF, self._format_viewport_clear(crop_w, crop_h, full_clear)]
         # Erase the previous marker before the new image lands; otherwise
         # box-drawing chars linger on iTerm2 inline-image cells (especially
         # when search is cleared or n/p jumps to another match).
@@ -1527,7 +1605,6 @@ class Viewer:
         out.extend([
             "\x1b[H",  # erase leaves the cursor elsewhere; doNotMoveCursor=1
             # draws the inline image at the current cell, not home.
-            STATUS_COLOR_OFF,  # see _draw_text()'s comment on this
             wrap_for_tmux(osc),
         ])
         if new_bounds:
@@ -1780,10 +1857,26 @@ class Viewer:
     def start_search(self, query):
         if not query:
             return
+        self.search_query = query
+        if self.kind == "text":
+            # No page/bbox structure for a plain text file - matches are
+            # just (line_idx, start, end) straight out of text_lines.
+            self.search_matches = self._find_all_text_matches()
+            if not self.search_matches:
+                self.search_pos = None
+                self.draw_status(f'"{query}" not found')
+                return
+            idx = 0
+            for i, (line_idx, _start, _end) in enumerate(self.search_matches):
+                if line_idx >= self.text_scroll:
+                    idx = i
+                    break
+            self._goto_search_match(idx)
+            return
+
         if self._search_index is None:
             self.draw_status("building search index...")
             self._search_index = build_search_index(self.pdf_path)
-        self.search_query = query
         self.search_matches = find_search_matches(self._search_index, query)
         if not self.search_matches:
             self.search_pos = None
@@ -1817,6 +1910,32 @@ class Viewer:
 
     def _goto_search_match(self, idx):
         self.search_pos = idx
+
+        if self.kind == "text":
+            line_idx, start, end = self.search_matches[idx]
+            avail_rows = self._text_avail_rows()
+            margin = avail_rows // 4
+            self.text_scroll = max(
+                self.text_scroll_min, min(self.text_scroll_max, line_idx - margin)
+            )
+            avail_cols = self._text_avail_cols()
+            line = self.text_lines[line_idx]
+            col_start = display_width(line[:start])
+            col_end = display_width(line[:end])
+            if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
+                self.text_x_offset = max(
+                    self.text_x_offset_min,
+                    min(
+                        self.text_x_offset_max,
+                        round((col_start + col_end) / 2 - avail_cols / 2),
+                    ),
+                )
+            self.refresh()
+            self.draw_status(
+                f'"{self.search_query}" match {idx + 1}/{len(self.search_matches)}'
+            )
+            return
+
         page = self.search_matches[idx][0]
 
         if self.text_mode:
@@ -1927,14 +2046,10 @@ class Viewer:
             self.text_x_offset = self.text_x_offset_min
         elif key in ("L", "SHIFT-RIGHT"):
             self.text_x_offset = self.text_x_offset_max
-        elif key in ("K", "U", "SHIFT-UP"):
+        elif key in ("K", "U", "SHIFT-UP", "g"):
             self.text_scroll = self.text_scroll_min
-        elif key in ("J", "D", "SHIFT-DOWN"):
+        elif key in ("J", "D", "SHIFT-DOWN", "G"):
             self.text_scroll = self.text_scroll_max
-        elif key in ("g", "HOME"):
-            self.go_to_page_text(1, 0)
-        elif key in ("G", "END"):
-            self.go_to_page_text(self.npages, None)
         elif key == "n":
             if self.page < self.npages:
                 self.go_to_page_text(self.page + 1, 0)
@@ -1978,14 +2093,9 @@ class Viewer:
             self.x_offset = 0
         elif key in ("L", "SHIFT-RIGHT"):
             self.x_offset = max(0, self.img.width - self.crop_width)
-        elif key in ("K", "U", "SHIFT-UP"):
+        elif key in ("K", "U", "SHIFT-UP", "g"):
             self.scroll = 0
-        elif key in ("J", "D", "SHIFT-DOWN"):
-            self.scroll = self.scroll_max
-        elif key in ("g", "HOME"):
-            self.go_page(1, 0)
-        elif key in ("G", "END"):
-            self.go_page(self.npages, None)
+        elif key in ("J", "D", "SHIFT-DOWN", "G"):
             self.scroll = self.scroll_max
         elif key == "n":
             if self.page < self.npages:
@@ -2220,18 +2330,20 @@ def run_viewer(
             continue
 
         if key == "t":
-            if viewer.is_pdf:
+            if viewer.kind == "pdf":
                 viewer.toggle_text_mode()
+            elif viewer.kind == "text":
+                viewer.draw_status("this is already a plain text file")
             else:
                 viewer.draw_status("text mode isn't available for image files")
             continue
 
         if key == "/":
-            if viewer.is_pdf:
+            if viewer.kind == "image":
+                viewer.draw_status("search isn't available for image files")
+            else:
                 search_buf = ""
                 viewer.draw_search_prompt(search_buf)
-            else:
-                viewer.draw_status("search isn't available for image files")
             continue
 
         if viewer.search_query is not None:
@@ -2258,21 +2370,50 @@ def run_viewer(
             viewer.draw_status(f"number: {num_buf}")
             continue
 
-        if key == "g" and num_buf:
-            # "<number>g" jumps straight to that page.
+        if key in ("g", "G") and num_buf:
+            # "<number>g"/"<number>G": in text mode, jump straight to
+            # that line of the current page's text (a new capability -
+            # there's no page-image equivalent of "line", so the count
+            # is simply ignored there and this falls through to plain
+            # g/G below: jump to the top/bottom of the current page).
             if viewer.text_mode:
-                viewer.go_to_page_text(int(num_buf), 0)
-            else:
-                viewer.go_page(int(num_buf), 0)
+                viewer.go_to_text_line(int(num_buf))
+                num_buf = ""
+                viewer.refresh()
+                continue
             num_buf = ""
+
+        if key in ("<", ">", "HOME", "END"):
+            # "<"/">" (HOME/END are aliases): jump to the first/last
+            # page of the whole document - "<number><" or "<number>>"
+            # jumps straight to that page instead, in either mode.
+            first = key in ("<", "HOME")
+            if num_buf:
+                target = int(num_buf)
+                num_buf = ""
+                if viewer.text_mode:
+                    viewer.go_to_page_text(target, 0)
+                else:
+                    viewer.go_page(target, 0)
+            elif viewer.text_mode:
+                if first:
+                    viewer.go_to_page_text(1, 0)
+                else:
+                    viewer.go_to_page_text(viewer.npages, None)
+            else:
+                if first:
+                    viewer.go_page(1, 0)
+                else:
+                    viewer.go_page(viewer.npages, None)
+                    viewer.scroll = viewer.scroll_max
             viewer.refresh()
             continue
 
         if key == "x":
             # "x" jumps to the first file in the list; "<number>x" jumps
-            # straight to that file (1-based, matching <number>g's page
-            # numbering) - meaningful only with more than one file, but
-            # harmless otherwise (go_to_file() just reports there's
+            # straight to that file (1-based, matching "<number><"'s
+            # page numbering) - meaningful only with more than one file,
+            # but harmless otherwise (go_to_file() just reports there's
             # nowhere to go).
             target = int(num_buf) - 1 if num_buf else 0
             num_buf = ""
@@ -2281,7 +2422,6 @@ def run_viewer(
 
         if key == "X":
             # "X" jumps to the last file in the list, mirroring "x" for
-            # the first - matches G/End for the last page vs g/Home for
             # the first.
             num_buf = ""
             viewer.go_to_file(len(viewer.files) - 1, "no such file")
@@ -2311,7 +2451,7 @@ def run_viewer(
 def main():
     parser = argparse.ArgumentParser(
         prog="pdfless",
-        description="Display a PDF or image in iTerm2 or WezTerm, less(1)-style.",
+        description="Display a PDF, image, or text file in iTerm2 or WezTerm, less(1)-style.",
         epilog=KEY_TABLE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
@@ -2324,7 +2464,7 @@ def main():
     )
     parser.add_argument(
         "files", nargs="+", metavar="file",
-        help="path to one or more PDF or image files",
+        help="path to one or more PDF, image, or text files",
     )
     parser.add_argument(
         "-p", "--page", type=int, default=1,
@@ -2379,7 +2519,7 @@ def main():
     if any(is_pdf for _, is_pdf in candidates):
         check_deps()
 
-    files = []  # [(abs_path, is_pdf, npages), ...], in the given order
+    files = []  # [(abs_path, kind, npages), ...], in the given order
     for path, is_pdf in candidates:
         if is_pdf:
             try:
@@ -2387,27 +2527,42 @@ def main():
             except Exception as e:
                 print(f"pdfless: not a usable PDF, skipping: {path} ({e})", file=sys.stderr)
                 continue
-            files.append((path, True, npages))
-        else:
+            files.append((path, "pdf", npages))
+            continue
+
+        try:
+            # .load() rather than the lighter .verify(): some formats
+            # (e.g. WMF without a system loader available) pass
+            # verify() - which only sanity-checks the file structure
+            # - but still fail to actually decode, which we'd rather
+            # catch here than mid-session once the raw/alternate-
+            # screen terminal is up.
+            with Image.open(path) as probe:
+                probe.load()
+            files.append((path, "image", 1))
+            continue
+        except Exception:
+            pass  # not an image either - try plain text next
+
+        if is_probably_text(path):
             try:
-                # .load() rather than the lighter .verify(): some formats
-                # (e.g. WMF without a system loader available) pass
-                # verify() - which only sanity-checks the file structure
-                # - but still fail to actually decode, which we'd rather
-                # catch here than mid-session once the raw/alternate-
-                # screen terminal is up.
-                with Image.open(path) as probe:
-                    probe.load()
+                read_plain_text_lines(path)  # just to validate it decodes
             except Exception as e:
                 print(
-                    f"pdfless: not a PDF or a recognized image format, "
-                    f"skipping: {path} ({e})", file=sys.stderr,
+                    f"pdfless: not valid UTF-8 text, skipping: {path} ({e})",
+                    file=sys.stderr,
                 )
                 continue
-            files.append((path, False, 1))
+            files.append((path, "text", 1))
+            continue
+
+        print(
+            f"pdfless: not a PDF, image, or text file, skipping: {path}",
+            file=sys.stderr,
+        )
 
     if not files:
-        die("no valid PDF or image files given")
+        die("no valid PDF, image, or text files given")
     start_page = max(1, min(files[0][2], args.page))
 
     if not sys.stdout.isatty() or not sys.stdin.isatty():
@@ -2417,7 +2572,11 @@ def main():
     fd = sys.stdin.fileno()
     try:
         with RawTerminal(fd) as rt:
-            sys.stdout.write("\x1b[?1049h\x1b[?25l" + MOUSE_ON + ALT_SCROLL_ON)
+            # A text-kind first file starts straight in text mode (see
+            # Viewer.__init__), where mouse reporting should be off, the
+            # same as it would be for a PDF's `t` toggle.
+            initial_mouse = MOUSE_OFF if files[0][1] == "text" else MOUSE_ON
+            sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON)
             sys.stdout.flush()
             viewer = None
             try:
