@@ -10,7 +10,7 @@ Lets you view a PDF (or a plain image - PNG, JPEG, and whatever else
 [Pillow](https://python-pillow.org) can decode) right in the terminal,
 using almost the same keybindings as `less(1)` — scroll by line, by
 half/full window, jump to a page, and so on.
-On top of that, `pdfless` also supports zooming in/out and panning.
+On top of that, `pdfless` also supports zooming in/out and panning. The mouse wheel is supported too, for scrolling.
 
 For a PDF, `pdfless` also has a plain-text mode, which extracts the
 text from the page — handy for copying text out. You can switch
@@ -21,7 +21,7 @@ match — works in both image mode and text mode.
 
 PDF hyperlinks are clickable in the page image — both external URLs
 (opened in your system browser) and internal links to another page in
-the same document. The mouse wheel is supported too, for scrolling.
+the same document.
 
 You can also open more than one file at once (`pdfless a.pdf b.png ...`)
 and switch between them with `:n`/`:p`, `less(1)`-style.
@@ -57,6 +57,16 @@ X11 forwarding, and no need to copy the PDF to your local machine first.
 <p align="center">
   <img src="docs/screenshots/pdfless-search-text-mode.png" alt="Search in text mode"><br>
   <em>Search — text mode, match highlighted</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-hyperlinks.png" alt="Clickable hyperlinks"><br>
+  <em>Clickable hyperlinks — external URLs and internal jumps</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pdfless-help.png" alt="Help overlay"><br>
+  <em>Help (<code>?</code>)</em>
 </p>
 
 ## Requirements
@@ -148,7 +158,7 @@ options:
 
 `-F`/`--follow` is handy while editing/regenerating a PDF or image (e.g.
 from a build script, a LaTeX watch loop, or a script re-rendering a PNG) —
-pdfless picks up each rebuild automatically, without losing your place.
+`pdfless` picks up each rebuild automatically, without losing your place.
 With multiple files open, it only watches whichever one is currently
 displayed, switching what it watches along with `:n`/`:p`.
 
@@ -201,7 +211,7 @@ Misc:
 | Keys | Action |
 | --- | --- |
 | click | (page image, not text mode) open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
-| mouse wheel | scroll up / down - in the page image, one line at a time like `e`/`y` (`--wheel-scroll-step` to change that); in text mode, the terminal turns it into `Up`/`Down` key presses instead, so it still works there without clashing with click-drag text selection |
+| mouse wheel | scroll up / down - in the page image, one line at a time like `e`/`y` (`--wheel-scroll-step` to change that); in text mode, one line at a time |
 | `[` / `]` | back / forward, through the positions internal links have jumped from |
 | `t` | toggle a plain-text view of the current page (its extracted text, scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) - PDFs only; on a plain image, this just reports that there's no text to show (a plain text file is already shown this way, with nothing to toggle) |
 | `f` | (text mode) toggle a border around the page's edges - on by default (`--no-frame` to start with it off) |
