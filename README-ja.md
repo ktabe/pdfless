@@ -16,6 +16,8 @@ PDF内のハイパーリンクは、PDF画像モードでクリックして開�
 
 （おまけとして、プレーンテキストファイルもそのまま開けます。最初からテキスト表示になり、PDFと同じように検索も使えます。）
 
+macOSでローカルにChrome/Chromiumがインストールされていれば、`pdfless` はWord・Excel・PowerPoint・Keynote・Pagesなど、Macの Quick Look ジェネレータがプレビューできるファイルも開けます（Quick Lookのプレビューを、裏で起動したヘッドレスChromeでレンダリングする仕組みです）。複数ページの文書（Wordなど）はPDFと同じ `n`/`p`/`g`/`G` でページ送りできます。表計算ファイルはアクティブなシートのみ表示され、シートの切り替えには対応していません。
+
 単なるターミナルプログラムなので、SSHでログインしている環境でも同じように使えます。X11転送は不要ですし、PDFを手元のマシンにコピーする必要もありません。
 
 ## スクリーンショット
@@ -59,6 +61,7 @@ PDF内のハイパーリンクは、PDF画像モードでクリックして開�
 
 - iTerm2のインラインイメージプロトコルに対応した端末 — [iTerm2](https://iterm2.com) と [WezTerm](https://wezterm.org) で動作確認済み。このプロトコルに非対応の端末では何も表示されません。
 - [poppler](https://poppler.freedesktop.org)（`pdftoppm` / `pdfinfo`）— PDFを見るときだけ必要です。画像ファイルしか開かないなら不要です。
+- macOS + ローカルのChrome/Chromium — Office/Keynote/PagesなどをQuick Look経由で開くときだけ必要です。どちらかがなければ、そのファイルは警告を出してスキップされます。
 - Python 3.9以上
 - [uv](https://docs.astral.sh/uv/)
 

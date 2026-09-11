@@ -29,6 +29,14 @@ and switch between them with `:n`/`:p`, `less(1)`-style.
 (As a bonus, `pdfless` can open a plain text file too, shown straight in
 that same text mode and searchable the same way as a PDF's.)
 
+On macOS, with a local Chrome/Chromium install, `pdfless` can also open
+anything your Mac's Quick Look generators know how to preview — Word,
+Excel, PowerPoint, Keynote, Pages, and more — by rendering that Quick
+Look preview through a headless Chrome. A multi-page document (e.g.
+Word) is paged through with the same `n`/`p`/`g`/`G` keys as a PDF;
+a spreadsheet only shows its active sheet (tab switching isn't
+supported).
+
 Since it's just a terminal program, it works the same way over SSH — no
 X11 forwarding, and no need to copy the PDF to your local machine first.
 
@@ -78,6 +86,9 @@ X11 forwarding, and no need to copy the PDF to your local machine first.
 - [poppler](https://poppler.freedesktop.org) (`pdftoppm` / `pdfinfo`) -
   only needed for viewing PDFs; not required at all if you only ever
   open plain image files.
+- macOS + a local Chrome/Chromium install - only needed for opening
+  Office/Keynote/Pages/etc. files via Quick Look; a file like that is
+  skipped with a warning if either is missing.
 - Python 3.9+
 - [uv](https://docs.astral.sh/uv/)
 

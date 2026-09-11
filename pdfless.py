@@ -14,14 +14,24 @@ matched to the terminal's actual pixel width, then scrolled by cropping
 that raster in memory and redrawing the screen - the same "redraw on
 each keypress" approach less(1) uses internally, since a terminal has
 no way to scroll just part of an inline image.
+
+Plain images and text files are supported directly, and (macOS only,
+given a local Chrome/Chromium install) anything else this Mac's Quick
+Look generators can preview - Word, Excel, PowerPoint, Keynote, Pages,
+... - via qlmanage + a headless-Chrome screenshot of its HTML preview.
 """
 
 import argparse
 import base64
+import concurrent.futures
 import fcntl
+import hashlib
 import html
 import io
+import json
 import os
+import pathlib
+import plistlib
 import re
 import select
 import shutil
@@ -37,7 +47,15 @@ import unicodedata
 import webbrowser
 from collections import OrderedDict
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageOps
+
+# A many-page/many-slide office document's full-height capture (see
+# build_office_pages()) routinely exceeds Pillow's default "decompression
+# bomb" pixel-count ceiling - that check exists for a program decoding
+# untrusted images from elsewhere, which doesn't describe a CLI pager
+# opening files the user themselves chose to view, so it's disabled here
+# rather than raising some new, still-arbitrary limit.
+Image.MAX_IMAGE_PIXELS = None
 
 __version__ = "1.1.0"
 
@@ -254,6 +272,402 @@ def check_deps():
     r = subprocess.run(["pdftoppm", "-h"], capture_output=True, text=True)
     if "-png" not in r.stdout + r.stderr:
         die(f"pdftoppm is not poppler-compatible ({POPPLER_INSTALL_HINT})")
+
+
+# Fallback path for anything that isn't a PDF, a plain image, or plain
+# text (Word/Excel/PowerPoint/Keynote/Pages/... - whatever this Mac's
+# installed Quick Look generators can handle): render it via
+# `qlmanage -o DIR -p FILE`, which drops a DIR/FILE.qlpreview/ bundle
+# containing Preview.html plus a PreviewProperties.plist ({Width,
+# Height, ShouldNotScale, ...}), then rasterize that HTML with a local
+# Chrome/Chromium (there's no Chrome-equivalent one-shot CLI screenshot
+# for Safari, so this whole path is Chrome-only).
+#
+# Most documents (Word's CanHavePages, PowerPoint/Keynote's
+# PageElementXPath - one flag per generator, and pptx sets neither)
+# render as one continuously-flowing HTML block with no actual page
+# breaks - "Height" from the plist is a single page/slide's height, and
+# the tall render is sliced into that many page-sized PNGs, giving the
+# same per-page n/p navigation as a real PDF. The one exception seen in
+# practice is Excel, whose plist sets "ShouldNotScale": there "Height"
+# is the exact total canvas size (just the active sheet - tab switching
+# is JS-driven and invisible to a static screenshot), and it also pins
+# its sheet-tab selector to the bottom of the viewport regardless of
+# window height - which would defeat the "grow the capture until content
+# stops reaching the bottom" trick used for the flowing case - so that
+# case is instead captured at exactly the given size, no growing.
+OFFICE_RENDER_SCALE = 2  # device-pixel-ratio, for headroom to zoom in
+OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
+OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
+OFFICE_MAX_CAPTURE_HEIGHT = 40000  # logical px cap on how tall a single
+# document's content is allowed to be, to keep a pathological document
+# from trying to rasterize an unbounded amount of image
+
+CHROME_CANDIDATES = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+)
+
+
+def find_chrome():
+    """A local Chrome/Chromium-family browser binary, for headless
+    screenshotting - or None if none is installed."""
+    for candidate in CHROME_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def generate_ql_preview(path, tmpdir):
+    """Ask Quick Look for an HTML preview of `path` via `qlmanage -p`.
+    Returns (html_path, width, height, should_not_scale) - width/height
+    are None if the plist didn't have them - or None if qlmanage isn't
+    available, has no generator for this file, or produced nothing."""
+    if shutil.which("qlmanage") is None:
+        return None
+    outdir = tempfile.mkdtemp(dir=tmpdir, prefix="qlpreview-")
+    try:
+        subprocess.run(
+            ["qlmanage", "-o", outdir, "-p", path],
+            capture_output=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    bundle = os.path.join(outdir, f"{os.path.basename(path)}.qlpreview")
+    html_path = os.path.join(bundle, "Preview.html")
+    if not os.path.isfile(html_path):
+        return None
+
+    width = height = None
+    should_not_scale = False
+    plist_path = os.path.join(bundle, "PreviewProperties.plist")
+    try:
+        with open(plist_path, "rb") as f:
+            props = plistlib.load(f)
+        raw_width, raw_height = props.get("Width"), props.get("Height")
+        # Chrome's --window-size silently falls back to a default size if
+        # given a float (e.g. "637.0,792.0") rather than plain integers -
+        # the plist's numbers are often floats, so round them here.
+        width = round(raw_width) if raw_width else None
+        height = round(raw_height) if raw_height else None
+        should_not_scale = bool(props.get("ShouldNotScale"))
+    except (OSError, ValueError):
+        pass
+    return html_path, width, height, should_not_scale
+
+
+_IMG_PDF_SRC_RE = re.compile(r'(<img\b[^>]*\bsrc=")([^"]+\.pdf)(")', re.IGNORECASE)
+
+
+def _rasterize_pdf_img_sources(html_path, tmpdir):
+    """A Quick Look Office preview can embed a picture as
+    `<img src="AttachmentN.pdf">` - Office.qlgenerator apparently assumes
+    a renderer that can show a PDF inline as an image, the way Safari/
+    WebKit (Quick Look's own host) does; plain Chrome can't, and just
+    shows a broken-image icon at whatever size the <img> tag's style
+    gives it. Across every picture in a slide deck, that's often enough
+    bogus extra height to throw off later slides' measured positions
+    entirely (see _measure_slide_offsets()).
+
+    Rewrites each such reference to a PNG rasterized from that PDF via
+    poppler's pdftoppm (already a dependency for viewing PDFs directly),
+    returning the path to a patched copy of the HTML - or `html_path`
+    unchanged if it has no such references, or pdftoppm isn't
+    available."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return html_path
+    refs = sorted({m.group(2) for m in _IMG_PDF_SRC_RE.finditer(content)})
+    if not refs or shutil.which("pdftoppm") is None:
+        return html_path
+
+    base_dir = os.path.dirname(html_path)
+
+    def _convert(ref):
+        src_pdf = os.path.join(base_dir, ref)
+        if not os.path.isfile(src_pdf):
+            return ref, None
+        prefix = os.path.join(tmpdir, f"qlimg-{hashlib.md5(ref.encode()).hexdigest()[:12]}")
+        try:
+            subprocess.run(
+                ["pdftoppm", "-png", "-r", "300", "-singlefile", src_pdf, prefix],
+                capture_output=True, check=True, timeout=20,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return ref, None
+        png_path = prefix + ".png"
+        return ref, (pathlib.Path(png_path).as_uri() if os.path.isfile(png_path) else None)
+
+    # A slide deck can embed dozens to a couple hundred of these (one
+    # `pdftoppm` process each) - running them one at a time was most of
+    # this whole function's cost, and each is independent, so a thread
+    # pool (subprocess.run releases the GIL while the child runs) cuts
+    # that down by roughly the number of workers.
+    png_by_ref = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for ref, uri in pool.map(_convert, refs):
+            if uri:
+                png_by_ref[ref] = uri
+    if not png_by_ref:
+        return html_path
+
+    def _replace(m):
+        uri = png_by_ref.get(m.group(2))
+        return f"{m.group(1)}{uri}{m.group(3)}" if uri else m.group(0)
+
+    patched_path = os.path.join(tmpdir, "office-images-patched.html")
+    with open(patched_path, "w", encoding="utf-8") as f:
+        f.write(_IMG_PDF_SRC_RE.sub(_replace, content))
+    return patched_path
+
+
+# GPU compositing has a texture-size ceiling that a multi-page/multi-
+# slide document's full-height capture (thousands of px, sometimes tens
+# of thousands) routinely exceeds, and Chrome then just hangs rather
+# than erroring out - confirmed hanging indefinitely with a physical
+# (post device-scale-factor) height anywhere from 24000px up on this
+# machine, well under Chrome's largest documented max-texture-size
+# (16384px on some GPUs) that a naive "keep the safety margin below
+# that" guess would have assumed safe. Software rasterization
+# (--disable-gpu) has no such limit but is noticeably slower, so a
+# capture kept safely under any plausible ceiling still uses the GPU;
+# anything at or beyond it skips straight to software rather than
+# wasting a mostly-guaranteed-to-time-out attempt first.
+OFFICE_GPU_SAFE_PHYSICAL_PX = 12000
+
+
+def _capture_html_screenshot(chrome, html_path, width, height, out_png):
+    physical_w = width * OFFICE_RENDER_SCALE
+    physical_h = height * OFFICE_RENDER_SCALE
+    base_args = [
+        chrome, "--headless", "--hide-scrollbars", "--no-sandbox",
+        f"--window-size={width},{height}",
+        f"--force-device-scale-factor={OFFICE_RENDER_SCALE}",
+        f"--screenshot={out_png}",
+        f"file://{os.path.abspath(html_path)}",
+    ]
+    if max(physical_w, physical_h) < OFFICE_GPU_SAFE_PHYSICAL_PX:
+        try:
+            subprocess.run(base_args, capture_output=True, check=True, timeout=8)
+            return
+        except subprocess.TimeoutExpired:
+            pass  # bigger than expected for this content; fall through
+    subprocess.run(
+        [base_args[0], "--disable-gpu", *base_args[1:]],
+        capture_output=True, check=True, timeout=30,
+    )
+
+
+def _sample_background_color(img):
+    """A representative "blank" background color for `img`, sampled from
+    its very top-left corner - outside the actual document content for
+    every Quick Look generator seen so far (page margin; or, for a slide
+    deck, the grey area around the first slide). Some generators' body
+    background isn't plain white (e.g. PowerPoint's is a mid-grey) and
+    stretches to fill the whole browser viewport regardless of window
+    height, so _trim_trailing_blank_rows() needs the actual color to
+    compare against rather than assuming white."""
+    return img.convert("RGB").getpixel((0, 0))
+
+
+def _trim_trailing_blank_rows(img, bg_color):
+    """Crop `img` to drop blank (uniformly `bg_color`) rows at the
+    bottom - left over from over-provisioning the capture height in
+    build_office_pages(), since the real content height isn't known
+    ahead of a render. Returns (trimmed_img, might_be_cut_off) - the
+    second value is True when content reaches all the way to the bottom
+    of `img`, meaning the capture may have been too short to fit
+    everything."""
+    rgb = img.convert("RGB")
+    bg = Image.new("RGB", rgb.size, bg_color)
+    bbox = ImageChops.difference(rgb, bg).getbbox()
+    if bbox is None:
+        return img, False  # a blank page
+    bottom = min(img.height, bbox[3] + 4)
+    return img.crop((0, 0, img.width, bottom)), bottom >= img.height - 2
+
+
+_SLIDE_MEASURE_SCRIPT = (
+    "<script>document.title = JSON.stringify({"
+    "total: document.body.scrollHeight,"
+    "tops: Array.from(document.querySelectorAll('div.slide'))"
+    ".map(function(e){return e.offsetTop;})"
+    "});</script>"
+)
+
+
+def _measure_slide_offsets(chrome, html_path, tmpdir):
+    """For a PowerPoint/Keynote-style slide deck (Preview.html stacking
+    one <div class="slide"> per slide, one after another with a small
+    margin between them), ask Chrome for the exact pixel boundary
+    between each slide, via a small script injected into a scratch copy
+    of the HTML and read back with `--dump-dom` - real computed layout
+    (offsetTop) rather than a guess. This matters because slides butt
+    right up against each other with no clean gap to detect in a
+    screenshot (each one's drop shadow bleeds into the margin before
+    the next), so slicing by the plist's Height (one slide's own
+    height, not counting that margin) drifts out of alignment with the
+    actual slide boundaries after enough slides.
+
+    Returns (total_height, [offset, ...]) in logical (unscaled) CSS
+    pixels - one offset per slide, in document order - or None if
+    Preview.html has no slide divs, or Chrome/parsing failed.
+
+    Note this still can't guarantee a slide's content never bleeds onto
+    the next one: PowerPoint auto-shrinks text at display time so it
+    fits its placeholder, but this static HTML preview doesn't reproduce
+    that, so a slide relying on it can render past its box's bottom
+    edge despite the box's own overflow:hidden - that's a limitation of
+    Office.qlgenerator's HTML output itself (also visible in Quick Look
+    proper), not something fixable from here."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+    if '<div class="slide"' not in content:
+        return None
+
+    idx = content.rfind("</body>")
+    instrumented = (
+        content[:idx] + _SLIDE_MEASURE_SCRIPT + content[idx:]
+        if idx != -1 else content + _SLIDE_MEASURE_SCRIPT
+    )
+    measure_path = os.path.join(tmpdir, "office-measure.html")
+    with open(measure_path, "w", encoding="utf-8") as f:
+        f.write(instrumented)
+    try:
+        r = subprocess.run(
+            [
+                chrome, "--headless", "--no-sandbox",
+                "--dump-dom", "--virtual-time-budget=2000",
+                f"file://{os.path.abspath(measure_path)}",
+            ],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        os.unlink(measure_path)
+
+    m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(html.unescape(m.group(1)))
+        tops = [float(t) for t in data["tops"]]
+        if not tops:
+            return None
+        return float(data["total"]), tops
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def build_office_pages(path, tmpdir):
+    """Try to render `path` - any file this Mac's Quick Look generators
+    can preview (Word, Excel, PowerPoint, Keynote, Pages, ...) - into one
+    or more page PNGs, via qlmanage + a local Chrome/Chromium. Returns a
+    list of PNG file paths (one per page, in reading order), or None if
+    qlmanage has no generator for this file or no Chrome is installed."""
+    chrome = find_chrome()
+    if chrome is None:
+        return None
+    preview = generate_ql_preview(path, tmpdir)
+    if preview is None:
+        return None
+    html_path, width, height, should_not_scale = preview
+    width = width or OFFICE_DEFAULT_WIDTH
+    height = height or OFFICE_DEFAULT_HEIGHT
+    html_path = _rasterize_pdf_img_sources(html_path, tmpdir)
+
+    # A short, stable-per-path tag so this file's capture/page PNGs don't
+    # collide with another file's (or its own previous ones, e.g. across
+    # a -F/--follow reload) - unlike id(path), collision odds are
+    # negligible even if a path string gets reused after being freed.
+    tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    out_png = os.path.join(tmpdir, f"office-capture-{tag}.png")
+    slide_offsets = None if should_not_scale else _measure_slide_offsets(chrome, html_path, tmpdir)
+    try:
+        if should_not_scale:
+            # See the comment above: Excel's sheet-tab selector is pinned
+            # to the bottom of the viewport regardless of window height,
+            # so the grow-and-trim approach below would never see it stop
+            # looking "cut off". Trust the plist's Height as-is instead -
+            # it's already sized to fit this generator's content exactly.
+            try:
+                _capture_html_screenshot(chrome, html_path, width, height, out_png)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                return None
+            trimmed = Image.open(out_png)
+            trimmed.load()
+        elif slide_offsets is not None:
+            # A slide deck (PowerPoint/Keynote) - the exact total height
+            # is already known (see _measure_slide_offsets()), so this
+            # can be captured in one shot rather than guessing.
+            total_height, _ = slide_offsets
+            capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(1, round(total_height)))
+            try:
+                _capture_html_screenshot(chrome, html_path, width, capture_height, out_png)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                return None
+            trimmed = Image.open(out_png)
+            trimmed.load()
+        else:
+            # A continuously-flowing document with no slide markers (e.g.
+            # Word) - its true total content height isn't known up front,
+            # so start with a guess and double it if the content still
+            # reaches the bottom edge, up to a hard cap. Starting small
+            # (rather than generously large) matters for speed, not just
+            # to avoid over-capturing a short document: it also keeps a
+            # short document's capture(s) under _capture_html_screenshot's
+            # GPU-safe size threshold, where every doubling from here on
+            # is much faster than the single oversized one this used to
+            # start with.
+            capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(height * 3, 1500))
+            while True:
+                try:
+                    _capture_html_screenshot(chrome, html_path, width, capture_height, out_png)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                    return None
+                img = Image.open(out_png)
+                img.load()
+                trimmed, cut_off = _trim_trailing_blank_rows(img, _sample_background_color(img))
+                if not cut_off or capture_height >= OFFICE_MAX_CAPTURE_HEIGHT:
+                    break
+                capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, capture_height * 2)
+    finally:
+        if os.path.exists(out_png):
+            os.unlink(out_png)
+
+    page_paths = []
+    if should_not_scale:
+        bounds = [0, trimmed.height]
+    elif slide_offsets is not None:
+        # Slice at each slide's own measured start, in physical (scaled)
+        # pixels - exact, unlike guessing from the screenshot itself
+        # (see _measure_slide_offsets() for why that doesn't work here).
+        total_height, tops = slide_offsets
+        bounds = [
+            min(trimmed.height, round(t * OFFICE_RENDER_SCALE)) for t in tops
+        ] + [trimmed.height]
+    else:
+        page_px = max(1, round(height * OFFICE_RENDER_SCALE))
+        npages = max(1, -(-trimmed.height // page_px))  # ceil division
+        bounds = [min(trimmed.height, i * page_px) for i in range(npages + 1)]
+
+    for i in range(len(bounds) - 1):
+        top, bottom = bounds[i], bounds[i + 1]
+        page_path = os.path.join(tmpdir, f"office-page-{tag}-{i + 1}.png")
+        trimmed.crop((0, top, trimmed.width, bottom)).save(page_path)
+        page_paths.append(page_path)
+    return page_paths
 
 
 def pdf_page_count(pdf_path):
@@ -786,24 +1200,29 @@ def _strip_leading_home(s):
 
 
 class PageCache:
-    def __init__(self, doc_path, tmpdir, is_pdf, size=CACHE_SIZE):
+    def __init__(self, doc_path, tmpdir, kind, size=CACHE_SIZE, office_pages=None):
         self.doc_path = doc_path
         self.tmpdir = tmpdir
-        self.is_pdf = is_pdf
+        self.kind = kind  # "pdf", "image", or "office"
+        self.office_pages = office_pages  # [png_path, ...], only for kind == "office"
         self.size = size
-        self._cache = OrderedDict()  # (page, dpi_rounded) -> PIL.Image
-        self._native_image = None  # image mode only, loaded once - see _get_image()
+        self._cache = OrderedDict()  # (page, dpi_or_px_rounded) -> PIL.Image
+        self._native_images = {}  # page -> PIL.Image, loaded once each - see
+        # _get_static_page(): for kind == "image" there's only ever page 1,
+        # but kind == "office" has one source file per pre-rendered page.
 
     def clear(self):
         self._cache.clear()
-        self._native_image = None  # re-read the file, e.g. for -F/--follow
+        self._native_images.clear()  # re-read the file(s), e.g. for -F/--follow
 
     def get(self, page, target_px, fit="width"):
-        """The page (PDF) or the whole file (a plain image), scaled so
-        it's `target_px` wide (fit="width") or tall (fit="height")."""
-        if self.is_pdf:
+        """The PDF page, or a pre-rendered page (a plain image file for
+        kind=="image", or one of the pre-sliced Quick Look preview PNGs
+        for kind=="office"), scaled so it's `target_px` wide (fit="width")
+        or tall (fit="height")."""
+        if self.kind == "pdf":
             return self._get_pdf_page(page, target_px, fit)
-        return self._get_image(target_px, fit)
+        return self._get_static_page(page, target_px, fit)
 
     def _get_pdf_page(self, page, target_px, fit):
         """Rasterize `page` at whatever DPI makes it `target_px` wide
@@ -835,14 +1254,18 @@ class PageCache:
             self._cache.popitem(last=False)
         return img
 
-    def _get_image(self, target_px, fit):
-        """Scale the source image (loaded once and cached natively) to
-        `target_px` wide or tall, mirroring _get_pdf_page()'s DPI-based
-        resize but by pixel ratio instead - there's no "page size in
-        points" for a plain image file."""
-        if self._native_image is None:
+    def _get_static_page(self, page, target_px, fit):
+        """Scale a pre-rendered page (loaded once per page and cached
+        natively) to `target_px` wide or tall, mirroring _get_pdf_page()'s
+        DPI-based resize but by pixel ratio instead - there's no "page
+        size in points" for a plain image or an office-preview PNG. The
+        source file is self.doc_path itself for kind=="image" (always
+        page 1), or self.office_pages[page - 1] for kind=="office"."""
+        native = self._native_images.get(page)
+        if native is None:
+            source = self.doc_path if self.kind == "image" else self.office_pages[page - 1]
             try:
-                img = Image.open(self.doc_path)
+                img = Image.open(source)
                 img = ImageOps.exif_transpose(img)  # also .load()s it
                 if img.mode in ("RGBA", "LA") or (
                     img.mode == "P" and "transparency" in img.info
@@ -857,12 +1280,12 @@ class PageCache:
                 # again later. Re-raised as a plain RuntimeError so
                 # callers (reload()'s caller in run_viewer) don't need to
                 # know anything PIL-specific to catch it.
-                raise RuntimeError(f"cannot load {self.doc_path}: {e}") from e
-            self._native_image = img
+                raise RuntimeError(f"cannot load {source}: {e}") from e
+            self._native_images[page] = img
+            native = img
 
-        native = self._native_image
         native_dim = native.width if fit == "width" else native.height
-        key = round(target_px)
+        key = (page, round(target_px))
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
@@ -904,11 +1327,14 @@ class EncodeCache:
 class Viewer:
     def __init__(
         self, files, file_index, page, tmpdir, fd, fit="width",
-        frame=True, wheel_scroll_step=1,
+        frame=True, wheel_scroll_step=1, office_pages_by_path=None,
     ):
         self.files = files  # [(path, kind, npages), ...] - one per CLI argument
         self.file_index = file_index
         self.tmpdir = tmpdir
+        # kind == "office" files' pre-rendered page PNGs (see
+        # build_office_pages()), keyed by absolute path.
+        self.office_pages_by_path = office_pages_by_path or {}
         self.fd = fd
         self.fit = fit
         self.wheel_scroll_step = wheel_scroll_step
@@ -969,11 +1395,12 @@ class Viewer:
         page/zoom/search/etc. state, which __init__ sets up once and
         go_to_file() resets explicitly on every later switch."""
         path, kind, npages = self.files[self.file_index]
-        self.pdf_path = path  # a plain image or text file, when not a PDF
+        self.pdf_path = path  # a plain image, text, or office file, when not a PDF
         self.pdf_name = os.path.basename(path)
-        self.kind = kind  # "pdf", "image", or "text"
+        self.kind = kind  # "pdf", "image", "text", or "office"
         self.npages = npages
-        self.cache = PageCache(path, self.tmpdir, kind == "pdf")
+        office_pages = self.office_pages_by_path.get(path) if kind == "office" else None
+        self.cache = PageCache(path, self.tmpdir, kind, office_pages=office_pages)
 
     @property
     def is_pdf(self):
@@ -1705,7 +2132,14 @@ class Viewer:
             if self.is_pdf:
                 self._link_index = build_link_index(self.pdf_path, self.npages)
             else:
-                self._link_index = [{"width_pt": 0.0, "height_pt": 0.0, "links": []}]
+                # No hyperlinks outside a PDF, but a multi-page "office"
+                # preview (or, in principle, a multi-page "image") still
+                # needs one empty entry per page - handle_click() indexes
+                # this by self.page, which can be > 1 for those kinds.
+                self._link_index = [
+                    {"width_pt": 0.0, "height_pt": 0.0, "links": []}
+                    for _ in range(self.npages)
+                ]
 
     def handle_click(self, col, row):
         """A left-click at 1-based terminal cell (col, row): if it landed
@@ -1839,6 +2273,18 @@ class Viewer:
         if self.is_pdf:
             self.npages = pdf_page_count(self.pdf_path)
             self.page = max(1, min(self.npages, self.page))
+        elif self.kind == "office":
+            # Unlike a PDF, an office-preview's pages are pre-rendered
+            # PNGs on disk (see build_office_pages()) rather than
+            # generated on demand - those need regenerating too, not
+            # just dropping from the cache, or a changed file would just
+            # redisplay the same stale pages.
+            pages = build_office_pages(self.pdf_path, self.tmpdir)
+            if pages:
+                self.office_pages_by_path[self.pdf_path] = pages
+                self.cache.office_pages = pages
+                self.npages = len(pages)
+                self.page = max(1, min(self.npages, self.page))
         self.cache.clear()
         self._search_index = None
         self.clear_search()
@@ -2115,12 +2561,14 @@ class Viewer:
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
     frame=True, follow=False, wheel_scroll_step=1, keep=False,
+    office_pages_by_path=None,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
     caller can inspect its final geometry (e.g. to tidy up the screen)."""
     viewer = Viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
         frame=frame, wheel_scroll_step=wheel_scroll_step,
+        office_pages_by_path=office_pages_by_path,
     )
 
     def on_winch(signum, frame):
@@ -2335,12 +2783,12 @@ def run_viewer(
             elif viewer.kind == "text":
                 viewer.draw_status("this is already a plain text file")
             else:
-                viewer.draw_status("text mode isn't available for image files")
+                viewer.draw_status("text mode isn't available for this file type")
             continue
 
         if key == "/":
-            if viewer.kind == "image":
-                viewer.draw_status("search isn't available for image files")
+            if viewer.kind in ("image", "office"):
+                viewer.draw_status("search isn't available for this file type")
             else:
                 search_buf = ""
                 viewer.draw_search_prompt(search_buf)
@@ -2451,7 +2899,11 @@ def run_viewer(
 def main():
     parser = argparse.ArgumentParser(
         prog="pdfless",
-        description="Display a PDF, image, or text file in iTerm2 or WezTerm, less(1)-style.",
+        description=(
+            "Display a PDF, image, text, or (macOS only, needs a local "
+            "Chrome) Quick-Look-previewable file (Word, Excel, "
+            "PowerPoint, ...) in iTerm2 or WezTerm, less(1)-style."
+        ),
         epilog=KEY_TABLE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
@@ -2464,7 +2916,7 @@ def main():
     )
     parser.add_argument(
         "files", nargs="+", metavar="file",
-        help="path to one or more PDF, image, or text files",
+        help="path to one or more PDF, image, text, or Quick-Look-previewable files",
     )
     parser.add_argument(
         "-p", "--page", type=int, default=1,
@@ -2519,58 +2971,71 @@ def main():
     if any(is_pdf for _, is_pdf in candidates):
         check_deps()
 
-    files = []  # [(abs_path, kind, npages), ...], in the given order
-    for path, is_pdf in candidates:
-        if is_pdf:
-            try:
-                npages = pdf_page_count(path)
-            except Exception as e:
-                print(f"pdfless: not a usable PDF, skipping: {path} ({e})", file=sys.stderr)
-                continue
-            files.append((path, "pdf", npages))
-            continue
-
-        try:
-            # .load() rather than the lighter .verify(): some formats
-            # (e.g. WMF without a system loader available) pass
-            # verify() - which only sanity-checks the file structure
-            # - but still fail to actually decode, which we'd rather
-            # catch here than mid-session once the raw/alternate-
-            # screen terminal is up.
-            with Image.open(path) as probe:
-                probe.load()
-            files.append((path, "image", 1))
-            continue
-        except Exception:
-            pass  # not an image either - try plain text next
-
-        if is_probably_text(path):
-            try:
-                read_plain_text_lines(path)  # just to validate it decodes
-            except Exception as e:
-                print(
-                    f"pdfless: not valid UTF-8 text, skipping: {path} ({e})",
-                    file=sys.stderr,
-                )
-                continue
-            files.append((path, "text", 1))
-            continue
-
-        print(
-            f"pdfless: not a PDF, image, or text file, skipping: {path}",
-            file=sys.stderr,
-        )
-
-    if not files:
-        die("no valid PDF, image, or text files given")
-    start_page = max(1, min(files[0][2], args.page))
-
-    if not sys.stdout.isatty() or not sys.stdin.isatty():
-        die("stdin/stdout must be a terminal")
-
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
-    fd = sys.stdin.fileno()
     try:
+        files = []  # [(abs_path, kind, npages), ...], in the given order
+        office_pages_by_path = {}  # kind=="office" files' page PNGs - see
+        # build_office_pages() - keyed by absolute path
+        for path, is_pdf in candidates:
+            if is_pdf:
+                try:
+                    npages = pdf_page_count(path)
+                except Exception as e:
+                    print(f"pdfless: not a usable PDF, skipping: {path} ({e})", file=sys.stderr)
+                    continue
+                files.append((path, "pdf", npages))
+                continue
+
+            try:
+                # .load() rather than the lighter .verify(): some formats
+                # (e.g. WMF without a system loader available) pass
+                # verify() - which only sanity-checks the file structure
+                # - but still fail to actually decode, which we'd rather
+                # catch here than mid-session once the raw/alternate-
+                # screen terminal is up.
+                with Image.open(path) as probe:
+                    probe.load()
+                files.append((path, "image", 1))
+                continue
+            except Exception:
+                pass  # not an image either - try plain text next
+
+            if is_probably_text(path):
+                try:
+                    read_plain_text_lines(path)  # just to validate it decodes
+                except Exception as e:
+                    print(
+                        f"pdfless: not valid UTF-8 text, skipping: {path} ({e})",
+                        file=sys.stderr,
+                    )
+                    continue
+                files.append((path, "text", 1))
+                continue
+
+            # Last resort: anything this Mac's Quick Look generators know
+            # how to preview (Word, Excel, PowerPoint, Keynote, Pages,
+            # ...), rendered via qlmanage + a local Chrome - see
+            # build_office_pages().
+            office_pages = build_office_pages(path, tmpdir)
+            if office_pages:
+                office_pages_by_path[path] = office_pages
+                files.append((path, "office", len(office_pages)))
+                continue
+
+            print(
+                f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
+                f"file, skipping: {path}",
+                file=sys.stderr,
+            )
+
+        if not files:
+            die("no valid PDF, image, text, or Quick-Look-previewable files given")
+        start_page = max(1, min(files[0][2], args.page))
+
+        if not sys.stdout.isatty() or not sys.stdin.isatty():
+            die("stdin/stdout must be a terminal")
+
+        fd = sys.stdin.fileno()
         with RawTerminal(fd) as rt:
             # A text-kind first file starts straight in text mode (see
             # Viewer.__init__), where mouse reporting should be off, the
@@ -2585,6 +3050,7 @@ def main():
                     files, 0, start_page, tmpdir, fd, rt.old,
                     fit=fit, frame=args.frame, follow=args.follow,
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
+                    office_pages_by_path=office_pages_by_path,
                 )
             finally:
                 if args.keep and viewer is not None:
