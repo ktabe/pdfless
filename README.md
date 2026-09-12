@@ -143,28 +143,39 @@ python3 pdfless.py some.pdf
 ## Usage
 
 ```
-usage: pdfless [--help] [-v] [-p PAGE] [-k] [-h] [--no-frame] [-F]
-               [--wheel-scroll-step N] file [file ...]
+usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-k] [-h] [--no-frame] [-F]
+               [--wheel-scroll-step N]
+               file [file ...]
 
 positional arguments:
-  file                    path to one or more PDF, image, or text files
+  file                  path to one or more PDF, image, text, or Quick-Look-
+                        previewable files
 
 options:
-  --help                  show this help message and exit
-  -v, --version           show program's version number and exit
-  -p, --page PAGE         page to start on, in the first file (default: 1)
-  -k, --keep              leave the last page on screen when quitting (q or
-                          ^C) instead of restoring the terminal screen
-  -h, --fit-height        fit each page to the terminal's full height
-                          instead of its full width (default: fit width)
-  --no-frame              don't draw a border around the page's edges in
-                          text mode (t); on by default, toggle any time
-                          with f
-  -F, --follow            watch the file and reload it if it changes on
-                          disk (checked every 3s), staying on the same page
-                          and in the same mode
-  --wheel-scroll-step N   scroll N lines per mouse wheel step, in the page
-                          image (default: 1)
+  --help                show this help message and exit
+  -v, --version         show program's version number and exit
+  -p, --page PAGE       page to start on, in the first file (default: 1)
+  -d, --debug           print timing for each stage of Quick Look preview
+                        rendering (qlmanage, pdftoppm, measuring, rendering,
+                        splitting into pages) to stderr
+  -s, --rendering-scale N
+                        device-pixel-ratio to render Quick Look preview files
+                        (Word/Excel/PowerPoint/etc., macOS only) at - higher
+                        looks sharper when zoomed in but is slower to render,
+                        especially for a document with many pages/slides
+                        (default: 1)
+  -k, --keep            leave the last page on screen when quitting (q or ^C)
+                        instead of restoring the terminal screen
+  -h, --fit-height      fit each page to the terminal's full height instead of
+                        its full width (default: fit width)
+  --no-frame            don't draw a border around the page's edges in text
+                        mode (t); on by default, toggle any time with f
+  -F, --follow          watch the file and reload it if it changes on disk
+                        (checked every 3s), staying on the same page and in
+                        the same mode
+  --wheel-scroll-step N
+                        scroll N lines per mouse wheel step, in the page image
+                        (default: 1)
 ```
 
 `-F`/`--follow` is handy while editing/regenerating a PDF or image (e.g.

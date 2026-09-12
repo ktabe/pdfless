@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import tty
 import unicodedata
@@ -296,7 +297,10 @@ def check_deps():
 # window height - which would defeat the "grow the capture until content
 # stops reaching the bottom" trick used for the flowing case - so that
 # case is instead captured at exactly the given size, no growing.
-OFFICE_RENDER_SCALE = 2  # device-pixel-ratio, for headroom to zoom in
+OFFICE_RENDER_SCALE = 1  # default device-pixel-ratio; --rendering-scale
+# overrides this - higher gives more headroom to zoom in before it looks
+# pixelated, at the cost of slower rendering (roughly linear in the
+# resulting pixel count) for a large document
 OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
 OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
 OFFICE_MAX_CAPTURE_HEIGHT = 40000  # logical px cap on how tall a single
@@ -304,19 +308,195 @@ OFFICE_MAX_CAPTURE_HEIGHT = 40000  # logical px cap on how tall a single
 # from trying to rasterize an unbounded amount of image
 
 CHROME_CANDIDATES = (
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    # (binary path, bundle id) - the bundle id lets find_chrome() move
+    # whichever of these is the user's actual default browser to the
+    # front, when it can tell.
+    # Vivaldi is deliberately not included here: its headless mode
+    # doesn't work (confirmed on 8.2.4133.52 - the UI process just
+    # crashes with "--headless --screenshot", with or without
+    # "--headless=old" too), so it would only make things worse for
+    # anyone who has it set as their default browser.
+    ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "com.google.chrome"),
+    ("/Applications/Chromium.app/Contents/MacOS/Chromium", "org.chromium.chromium"),
+    ("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", "com.brave.browser"),
 )
+
+
+def _default_browser_bundle_id():
+    """The bundle identifier of the user's default web browser (e.g.
+    "com.google.chrome"), read from Launch Services' own record of the
+    "http" URL handler - or None if that can't be determined. Always
+    lowercase (Launch Services itself is case-insensitive about these
+    and stores them inconsistently - e.g. Chrome's own Info.plist says
+    "com.google.Chrome" but the handler record says "com.google.chrome")."""
+    plist_path = os.path.expanduser(
+        "~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist"
+    )
+    try:
+        r = subprocess.run(
+            ["plutil", "-convert", "json", "-o", "-", plist_path],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    for handler in data.get("LSHandlers", []):
+        if handler.get("LSHandlerURLScheme") == "http":
+            role = handler.get("LSHandlerRoleAll")
+            return role.lower() if role else None
+    return None
+
+
+class _DebugTimer:
+    """Prints how long one stage of build_office_pages() took, when
+    -d/--debug is on - e.g. "pdfless: [debug] slides.pptx: rendering:
+    0.72s". A no-op (no timing overhead beyond one monotonic() call)
+    when off."""
+
+    def __init__(self, debug, label):
+        self.debug = debug
+        self.label = label
+
+    def __enter__(self):
+        if self.debug:
+            self.t0 = time.monotonic()
+        return self
+
+    def __exit__(self, *exc):
+        if self.debug:
+            print(
+                f"pdfless: [debug] {self.label}: {time.monotonic() - self.t0:.2f}s",
+                file=sys.stderr,
+            )
+
+
+class _ProgressLine:
+    """A single, self-overwriting status line on stderr - e.g.
+    "pdfless: slides.pptx: rendering (1506x39796)..." - shown while
+    build_office_pages() works through a Quick Look file, since that can
+    take anywhere from under a second to tens of seconds and would
+    otherwise look like pdfless had simply hung. Enabled only when
+    stderr is a terminal (so a redirected/piped run doesn't get a stream
+    of junk \\r-terminated lines) and -d/--debug isn't already printing
+    its own, more detailed, per-stage timing lines."""
+
+    def __init__(self, enabled):
+        self.enabled = enabled and sys.stderr.isatty()
+        self._last_len = 0
+        self._lock = threading.Lock()
+
+    def update(self, text):
+        if not self.enabled:
+            return
+        with self._lock:
+            text = f"pdfless: {text}"
+            pad = max(0, self._last_len - len(text))
+            sys.stderr.write("\r" + text + " " * pad)
+            sys.stderr.flush()
+            self._last_len = len(text)
+
+    def clear(self):
+        if not self.enabled:
+            return
+        with self._lock:
+            if self._last_len:
+                sys.stderr.write("\r" + " " * self._last_len + "\r")
+                sys.stderr.flush()
+            self._last_len = 0
+
+    def spin(self, label):
+        """Context manager: animates a spinner in front of `label` in a
+        background thread for the duration of the `with` block - for a
+        stage (e.g. the actual Chrome screenshot) that can take a while
+        with no intermediate progress to report, so at least something
+        visibly moves instead of the line just sitting there."""
+        return _Spinner(self, label)
+
+
+_SPINNER_FRAMES = "|/-\\"
+
+
+class _Spinner:
+    def __init__(self, progress, label):
+        self.progress = progress
+        self.label = label
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        if self.progress.enabled:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def _run(self):
+        i = 0
+        while not self._stop.wait(0.15 if i else 0):
+            self.progress.update(f"{_SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]} {self.label}")
+            i += 1
+
+    def __exit__(self, *exc):
+        if self._thread:
+            self._stop.set()
+            self._thread.join()
+
+
+class _ViewerProgress:
+    """Adapts build_office_pages()'s progress reporting to the Viewer's
+    own status line, for a file rendered lazily while the interactive
+    session is already running (opening a file for the first time, or
+    switching to one with :n/:p, now that each office-kind file is only
+    ever rendered once it's actually displayed - see
+    Viewer._ensure_office_pages()) - a stderr line (what _ProgressLine
+    uses for the equivalent one-off startup validation in main()) would
+    either corrupt or hide behind the alternate screen buffer at that
+    point, so this posts into the status line instead, the same as any
+    other one-off status message. Off under -d/--debug, which already
+    prints its own, more detailed, per-stage timing lines to stderr."""
+
+    def __init__(self, viewer):
+        self.viewer = viewer
+        self.enabled = not viewer.debug
+
+    def update(self, text):
+        if self.enabled:
+            self.viewer.draw_status(text)
+
+    def clear(self):
+        # Blank the line rather than restoring the viewer's normal status
+        # text (draw_status() with no argument) - that needs geometry
+        # (self.scroll_max, etc.) this may run before the current file's
+        # own first _load_page() has ever computed, if it's the very
+        # first file opened. A real refresh() always follows moments
+        # after this (from run_viewer() for the first file, or from the
+        # end of go_to_file()/reload() otherwise), painting the correct
+        # status right over this blank - so nothing is ever left stuck
+        # looking wrong.
+        if self.enabled:
+            self.viewer.draw_status(" ")
+
+    def spin(self, label):
+        return _Spinner(self, label)
 
 
 def find_chrome():
     """A local Chrome/Chromium-family browser binary, for headless
-    screenshotting - or None if none is installed."""
-    for candidate in CHROME_CANDIDATES:
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+    screenshotting - or None if none is installed. Prefers the user's
+    default browser, when it's one of these and can be determined;
+    otherwise falls back to CHROME_CANDIDATES' fixed order."""
+    default_id = _default_browser_bundle_id()
+    candidates = CHROME_CANDIDATES
+    if default_id is not None:
+        candidates = sorted(candidates, key=lambda c: c[1] != default_id)
+    for path, _bundle_id in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    for name in (
+        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+        "vivaldi", "vivaldi-stable",
+    ):
         found = shutil.which(name)
         if found:
             return found
@@ -361,10 +541,10 @@ def generate_ql_preview(path, tmpdir):
     return html_path, width, height, should_not_scale
 
 
-_IMG_PDF_SRC_RE = re.compile(r'(<img\b[^>]*\bsrc=")([^"]+\.pdf)(")', re.IGNORECASE)
+_IMG_SRC_RE = re.compile(r'(<img\b[^>]*\bsrc=")([^"]+)(")', re.IGNORECASE)
 
 
-def _rasterize_pdf_img_sources(html_path, tmpdir):
+def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
     """A Quick Look Office preview can embed a picture as
     `<img src="AttachmentN.pdf">` - Office.qlgenerator apparently assumes
     a renderer that can show a PDF inline as an image, the way Safari/
@@ -376,16 +556,23 @@ def _rasterize_pdf_img_sources(html_path, tmpdir):
 
     Rewrites each such reference to a PNG rasterized from that PDF via
     poppler's pdftoppm (already a dependency for viewing PDFs directly),
-    returning the path to a patched copy of the HTML - or `html_path`
-    unchanged if it has no such references, or pdftoppm isn't
-    available."""
+    writing the patched copy alongside the original Preview.html (under
+    a different name) rather than elsewhere, so every *other* (non-PDF)
+    `<img src>` in it - a relative path - still resolves exactly as
+    before, untouched.
+
+    Returns the path to that patched copy - or `html_path` unchanged if
+    it has no `<img src="*.pdf">` references at all (nothing to
+    rasterize), or pdftoppm isn't available. `on_progress`, if given, is
+    called as `on_progress(done, total)` after each conversion finishes."""
     try:
         with open(html_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
     except OSError:
         return html_path
-    refs = sorted({m.group(2) for m in _IMG_PDF_SRC_RE.finditer(content)})
-    if not refs or shutil.which("pdftoppm") is None:
+    all_srcs = [m.group(2) for m in _IMG_SRC_RE.finditer(content)]
+    pdf_refs = sorted({s for s in all_srcs if s.lower().endswith(".pdf")})
+    if not pdf_refs or shutil.which("pdftoppm") is None:
         return html_path
 
     base_dir = os.path.dirname(html_path)
@@ -411,20 +598,25 @@ def _rasterize_pdf_img_sources(html_path, tmpdir):
     # pool (subprocess.run releases the GIL while the child runs) cuts
     # that down by roughly the number of workers.
     png_by_ref = {}
+    done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        for ref, uri in pool.map(_convert, refs):
+        futures = [pool.submit(_convert, ref) for ref in pdf_refs]
+        for future in concurrent.futures.as_completed(futures):
+            ref, uri = future.result()
             if uri:
                 png_by_ref[ref] = uri
-    if not png_by_ref:
-        return html_path
+            done += 1
+            if on_progress:
+                on_progress(done, len(pdf_refs))
 
     def _replace(m):
-        uri = png_by_ref.get(m.group(2))
+        src = m.group(2)
+        uri = png_by_ref.get(src)
         return f"{m.group(1)}{uri}{m.group(3)}" if uri else m.group(0)
 
-    patched_path = os.path.join(tmpdir, "office-images-patched.html")
+    patched_path = os.path.join(base_dir, "pdfless-images-patched.html")
     with open(patched_path, "w", encoding="utf-8") as f:
-        f.write(_IMG_PDF_SRC_RE.sub(_replace, content))
+        f.write(_IMG_SRC_RE.sub(_replace, content))
     return patched_path
 
 
@@ -443,13 +635,13 @@ def _rasterize_pdf_img_sources(html_path, tmpdir):
 OFFICE_GPU_SAFE_PHYSICAL_PX = 12000
 
 
-def _capture_html_screenshot(chrome, html_path, width, height, out_png):
-    physical_w = width * OFFICE_RENDER_SCALE
-    physical_h = height * OFFICE_RENDER_SCALE
+def _capture_html_screenshot(chrome, html_path, width, height, out_png, render_scale):
+    physical_w = width * render_scale
+    physical_h = height * render_scale
     base_args = [
         chrome, "--headless", "--hide-scrollbars", "--no-sandbox",
         f"--window-size={width},{height}",
-        f"--force-device-scale-factor={OFFICE_RENDER_SCALE}",
+        f"--force-device-scale-factor={render_scale}",
         f"--screenshot={out_png}",
         f"file://{os.path.abspath(html_path)}",
     ]
@@ -503,7 +695,7 @@ _SLIDE_MEASURE_SCRIPT = (
 )
 
 
-def _measure_slide_offsets(chrome, html_path, tmpdir):
+def _measure_slide_offsets(chrome, html_path):
     """For a PowerPoint/Keynote-style slide deck (Preview.html stacking
     one <div class="slide"> per slide, one after another with a small
     margin between them), ask Chrome for the exact pixel boundary
@@ -540,7 +732,7 @@ def _measure_slide_offsets(chrome, html_path, tmpdir):
         content[:idx] + _SLIDE_MEASURE_SCRIPT + content[idx:]
         if idx != -1 else content + _SLIDE_MEASURE_SCRIPT
     )
-    measure_path = os.path.join(tmpdir, "office-measure.html")
+    measure_path = os.path.join(os.path.dirname(html_path), "pdfless-slide-measure.html")
     with open(measure_path, "w", encoding="utf-8") as f:
         f.write(instrumented)
     try:
@@ -570,104 +762,203 @@ def _measure_slide_offsets(chrome, html_path, tmpdir):
         return None
 
 
-def build_office_pages(path, tmpdir):
+def _probe_office_preview(path, tmpdir):
+    """Cheaply check whether `path` is something this Mac's Quick Look
+    generators can preview at all (Word, Excel, PowerPoint, Keynote,
+    Pages, ...) - i.e. whether build_office_pages() has any chance of
+    working - without doing that function's expensive part (the actual
+    Chrome rendering). Used to decide whether to accept the file at all
+    (main()) without paying for a render that may never be looked at:
+    with multiple files given on the command line, each office-kind one
+    is only actually rendered once it's displayed - see
+    Viewer._ensure_office_pages()."""
+    if find_chrome() is None:
+        return False
+    return generate_ql_preview(path, tmpdir) is not None
+
+
+def _render_office_error_placeholder(path, tmpdir, message):
+    """A single-page fallback for when build_office_pages() succeeds
+    at _probe_office_preview() time (qlmanage has a generator for this
+    file) but then fails for real later (e.g. Chrome crashes or times
+    out on this particular render) - rendering happening lazily, on
+    first display rather than upfront, means a failure here can't just
+    fall back to skipping the file the way main() does for one that
+    never looked previewable in the first place. Returns a one-item
+    list of PNG paths, the same shape build_office_pages() itself
+    returns on success, so callers don't need to special-case this."""
+    from PIL import ImageDraw
+
+    img = Image.new("RGB", (900, 200), "white")
+    draw = ImageDraw.Draw(img)
+    draw.text((20, 20), f"could not render {os.path.basename(path)}", fill="black")
+    draw.text((20, 50), message, fill="black")
+    out_path = os.path.join(
+        tmpdir, f"office-error-{hashlib.md5(path.encode('utf-8', 'surrogateescape')).hexdigest()[:12]}.png"
+    )
+    img.save(out_path)
+    return [out_path]
+
+
+def build_office_pages(
+    path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE, progress=None,
+):
     """Try to render `path` - any file this Mac's Quick Look generators
     can preview (Word, Excel, PowerPoint, Keynote, Pages, ...) - into one
     or more page PNGs, via qlmanage + a local Chrome/Chromium. Returns a
     list of PNG file paths (one per page, in reading order), or None if
-    qlmanage has no generator for this file or no Chrome is installed."""
-    chrome = find_chrome()
-    if chrome is None:
-        return None
-    preview = generate_ql_preview(path, tmpdir)
-    if preview is None:
-        return None
-    html_path, width, height, should_not_scale = preview
-    width = width or OFFICE_DEFAULT_WIDTH
-    height = height or OFFICE_DEFAULT_HEIGHT
-    html_path = _rasterize_pdf_img_sources(html_path, tmpdir)
-
-    # A short, stable-per-path tag so this file's capture/page PNGs don't
-    # collide with another file's (or its own previous ones, e.g. across
-    # a -F/--follow reload) - unlike id(path), collision odds are
-    # negligible even if a path string gets reused after being freed.
-    tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
-    out_png = os.path.join(tmpdir, f"office-capture-{tag}.png")
-    slide_offsets = None if should_not_scale else _measure_slide_offsets(chrome, html_path, tmpdir)
+    qlmanage has no generator for this file or no Chrome is installed.
+    With debug=True (-d/--debug), prints each stage's wall-clock time
+    (and which browser got used) to stderr, plus a total at the end.
+    `render_scale` is the device-pixel-ratio to rasterize at
+    (--rendering-scale) - higher is sharper when zoomed in but slower
+    for a large document. `progress`, if given, is a _ProgressLine to
+    post a one-line "what's happening right now" status to, since this
+    whole function can take anywhere from under a second to tens of
+    seconds and would otherwise look like pdfless had simply hung."""
+    if progress is None:
+        progress = _ProgressLine(enabled=False)
+    name = os.path.basename(path)
+    t_start = time.monotonic()
     try:
-        if should_not_scale:
-            # See the comment above: Excel's sheet-tab selector is pinned
-            # to the bottom of the viewport regardless of window height,
-            # so the grow-and-trim approach below would never see it stop
-            # looking "cut off". Trust the plist's Height as-is instead -
-            # it's already sized to fit this generator's content exactly.
-            try:
-                _capture_html_screenshot(chrome, html_path, width, height, out_png)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                return None
-            trimmed = Image.open(out_png)
-            trimmed.load()
-        elif slide_offsets is not None:
-            # A slide deck (PowerPoint/Keynote) - the exact total height
-            # is already known (see _measure_slide_offsets()), so this
-            # can be captured in one shot rather than guessing.
-            total_height, _ = slide_offsets
-            capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(1, round(total_height)))
-            try:
-                _capture_html_screenshot(chrome, html_path, width, capture_height, out_png)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                return None
-            trimmed = Image.open(out_png)
-            trimmed.load()
-        else:
-            # A continuously-flowing document with no slide markers (e.g.
-            # Word) - its true total content height isn't known up front,
-            # so start with a guess and double it if the content still
-            # reaches the bottom edge, up to a hard cap. Starting small
-            # (rather than generously large) matters for speed, not just
-            # to avoid over-capturing a short document: it also keeps a
-            # short document's capture(s) under _capture_html_screenshot's
-            # GPU-safe size threshold, where every doubling from here on
-            # is much faster than the single oversized one this used to
-            # start with.
-            capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(height * 3, 1500))
-            while True:
+        progress.update(f"{name}: looking for a local Chrome...")
+        chrome = find_chrome()
+        if chrome is None:
+            return None
+        if debug:
+            print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr)
+
+        progress.update(f"{name}: reading Quick Look preview...")
+        with _DebugTimer(debug, f"{name}: qlmanage preview"):
+            preview = generate_ql_preview(path, tmpdir)
+        if preview is None:
+            return None
+        html_path, width, height, should_not_scale = preview
+        width = width or OFFICE_DEFAULT_WIDTH
+        height = height or OFFICE_DEFAULT_HEIGHT
+        progress.update(f"{name}: converting embedded images...")
+        on_img_progress = lambda done, total: progress.update(
+            f"{name}: converting embedded images ({done}/{total})..."
+        )
+        with _DebugTimer(debug, f"{name}: pdftoppm (embedded images)"):
+            html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
+
+        # A short, stable-per-path tag so this file's capture/page PNGs
+        # don't collide with another file's (or its own previous ones,
+        # e.g. across a -F/--follow reload) - unlike id(path), collision
+        # odds are negligible even if a path string gets reused after
+        # being freed.
+        tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        out_png = os.path.join(tmpdir, f"office-capture-{tag}.png")
+        slide_offsets = None
+        if not should_not_scale:
+            progress.update(f"{name}: measuring page/slide layout...")
+            with _DebugTimer(debug, f"{name}: measure slide/page offsets"):
+                slide_offsets = _measure_slide_offsets(chrome, html_path)
+        try:
+            if should_not_scale:
+                # See the comment above: Excel's sheet-tab selector is
+                # pinned to the bottom of the viewport regardless of
+                # window height, so the grow-and-trim approach below
+                # would never see it stop looking "cut off". Trust the
+                # plist's Height as-is instead - it's already sized to
+                # fit this generator's content exactly.
+                label = f"{name}: rendering ({width * render_scale:.0f}x{height * render_scale:.0f})"
                 try:
-                    _capture_html_screenshot(chrome, html_path, width, capture_height, out_png)
+                    with _DebugTimer(debug, label), progress.spin(label + "..."):
+                        _capture_html_screenshot(chrome, html_path, width, height, out_png, render_scale)
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
                     return None
-                img = Image.open(out_png)
-                img.load()
-                trimmed, cut_off = _trim_trailing_blank_rows(img, _sample_background_color(img))
-                if not cut_off or capture_height >= OFFICE_MAX_CAPTURE_HEIGHT:
-                    break
-                capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, capture_height * 2)
+                trimmed = Image.open(out_png)
+                trimmed.load()
+            elif slide_offsets is not None:
+                # A slide deck (PowerPoint/Keynote) - the exact total
+                # height is already known (see _measure_slide_offsets()),
+                # so this can be captured in one shot rather than
+                # guessing.
+                total_height, _ = slide_offsets
+                capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(1, round(total_height)))
+                label = (
+                    f"{name}: rendering "
+                    f"({width * render_scale:.0f}x{capture_height * render_scale:.0f})"
+                )
+                try:
+                    with _DebugTimer(debug, label), progress.spin(label + "..."):
+                        _capture_html_screenshot(chrome, html_path, width, capture_height, out_png, render_scale)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                    return None
+                trimmed = Image.open(out_png)
+                trimmed.load()
+            else:
+                # A continuously-flowing document with no slide markers
+                # (e.g. Word) - its true total content height isn't
+                # known up front, so start with a guess and double it if
+                # the content still reaches the bottom edge, up to a
+                # hard cap. Starting small (rather than generously
+                # large) matters for speed, not just to avoid
+                # over-capturing a short document: it also keeps a short
+                # document's capture(s) under _capture_html_screenshot's
+                # GPU-safe size threshold, where every doubling from here
+                # on is much faster than the single oversized one this
+                # used to start with.
+                capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(height * 3, 1500))
+                attempt = 0
+                while True:
+                    attempt += 1
+                    label = (
+                        f"{name}: rendering attempt {attempt} "
+                        f"({width * render_scale:.0f}x{capture_height * render_scale:.0f})"
+                    )
+                    try:
+                        with _DebugTimer(debug, label), progress.spin(label + "..."):
+                            _capture_html_screenshot(
+                                chrome, html_path, width, capture_height, out_png, render_scale
+                            )
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                        return None
+                    img = Image.open(out_png)
+                    img.load()
+                    trimmed, cut_off = _trim_trailing_blank_rows(img, _sample_background_color(img))
+                    if not cut_off or capture_height >= OFFICE_MAX_CAPTURE_HEIGHT:
+                        break
+                    capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, capture_height * 2)
+        finally:
+            if os.path.exists(out_png):
+                os.unlink(out_png)
+
+        page_paths = []
+        if should_not_scale:
+            bounds = [0, trimmed.height]
+        elif slide_offsets is not None:
+            # Slice at each slide's own measured start, in physical
+            # (scaled) pixels - exact, unlike guessing from the
+            # screenshot itself (see _measure_slide_offsets() for why
+            # that doesn't work here).
+            total_height, tops = slide_offsets
+            bounds = [
+                min(trimmed.height, round(t * render_scale)) for t in tops
+            ] + [trimmed.height]
+        else:
+            page_px = max(1, round(height * render_scale))
+            npages = max(1, -(-trimmed.height // page_px))  # ceil division
+            bounds = [min(trimmed.height, i * page_px) for i in range(npages + 1)]
+
+        npages = len(bounds) - 1
+        progress.update(f"{name}: splitting into {npages} page(s)...")
+        with _DebugTimer(debug, f"{name}: splitting into {npages} page(s)"):
+            for i in range(npages):
+                top, bottom = bounds[i], bounds[i + 1]
+                page_path = os.path.join(tmpdir, f"office-page-{tag}-{i + 1}.png")
+                trimmed.crop((0, top, trimmed.width, bottom)).save(page_path)
+                page_paths.append(page_path)
+        if debug:
+            print(
+                f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
+                file=sys.stderr,
+            )
+        return page_paths
     finally:
-        if os.path.exists(out_png):
-            os.unlink(out_png)
-
-    page_paths = []
-    if should_not_scale:
-        bounds = [0, trimmed.height]
-    elif slide_offsets is not None:
-        # Slice at each slide's own measured start, in physical (scaled)
-        # pixels - exact, unlike guessing from the screenshot itself
-        # (see _measure_slide_offsets() for why that doesn't work here).
-        total_height, tops = slide_offsets
-        bounds = [
-            min(trimmed.height, round(t * OFFICE_RENDER_SCALE)) for t in tops
-        ] + [trimmed.height]
-    else:
-        page_px = max(1, round(height * OFFICE_RENDER_SCALE))
-        npages = max(1, -(-trimmed.height // page_px))  # ceil division
-        bounds = [min(trimmed.height, i * page_px) for i in range(npages + 1)]
-
-    for i in range(len(bounds) - 1):
-        top, bottom = bounds[i], bounds[i + 1]
-        page_path = os.path.join(tmpdir, f"office-page-{tag}-{i + 1}.png")
-        trimmed.crop((0, top, trimmed.width, bottom)).save(page_path)
-        page_paths.append(page_path)
-    return page_paths
+        progress.clear()
 
 
 def pdf_page_count(pdf_path):
@@ -1328,6 +1619,7 @@ class Viewer:
     def __init__(
         self, files, file_index, page, tmpdir, fd, fit="width",
         frame=True, wheel_scroll_step=1, office_pages_by_path=None,
+        debug=False, office_render_scale=OFFICE_RENDER_SCALE,
     ):
         self.files = files  # [(path, kind, npages), ...] - one per CLI argument
         self.file_index = file_index
@@ -1335,11 +1627,28 @@ class Viewer:
         # kind == "office" files' pre-rendered page PNGs (see
         # build_office_pages()), keyed by absolute path.
         self.office_pages_by_path = office_pages_by_path or {}
+        self.debug = debug  # -d/--debug: print office-preview stage timing
+        self.office_render_scale = office_render_scale  # --rendering-scale
         self.fd = fd
         self.fit = fit
         self.wheel_scroll_step = wheel_scroll_step
+        # A real (not just placeholder-0) self.rows/cols before
+        # _set_current_file() below is what lets its lazy office-preview
+        # render (if the first file needs one) show live status-line
+        # progress the same as any later one (e.g. a :n/:p switch) does -
+        # draw_status() needs both to lay out that line. The rest of the
+        # geometry (avail_height_px, cell sizes, ...) still isn't known
+        # this early - that needs self.cache, set up moments from now -
+        # but the status line alone doesn't touch any of that.
+        self.rows, self.cols, _, _ = get_term_cells(fd)
         self.page = page
         self._set_current_file()  # sets pdf_path/pdf_name/kind/npages/cache
+        # For an office-kind first file, self.npages was just determined
+        # above (by _ensure_office_pages(), lazily) rather than known
+        # ahead of time the way main() clamps a PDF/image/text file's
+        # start page against - so clamp it here instead, now that it's
+        # known.
+        self.page = max(1, min(self.npages, self.page))
         self.encode_cache = EncodeCache()
         self.scroll = 0
         self.zoom = 1.0
@@ -1348,8 +1657,7 @@ class Viewer:
         self.avail_height_px = 0
         self.cell_h_px = 1
         self.cell_w_px = 1
-        self.rows = 0
-        self.cols = 0
+        # self.rows/self.cols are already set, above - see the comment there
         self.crop_width = 0
         self.x_offset = 0
         self.help_active = False
@@ -1399,8 +1707,36 @@ class Viewer:
         self.pdf_name = os.path.basename(path)
         self.kind = kind  # "pdf", "image", "text", or "office"
         self.npages = npages
+        self._ensure_office_pages()  # a no-op unless kind == "office" and
+        # this file hasn't been rendered yet - may update self.npages and
+        # self.files[self.file_index] in place, see below
         office_pages = self.office_pages_by_path.get(path) if kind == "office" else None
         self.cache = PageCache(path, self.tmpdir, kind, office_pages=office_pages)
+
+    def _ensure_office_pages(self):
+        """With multiple files on the command line, an office-kind one
+        (Word/Excel/PowerPoint/etc. via Quick Look) is only actually
+        rendered the moment it's about to be displayed - not upfront for
+        every such file regardless of whether it's ever looked at - so
+        this is where that render happens, the first time self.kind ==
+        "office" and self.pdf_path isn't already in
+        self.office_pages_by_path. A no-op every time after that (the
+        result is cached there for the rest of the session, same as a
+        file that's always been rendered up front would be)."""
+        if self.kind != "office" or self.pdf_path in self.office_pages_by_path:
+            return
+        pages = build_office_pages(
+            self.pdf_path, self.tmpdir, debug=self.debug,
+            render_scale=self.office_render_scale, progress=_ViewerProgress(self),
+        )
+        if not pages:
+            pages = _render_office_error_placeholder(
+                self.pdf_path, self.tmpdir,
+                "Quick Look rendering failed - see -d/--debug for details",
+            )
+        self.office_pages_by_path[self.pdf_path] = pages
+        self.npages = len(pages)
+        self.files[self.file_index] = (self.pdf_path, self.kind, self.npages)
 
     @property
     def is_pdf(self):
@@ -2279,7 +2615,11 @@ class Viewer:
             # generated on demand - those need regenerating too, not
             # just dropping from the cache, or a changed file would just
             # redisplay the same stale pages.
-            pages = build_office_pages(self.pdf_path, self.tmpdir)
+            pages = build_office_pages(
+                self.pdf_path, self.tmpdir,
+                debug=self.debug, render_scale=self.office_render_scale,
+                progress=_ViewerProgress(self),
+            )
             if pages:
                 self.office_pages_by_path[self.pdf_path] = pages
                 self.cache.office_pages = pages
@@ -2561,14 +2901,15 @@ class Viewer:
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
     frame=True, follow=False, wheel_scroll_step=1, keep=False,
-    office_pages_by_path=None,
+    office_pages_by_path=None, debug=False, office_render_scale=OFFICE_RENDER_SCALE,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
     caller can inspect its final geometry (e.g. to tidy up the screen)."""
     viewer = Viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
         frame=frame, wheel_scroll_step=wheel_scroll_step,
-        office_pages_by_path=office_pages_by_path,
+        office_pages_by_path=office_pages_by_path, debug=debug,
+        office_render_scale=office_render_scale,
     )
 
     def on_winch(signum, frame):
@@ -2923,6 +3264,20 @@ def main():
         help="page to start on, in the first file (default: 1)",
     )
     parser.add_argument(
+        "-d", "--debug",
+        action="store_true",
+        help="print timing for each stage of Quick Look preview "
+             "rendering (qlmanage, pdftoppm, measuring, rendering, "
+             "splitting into pages) to stderr",
+    )
+    parser.add_argument(
+        "-s", "--rendering-scale", type=float, default=OFFICE_RENDER_SCALE, metavar="N",
+        help="device-pixel-ratio to render Quick Look preview files "
+             "(Word/Excel/PowerPoint/etc., macOS only) at - higher looks "
+             "sharper when zoomed in but is slower to render, especially "
+             "for a document with many pages/slides (default: %(default)s)",
+    )
+    parser.add_argument(
         "-k", "--keep",
         action="store_true",
         help="leave the last page on screen when quitting (q or ^C) "
@@ -3014,12 +3369,15 @@ def main():
 
             # Last resort: anything this Mac's Quick Look generators know
             # how to preview (Word, Excel, PowerPoint, Keynote, Pages,
-            # ...), rendered via qlmanage + a local Chrome - see
-            # build_office_pages().
-            office_pages = build_office_pages(path, tmpdir)
-            if office_pages:
-                office_pages_by_path[path] = office_pages
-                files.append((path, "office", len(office_pages)))
+            # ...), via qlmanage + a local Chrome. Only cheaply checked
+            # here (does qlmanage have a generator for it at all) - the
+            # expensive part (actually rendering it with Chrome) is
+            # deferred until the file is displayed, so opening several
+            # such files at once doesn't pay for rendering every one of
+            # them upfront when only whichever is looked at ever needs
+            # it - see Viewer._ensure_office_pages().
+            if _probe_office_preview(path, tmpdir):
+                files.append((path, "office", None))  # npages: unknown until rendered
                 continue
 
             print(
@@ -3030,7 +3388,12 @@ def main():
 
         if not files:
             die("no valid PDF, image, text, or Quick-Look-previewable files given")
-        start_page = max(1, min(files[0][2], args.page))
+        # files[0][2] (npages) is None for an office-kind first file -
+        # its real page count isn't known until Viewer.__init__ actually
+        # renders it, which also clamps self.page against it then; here
+        # just keep whatever page number was asked for (>= 1).
+        start_page = args.page if files[0][2] is None else min(files[0][2], args.page)
+        start_page = max(1, start_page)
 
         if not sys.stdout.isatty() or not sys.stdin.isatty():
             die("stdin/stdout must be a terminal")
@@ -3050,7 +3413,8 @@ def main():
                     files, 0, start_page, tmpdir, fd, rt.old,
                     fit=fit, frame=args.frame, follow=args.follow,
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
-                    office_pages_by_path=office_pages_by_path,
+                    office_pages_by_path=office_pages_by_path, debug=args.debug,
+                    office_render_scale=args.rendering_scale,
                 )
             finally:
                 if args.keep and viewer is not None:
