@@ -366,9 +366,17 @@ class _DebugTimer:
 
     def __exit__(self, *exc):
         if self.debug:
+            # end="\r\n", not the default "\n": this prints while the
+            # terminal's in raw mode (build_office_pages() only ever
+            # runs from inside the interactive viewer now - even a
+            # first/only file is rendered lazily, from Viewer.__init__),
+            # where a bare "\n" doesn't return the cursor to column 1
+            # (that's OPOST's job, and raw mode turns it off) - every
+            # line after the first would print staggered one column
+            # further right than the last otherwise.
             print(
                 f"pdfless: [debug] {self.label}: {time.monotonic() - self.t0:.2f}s",
-                file=sys.stderr,
+                file=sys.stderr, end="\r\n",
             )
 
 
@@ -826,7 +834,7 @@ def build_office_pages(
         if chrome is None:
             return None
         if debug:
-            print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr)
+            print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
 
         progress.update(f"{name}: reading Quick Look preview...")
         with _DebugTimer(debug, f"{name}: qlmanage preview"):
@@ -954,7 +962,7 @@ def build_office_pages(
         if debug:
             print(
                 f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
-                file=sys.stderr,
+                file=sys.stderr, end="\r\n",
             )
         return page_paths
     finally:
@@ -1441,10 +1449,13 @@ def get_pixel_size(fd):
         return got
 
     if not _warned_fallback:
+        # end="\r\n": this can print from inside the viewer's raw-mode
+        # terminal (get_pixel_size() is called on every resize), where a
+        # bare "\n" wouldn't return the cursor to column 1.
         print(
             "pdfless: could not determine terminal pixel size; falling back "
             "to a rough estimate (image sharpness/fit may be off)",
-            file=sys.stderr,
+            file=sys.stderr, end="\r\n",
         )
         _warned_fallback = True
 
