@@ -4,7 +4,6 @@ import fcntl
 import termios
 import shutil
 import signal
-import subprocess
 import sys
 import time
 import pty
@@ -13,60 +12,44 @@ import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PDFLESS_PY = os.path.join(REPO_ROOT, "pdfless.py")
+FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 sys.path.insert(0, REPO_ROOT)
 import pdfless  # noqa: E402  (import after sys.path tweak, deliberately)
 
 
+# All of these are static files checked into tests/fixtures/ rather
+# than generated on the fly - faster (no per-run PIL/textutil work),
+# easy to inspect/open by hand, and (sample.docx in particular) works
+# the same regardless of whether textutil happens to be available at
+# test time; only the actual Quick Look/Chrome rendering of it is
+# gated on macOS (see requires_office_support).
 @pytest.fixture
 def sample_pdf():
-    """A real, small PDF already checked into the repo (used for
-    screenshots/manual testing) - avoids depending on any PDF-writing
-    library just to get a valid multi-page-capable sample."""
+    """A real, small PDF already checked into the repo root (used for
+    screenshots/manual testing too) - avoids depending on any PDF-
+    writing library just to get a valid multi-page-capable sample."""
     return os.path.join(REPO_ROOT, "lorem_ipsum.pdf")
 
 
 @pytest.fixture
-def sample_image(tmp_path):
-    from PIL import Image
-
-    path = tmp_path / "sample.png"
-    Image.new("RGB", (64, 48), (200, 100, 50)).save(path)
-    return str(path)
+def sample_image():
+    return os.path.join(FIXTURES_DIR, "sample.png")
 
 
 @pytest.fixture
-def sample_text(tmp_path):
-    path = tmp_path / "sample.txt"
-    path.write_text("line one\nline two\nline three\n", encoding="utf-8")
-    return str(path)
+def sample_text():
+    return os.path.join(FIXTURES_DIR, "sample.txt")
 
 
 @pytest.fixture
-def sample_rtf(tmp_path):
-    path = tmp_path / "sample.rtf"
-    path.write_bytes(
-        rb"{\rtf1\ansi\deff0 {\fonttbl{\f0 Times New Roman;}}"
-        rb"\f0\fs24 Hello from a test RTF file.\par}"
-    )
-    return str(path)
+def sample_rtf():
+    return os.path.join(FIXTURES_DIR, "sample.rtf")
 
 
 @pytest.fixture
-def sample_docx(tmp_path):
-    """A real .docx, built with macOS's own textutil (no extra
-    dependency) from a plain text file - skipped if textutil isn't
-    available (non-macOS)."""
-    if shutil.which("textutil") is None:
-        pytest.skip("textutil not available (not macOS)")
-    src = tmp_path / "source.txt"
-    src.write_text("Hello from a test Word document.\n", encoding="utf-8")
-    out = tmp_path / "sample.docx"
-    subprocess.run(
-        ["textutil", "-convert", "docx", "-output", str(out), str(src)],
-        check=True, capture_output=True,
-    )
-    return str(out)
+def sample_docx():
+    return os.path.join(FIXTURES_DIR, "sample.docx")
 
 
 def office_support_available():
