@@ -2625,13 +2625,6 @@ class Viewer:
         # "in text mode", the same rendering PDF's `t` key switches to.
         self.text_mode = self.kind == "text"
         self.text_lines = []
-        # For a handler whose text isn't paginated (doc_handler.
-        # text_mode_is_paginated() False - office/text/rtf: see
-        # DocumentHandler), the whole document's text is extracted once
-        # (on entering text mode, or on -F/--follow reload) and reused
-        # as-is regardless of self.page, rather than re-extracted every
-        # time _load_text_page() runs.
-        self._cached_text_lines = None
         self.text_scroll = 0
         self.text_scroll_min = 0
         self.text_scroll_max = 0
@@ -2726,7 +2719,6 @@ class Viewer:
         self._history_back = []
         self._history_forward = []
         self.text_mode = self.kind == "text"
-        self._cached_text_lines = None  # stale for the previous file - reload on next 't'
         # Mouse reporting is only useful in the page image (clicking
         # hyperlinks, wheel scroll); off in any kind of text view, the
         # same as enter_text_mode()/exit_text_mode() do for a PDF's `t`
@@ -2844,15 +2836,8 @@ class Viewer:
         spreadsheet or slide deck - see extract_office_text())."""
         if not self.doc_handler.supports_text_mode():
             return False
-        if not self.doc_handler.text_mode_is_paginated():
-            # Extracted once here (or by reload()) and reused by
-            # _load_text_page() as-is regardless of self.page, rather
-            # than re-extracted every time it runs - matters for an
-            # OfficeDocument (a fresh `textutil` subprocess otherwise).
-            lines = self.doc_handler.extract_text(self.page)
-            if lines is None:
-                return False
-            self._cached_text_lines = lines
+        if self.doc_handler.extract_text(self.page) is None:
+            return False
         self.text_mode = True
         # Mouse reporting is only useful (and only turned on) for
         # clicking hyperlinks in the page image; leave it off here so
@@ -2897,14 +2882,13 @@ class Viewer:
         return self.enter_text_mode()
 
     def _load_text_page(self):
-        if self.doc_handler.text_mode_is_paginated():
-            self.text_lines = self.doc_handler.extract_text(self.page)
-        else:
-            # Not paginated (office/text/rtf) - the whole document's
-            # text, extracted once by enter_text_mode()/reload() and
-            # reused here regardless of self.page (see
-            # self._cached_text_lines).
-            self.text_lines = self._cached_text_lines
+        # For a handler whose text isn't paginated (office/text/rtf),
+        # extract_text() ignores `page` and returns the whole document
+        # every time - simplest to just always ask fresh here rather
+        # than trying to cache it, since nothing else calls this often
+        # enough for that to matter (see enter_text_mode()/reload(),
+        # the only other places that ask for this same text).
+        self.text_lines = self.doc_handler.extract_text(self.page)
         self.text_scroll = 0
         self.text_x_offset = 0
         self._clamp_text_scroll()
@@ -3613,11 +3597,6 @@ class Viewer:
         self._search_index = None
         self.clear_search()
         if self.text_mode:
-            if not self.doc_handler.text_mode_is_paginated():
-                # self._cached_text_lines is otherwise only refreshed by
-                # re-entering text mode - re-extract it here too, or a
-                # changed file would just keep showing its old text.
-                self._cached_text_lines = self.doc_handler.extract_text(self.page) or []
             self._load_text_page()
         else:
             self._load_page()
