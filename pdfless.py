@@ -1496,13 +1496,39 @@ def is_probably_text(path, sniff_bytes=8000):
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
+def is_rtf_file(path):
+    """Sniff for RTF's own signature ("{\\rtf1" right at the start),
+    the same way is_pdf_file() sniffs "%PDF-" rather than trusting the
+    extension. RTF is - deliberately - plain ASCII text, so
+    is_probably_text()'s NUL-byte heuristic happily calls it plain
+    text too; read_plain_text_lines() uses this to tell the two apart,
+    since showing an RTF file "as plain text" verbatim just means
+    showing its raw markup (control words, font/color tables, ...)
+    instead of the document's actual content."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(6) == b"{\\rtf1"
+    except OSError:
+        return False
+
+
 def read_plain_text_lines(path, tab_width=8):
     """A plain text file's lines, as pdftotext -layout's output is for a
     PDF page: ready to hand straight to the existing text-mode renderer.
     Tabs are expanded (there's no terminal-native tab stop handling in
     that renderer's column math) and stray control characters (e.g. a
     raw ESC) are stripped, so odd file content can't corrupt the
-    terminal display the way passing it through raw would."""
+    terminal display the way passing it through raw would.
+
+    An RTF file (see is_rtf_file()) is its own special case: its "plain
+    text" content is the raw RTF markup, not the document text a reader
+    actually wants, so this extracts that instead via extract_office_text()
+    (macOS's textutil) - falling back to the raw markup only if that
+    somehow fails, rather than showing nothing at all."""
+    if is_rtf_file(path):
+        lines = extract_office_text(path)
+        if lines is not None:
+            return lines
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     content = content.expandtabs(tab_width)
