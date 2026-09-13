@@ -639,11 +639,11 @@ def _parse_sheet_tabs(html_path):
 # on. A Numbers/Pages/Keynote sheet can embed its *entire* content (a
 # whole spreadsheet, potentially thousands of points on a side) as one
 # such "picture" (see _rasterize_pdf_img_sources()), and poppler's
-# pdftoppm has its own internal allocation ceiling for how big a bitmap
-# it'll produce - past that, it prints "Bogus memory allocation size"
-# but still exits 0, having written a degenerate ~1x1px PNG instead of
-# actually failing loudly. This cap keeps the request comfortably clear
-# of that ceiling.
+# pdftocairo (see there for why it's used instead of pdftoppm) has its
+# own ceiling on the cairo surface size it'll produce - past that, it
+# fails loudly (a non-zero exit, caught below) rather than silently
+# writing something degenerate. This cap keeps the request comfortably
+# clear of that ceiling.
 OFFICE_EMBEDDED_IMG_MAX_PX = 6000
 
 
@@ -681,17 +681,17 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
     http/data/...) iframe target, not just in `html_path` itself.
 
     Rewrites each PDF reference found anywhere in that tree to a PNG
-    rasterized from that PDF via poppler's pdftoppm (already a
-    dependency for viewing PDFs directly), and rewrites each iframe
-    reference to point at its (recursively) patched target. Every
-    patched file is written alongside the original it came from (same
-    directory, different name) rather than elsewhere, so any *other*
-    (non-PDF, non-iframe) relative reference in it keeps resolving
-    exactly as before, untouched.
+    rasterized from that PDF via poppler's pdftocairo (not pdftoppm -
+    see _convert() below for why), and rewrites each iframe reference
+    to point at its (recursively) patched target. Every patched file is
+    written alongside the original it came from (same directory,
+    different name) rather than elsewhere, so any *other* (non-PDF,
+    non-iframe) relative reference in it keeps resolving exactly as
+    before, untouched.
 
     Returns the path to `html_path`'s own patched copy - or `html_path`
     unchanged if nothing anywhere in the tree needed patching, or
-    pdftoppm isn't available. `on_progress`, if given, is called as
+    pdftocairo isn't available. `on_progress`, if given, is called as
     `on_progress(done, total)` after each PDF conversion finishes,
     `total` counting every one found across the whole tree."""
     # Phase 1: walk html_path plus every local HTML file it (recursively)
@@ -805,11 +805,13 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
         png_path = prefix + ".png"
         if not os.path.isfile(png_path):
             return path, ref, None
-        # Defensive: pdftoppm can exit 0 even after failing internally
-        # (see OFFICE_EMBEDDED_IMG_MAX_PX) - a degenerate ~1px output
-        # means treat it as a failure (leaving the original <img
-        # src="*.pdf"> in place - a broken-image icon - rather than
-        # silently serving a blank picture).
+        # Defensive: pdftocairo failing outright over OFFICE_EMBEDDED_IMG_MAX_PX
+        # is already caught above (a non-zero exit raises
+        # CalledProcessError) - this instead guards a degenerate ~1px
+        # output from some other cause (e.g. a wildly wrong declared
+        # width/height), treating it as a failure too (leaving the
+        # original <img src="*.pdf"> in place - a broken-image icon -
+        # rather than silently serving a blank picture).
         try:
             with Image.open(png_path) as probe:
                 if probe.width <= 2 or probe.height <= 2:
@@ -819,7 +821,7 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
         return path, ref, pathlib.Path(png_path).as_uri()
 
     # A slide deck can embed dozens to a couple hundred of these (one
-    # `pdftoppm` process each) - running them one at a time was most of
+    # `pdftocairo` process each) - running them one at a time was most of
     # this whole function's cost, and each is independent, so a thread
     # pool (subprocess.run releases the GIL while the child runs) cuts
     # that down by roughly the number of workers.
@@ -1269,7 +1271,7 @@ class ExcelWorkbook(OfficeVariant):
 
         def _render_sheet(i, sheet_name, sheet_html_path):
             with _DebugTimer(
-                debug, f"{name}: sheet {i + 1} ({sheet_name}): pdftoppm (embedded images)"
+                debug, f"{name}: sheet {i + 1} ({sheet_name}): pdftocairo (embedded images)"
             ):
                 sheet_html_path = _rasterize_pdf_img_sources(sheet_html_path, tmpdir)
             page_path = os.path.join(tmpdir, f"office-page-{self.tag}-{i + 1}.png")
@@ -1506,7 +1508,7 @@ def build_office_pages(
             on_img_progress = lambda done, total: progress.update(
                 f"{name}: converting embedded images ({done}/{total})..."
             )
-            with _DebugTimer(debug, f"{name}: pdftoppm (embedded images)"):
+            with _DebugTimer(debug, f"{name}: pdftocairo (embedded images)"):
                 html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
 
             # Confident means the Quick Look generator itself named the
@@ -4261,7 +4263,7 @@ def main():
         "-d", "--debug",
         action="store_true",
         help="print timing for each stage of Quick Look preview "
-             "rendering (qlmanage, pdftoppm, measuring, rendering, "
+             "rendering (qlmanage, pdftocairo, measuring, rendering, "
              "splitting into pages) to stderr",
     )
     parser.add_argument(

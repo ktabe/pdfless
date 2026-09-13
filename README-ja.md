@@ -60,7 +60,7 @@ macOSでローカルにChrome/Chromiumがインストールされていれば、
 ## 必要なもの
 
 - iTerm2のインラインイメージプロトコルに対応した端末 — [iTerm2](https://iterm2.com) と [WezTerm](https://wezterm.org) で動作確認済み。このプロトコルに非対応の端末では何も表示されません。
-- [poppler](https://poppler.freedesktop.org)（`pdftoppm` / `pdfinfo`）— PDFを見るときだけ必要です。画像ファイルしか開かないなら不要です。
+- [poppler](https://poppler.freedesktop.org)（`pdftoppm`/`pdfinfo`/`pdftocairo`）— PDFを直接見るとき、およびQuick Lookプレビューファイル（Word/Excel/PowerPointなど）に埋め込まれた画像をラスタライズするときに必要です。画像ファイルしか開かないなら不要です。
 - macOS + ローカルのChrome/Chromium — Office/Keynote/PagesなどをQuick Look経由で開くときだけ必要です。どちらかがなければ、そのファイルは警告を出してスキップされます。
 - Python 3.9以上
 - [uv](https://docs.astral.sh/uv/)
@@ -123,7 +123,7 @@ options:
   --help                このヘルプメッセージを表示して終了
   -v, --version         バージョン番号を表示して終了
   -p, --page PAGE       最初のファイルの開始ページ（デフォルト: 1）
-  -d, --debug           Quick Lookプレビュー生成の各段階（qlmanage、pdftoppm、
+  -d, --debug           Quick Lookプレビュー生成の各段階（qlmanage、pdftocairo、
                         計測、レンダリング、ページ分割）にかかった時間を
                         標準エラー出力に表示する
   -s, --rendering-scale N

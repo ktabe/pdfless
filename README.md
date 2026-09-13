@@ -83,9 +83,11 @@ X11 forwarding, and no need to copy the PDF to your local machine first.
   working on [iTerm2](https://iterm2.com) and
   [WezTerm](https://wezterm.org); terminals
   without this protocol will not display anything.
-- [poppler](https://poppler.freedesktop.org) (`pdftoppm` / `pdfinfo`) -
-  only needed for viewing PDFs; not required at all if you only ever
-  open plain image files.
+- [poppler](https://poppler.freedesktop.org) (`pdftoppm`/`pdfinfo`/
+  `pdftocairo`) - needed for viewing PDFs directly, and for rasterizing
+  pictures embedded in a Quick Look preview file (Word/Excel/
+  PowerPoint/etc.); not required at all if you only ever open plain
+  image files.
 - macOS + a local Chrome/Chromium install - only needed for opening
   Office/Keynote/Pages/etc. files via Quick Look; a file like that is
   skipped with a warning if either is missing.
@@ -156,7 +158,7 @@ options:
   -v, --version         show program's version number and exit
   -p, --page PAGE       page to start on, in the first file (default: 1)
   -d, --debug           print timing for each stage of Quick Look preview
-                        rendering (qlmanage, pdftoppm, measuring, rendering,
+                        rendering (qlmanage, pdftocairo, measuring, rendering,
                         splitting into pages) to stderr
   -s, --rendering-scale N
                         device-pixel-ratio to render Quick Look preview files
