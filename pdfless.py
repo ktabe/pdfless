@@ -1224,30 +1224,40 @@ def build_office_pages(
         # ever showing whichever sheet happened to be selected first.
         sheet_tabs = _parse_sheet_tabs(html_path) if should_not_scale else []
         if sheet_tabs:
-            page_paths = []
-            for i, (sheet_name, sheet_html_path) in enumerate(sheet_tabs):
-                progress.update(
-                    f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): "
-                    "converting embedded images..."
-                )
-                on_img_progress = lambda done, total, i=i: progress.update(
-                    f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): "
-                    f"converting embedded images ({done}/{total})..."
-                )
-                with _DebugTimer(debug, f"{name}: sheet {i + 1} ({sheet_name}): pdftoppm (embedded images)"):
-                    sheet_html_path = _rasterize_pdf_img_sources(
-                        sheet_html_path, tmpdir, on_progress=on_img_progress
-                    )
+            # Each sheet is an independent render (its own already-
+            # rasterized HTML, its own Chrome screenshot subprocess), so
+            # - like _rasterize_pdf_img_sources()'s embedded-image
+            # conversion - run them concurrently rather than one at a
+            # time; a workbook can have dozens of sheets, and each is
+            # mostly subprocess wait (releases the GIL), not CPU time
+            # here.
+            def _render_sheet(i, sheet_name, sheet_html_path):
+                with _DebugTimer(
+                    debug, f"{name}: sheet {i + 1} ({sheet_name}): pdftoppm (embedded images)"
+                ):
+                    sheet_html_path = _rasterize_pdf_img_sources(sheet_html_path, tmpdir)
                 page_path = os.path.join(tmpdir, f"office-page-{tag}-{i + 1}.png")
                 label = f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): rendering"
-                try:
-                    with _DebugTimer(debug, label), progress.spin(label + "..."):
-                        _capture_html_screenshot(
-                            chrome, sheet_html_path, width, height, page_path, render_scale
-                        )
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                    return None
-                page_paths.append(page_path)
+                with _DebugTimer(debug, label):
+                    _capture_html_screenshot(
+                        chrome, sheet_html_path, width, height, page_path, render_scale
+                    )
+                return page_path
+
+            page_paths = [None] * len(sheet_tabs)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(sheet_tabs))) as pool:
+                futures = {
+                    pool.submit(_render_sheet, i, sheet_name, sheet_html_path): i
+                    for i, (sheet_name, sheet_html_path) in enumerate(sheet_tabs)
+                }
+                done = 0
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        page_paths[futures[future]] = future.result()
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                        return None
+                    done += 1
+                    progress.update(f"{name}: rendered {done}/{len(sheet_tabs)} sheet(s)...")
             if debug:
                 print(
                     f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
