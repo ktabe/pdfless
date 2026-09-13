@@ -2473,18 +2473,24 @@ def _strip_leading_home(s):
     return s
 
 
-def _page_handler_for_kind(kind, doc_path):
-    """The DocumentHandler that owns PageCache.get()'s actual per-page
-    rendering for `kind` - only pdf/image/office ever go through
-    PageCache at all (a "text"-kind file is shown by Viewer's text mode
-    directly, never via a page image), so this only needs to cover
-    those three."""
+def _document_handler_for_kind(kind, path):
+    """Reconstruct the DocumentHandler for an already-classified file.
+    main()'s HANDLER_CLASSES dispatch (see UnusableFile and its
+    callers) already ran sniff() once per file to decide `kind` in the
+    first place, but only that string (plus path/npages) is kept in
+    Viewer.files - so this rebuilds the actual handler from `kind`,
+    with one cheap re-check where the string alone is ambiguous:
+    kind=="text" covers both TextDocument and RtfDocument (see
+    RtfDocument), which is_rtf_file() tells apart without needing to
+    re-run sniff()'s full validation again."""
     if kind == "pdf":
-        return PdfDocument(doc_path)
+        return PdfDocument(path)
     if kind == "image":
-        return ImageDocument(doc_path)
+        return ImageDocument(path)
     if kind == "office":
-        return OfficeDocument(doc_path)
+        return OfficeDocument(path)
+    if kind == "text":
+        return RtfDocument(path) if is_rtf_file(path) else TextDocument(path)
     return None
 
 
@@ -2492,7 +2498,7 @@ class PageCache:
     """Caches rasterized/resized page images, keyed by (page, size) -
     the actual per-kind work (rasterize a PDF page at some DPI, resize
     a pre-rendered image/office PNG) is delegated to a DocumentHandler
-    (see _page_handler_for_kind()), which reaches back into this cache's
+    (see _document_handler_for_kind()), which reaches back into this cache's
     own bookkeeping (_cached()/_store(), and tmpdir/office_pages) since
     that bookkeeping - LRU eviction, the "loaded once natively" table -
     is shared machinery than any one kind's own concern."""
@@ -2508,7 +2514,7 @@ class PageCache:
         # DocumentHandler._native_page_image(): for kind == "image"
         # there's only ever page 1, but kind == "office" has one source
         # file per pre-rendered page.
-        self.handler = _page_handler_for_kind(kind, doc_path)
+        self.handler = _document_handler_for_kind(kind, doc_path)
 
     def clear(self):
         self._cache.clear()
@@ -2617,11 +2623,13 @@ class Viewer:
         # "in text mode", the same rendering PDF's `t` key switches to.
         self.text_mode = self.kind == "text"
         self.text_lines = []
-        # kind=="office"'s whole-document text (see extract_office_text())
-        # - unlike a PDF's per-page pdftotext, textutil has no notion of
-        # pages, so this is extracted once (on entering text mode, or on
-        # -F/--follow reload) and reused as-is regardless of self.page.
-        self._office_text_lines = None
+        # For a handler whose text isn't paginated (doc_handler.
+        # text_mode_is_paginated() False - office/text/rtf: see
+        # DocumentHandler), the whole document's text is extracted once
+        # (on entering text mode, or on -F/--follow reload) and reused
+        # as-is regardless of self.page, rather than re-extracted every
+        # time _load_text_page() runs.
+        self._cached_text_lines = None
         self.text_scroll = 0
         self.text_scroll_min = 0
         self.text_scroll_max = 0
@@ -2647,7 +2655,7 @@ class Viewer:
         self.help_active = False
 
     def _set_current_file(self):
-        """Point pdf_path/pdf_name/kind/npages/cache at
+        """Point pdf_path/pdf_name/kind/npages/doc_handler/cache at
         self.files[self.file_index] - just the file's identity, not the
         page/zoom/search/etc. state, which __init__ sets up once and
         go_to_file() resets explicitly on every later switch."""
@@ -2656,6 +2664,7 @@ class Viewer:
         self.pdf_name = os.path.basename(path)
         self.kind = kind  # "pdf", "image", "text", or "office"
         self.npages = npages
+        self.doc_handler = _document_handler_for_kind(kind, path)
         self._ensure_office_pages()  # a no-op unless kind == "office" and
         # this file hasn't been rendered yet - may update self.npages and
         # self.files[self.file_index] in place, see below
@@ -2715,7 +2724,7 @@ class Viewer:
         self._history_back = []
         self._history_forward = []
         self.text_mode = self.kind == "text"
-        self._office_text_lines = None  # stale for the previous file - reload on next 't'
+        self._cached_text_lines = None  # stale for the previous file - reload on next 't'
         # Mouse reporting is only useful in the page image (clicking
         # hyperlinks, wheel scroll); off in any kind of text view, the
         # same as enter_text_mode()/exit_text_mode() do for a PDF's `t`
@@ -2828,14 +2837,20 @@ class Viewer:
 
     def enter_text_mode(self):
         """Switch to text mode - False (no-op) if there's no text to
-        show at all, which for kind=="office" means textutil couldn't
-        extract anything from this particular file (e.g. a spreadsheet
-        or slide deck - see extract_office_text())."""
-        if self.kind == "office":
-            lines = extract_office_text(self.pdf_path)
+        show at all, which for an OfficeDocument means textutil
+        couldn't extract anything from this particular file (e.g. a
+        spreadsheet or slide deck - see extract_office_text())."""
+        if not self.doc_handler.supports_text_mode():
+            return False
+        if not self.doc_handler.text_mode_is_paginated():
+            # Extracted once here (or by reload()) and reused by
+            # _load_text_page() as-is regardless of self.page, rather
+            # than re-extracted every time it runs - matters for an
+            # OfficeDocument (a fresh `textutil` subprocess otherwise).
+            lines = self.doc_handler.extract_text(self.page)
             if lines is None:
                 return False
-            self._office_text_lines = lines
+            self._cached_text_lines = lines
         self.text_mode = True
         # Mouse reporting is only useful (and only turned on) for
         # clicking hyperlinks in the page image; leave it off here so
@@ -2880,16 +2895,14 @@ class Viewer:
         return self.enter_text_mode()
 
     def _load_text_page(self):
-        if self.kind == "text":
-            self.text_lines = read_plain_text_lines(self.pdf_path)
-        elif self.kind == "office":
-            # Unlike a PDF's extract_page_text(), textutil has no notion
-            # of pages - self._office_text_lines is the whole document,
-            # extracted once by enter_text_mode()/reload() and reused
-            # here regardless of self.page.
-            self.text_lines = self._office_text_lines
+        if self.doc_handler.text_mode_is_paginated():
+            self.text_lines = self.doc_handler.extract_text(self.page)
         else:
-            self.text_lines = extract_page_text(self.pdf_path, self.page)
+            # Not paginated (office/text/rtf) - the whole document's
+            # text, extracted once by enter_text_mode()/reload() and
+            # reused here regardless of self.page (see
+            # self._cached_text_lines).
+            self.text_lines = self._cached_text_lines
         self.text_scroll = 0
         self.text_x_offset = 0
         self._clamp_text_scroll()
@@ -3598,11 +3611,11 @@ class Viewer:
         self._search_index = None
         self.clear_search()
         if self.text_mode:
-            if self.kind == "office":
-                # self._office_text_lines is otherwise only refreshed by
+            if not self.doc_handler.text_mode_is_paginated():
+                # self._cached_text_lines is otherwise only refreshed by
                 # re-entering text mode - re-extract it here too, or a
                 # changed file would just keep showing its old text.
-                self._office_text_lines = extract_office_text(self.pdf_path) or []
+                self._cached_text_lines = self.doc_handler.extract_text(self.page) or []
             self._load_text_page()
         else:
             self._load_page()
@@ -3811,13 +3824,13 @@ class Viewer:
         elif key in ("J", "D", "SHIFT-DOWN", "G"):
             self.text_scroll = self.text_scroll_max
         elif key == "n":
-            # kind=="office": text is the whole document at once (see
-            # _load_text_page()), not one page/slide at a time - nothing
-            # for "next" to do.
-            if self.kind != "office" and self.page < self.npages:
+            # A handler whose text isn't paginated (office/text/rtf -
+            # see _load_text_page()) shows the whole document at once,
+            # not one page/slide at a time - nothing for "next" to do.
+            if self.doc_handler.text_mode_is_paginated() and self.page < self.npages:
                 self.go_to_page_text(self.page + 1, 0)
         elif key == "p":
-            if self.kind != "office" and self.page > 1:
+            if self.doc_handler.text_mode_is_paginated() and self.page > 1:
                 self.go_to_page_text(self.page - 1, 0)
         elif key == "q":
             return False
@@ -4097,17 +4110,19 @@ def run_viewer(
             continue
 
         if key == "t":
-            if viewer.kind in ("pdf", "office"):
+            if viewer.kind == "text":
+                # Always-on text mode already - toggling would try to
+                # switch to an image view this kind doesn't have.
+                viewer.draw_status("this is already a plain text file")
+            elif viewer.doc_handler.supports_text_mode():
                 if not viewer.toggle_text_mode():
                     viewer.draw_status("no text could be extracted from this file")
-            elif viewer.kind == "text":
-                viewer.draw_status("this is already a plain text file")
             else:
                 viewer.draw_status("text mode isn't available for this file type")
             continue
 
         if key == "/":
-            if viewer.kind in ("image", "office"):
+            if not viewer.doc_handler.supports_search():
                 viewer.draw_status("search isn't available for this file type")
             else:
                 search_buf = ""
