@@ -111,8 +111,8 @@ python3 pdfless.py some.pdf
 ## 使い方
 
 ```
-usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-k] [-h] [--no-frame] [-F]
-               [--wheel-scroll-step N]
+usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [--no-frame]
+               [-F] [--wheel-scroll-step N]
                file [file ...]
 
 positional arguments:
@@ -132,6 +132,15 @@ options:
                         大きくするとズームイン時に鮮明になるが、ページ数・
                         スライド数が多い文書ほどレンダリングが遅くなる
                         （デフォルト: 1）
+  -c, --continuous      Quick Lookプレビューファイル（Word/Excel/PowerPoint
+                        など、macOSのみ）を、ページ/スライドに分割せず常に
+                        プレーンな画像ファイルと同じように連続スクロール
+                        表示する。ページ/スライドの境界を確信を持って
+                        判定できないとき（PowerPointが最も信頼できる。
+                        他の形式は場合による）は、デフォルトでも自動的に
+                        この表示になる。このオプションは、本来ならページ
+                        分割される文書に対しても強制的に連続表示にする
+                        （ページ/スライド番号へ直接ジャンプできなくなる）
   -k, --keep            終了時 (q または ^C) に端末画面を復元せず、
                         最後に表示していたページを画面に残す
   -h, --fit-height      各ページを端末の横幅いっぱいではなく、

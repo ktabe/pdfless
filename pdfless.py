@@ -67,8 +67,8 @@ STATUS_COLOR_OFF = "\x1b[0m"
 # filename/page/loc%/zoom% each stand out, with the trailing key-hints
 # text in a plainer, subdued color.
 STATUS_COLOR_FILENAME = "\x1b[44;97m"  # white on blue
-STATUS_COLOR_FILE_INDEX = "\x1b[46;30m"  # black on cyan
-STATUS_COLOR_PAGE = "\x1b[42;30m"  # black on green
+STATUS_COLOR_FILE_INDEX = "\x1b[46;97m"  # white on cyan
+STATUS_COLOR_PAGE = "\x1b[42;97m"  # white on green
 STATUS_COLOR_LOC = "\x1b[43;30m"  # black on yellow
 STATUS_COLOR_ZOOM = "\x1b[45;97m"  # white on magenta
 STATUS_COLOR_HELP = "\x1b[100;37m"  # light grey on dark grey
@@ -301,6 +301,12 @@ OFFICE_RENDER_SCALE = 1  # default device-pixel-ratio; --rendering-scale
 # overrides this - higher gives more headroom to zoom in before it looks
 # pixelated, at the cost of slower rendering (roughly linear in the
 # resulting pixel count) for a large document
+OFFICE_RENDER_SCALE_FLOWING = 2  # default device-pixel-ratio for
+# continuously-flowing text (Word and the like - no slide/page markers
+# at all, so no slide_offsets - see build_office_pages()): these are
+# text-heavy and usually short, so favor sharpness over the render-time
+# tradeoff OFFICE_RENDER_SCALE otherwise makes for a many-slide deck -
+# unless --rendering-scale was passed explicitly.
 OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
 OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
 OFFICE_MAX_CAPTURE_HEIGHT = 40000  # logical px cap on how tall a single
@@ -513,9 +519,13 @@ def find_chrome():
 
 def generate_ql_preview(path, tmpdir):
     """Ask Quick Look for an HTML preview of `path` via `qlmanage -p`.
-    Returns (html_path, width, height, should_not_scale) - width/height
-    are None if the plist didn't have them - or None if qlmanage isn't
-    available, has no generator for this file, or produced nothing."""
+    Returns (html_path, width, height, should_not_scale,
+    page_element_xpath) - width/height are None if the plist didn't
+    have them, page_element_xpath is None if it has no
+    "PageElementXPath" (meaning this document has no distinct
+    page/slide elements to speak of - e.g. Word's continuously-flowing
+    text) - or None if qlmanage isn't available, has no generator for
+    this file, or produced nothing."""
     if shutil.which("qlmanage") is None:
         return None
     outdir = tempfile.mkdtemp(dir=tmpdir, prefix="qlpreview-")
@@ -531,7 +541,7 @@ def generate_ql_preview(path, tmpdir):
     if not os.path.isfile(html_path):
         return None
 
-    width = height = None
+    width = height = page_element_xpath = None
     should_not_scale = False
     plist_path = os.path.join(bundle, "PreviewProperties.plist")
     try:
@@ -544,88 +554,271 @@ def generate_ql_preview(path, tmpdir):
         width = round(raw_width) if raw_width else None
         height = round(raw_height) if raw_height else None
         should_not_scale = bool(props.get("ShouldNotScale"))
+        page_element_xpath = props.get("PageElementXPath") or None
     except (OSError, ValueError):
         pass
-    return html_path, width, height, should_not_scale
+    return html_path, width, height, should_not_scale, page_element_xpath
 
 
 _IMG_SRC_RE = re.compile(r'(<img\b[^>]*\bsrc=")([^"]+)(")', re.IGNORECASE)
+_IMG_TAG_RE = re.compile(r'<img\b[^>]*>', re.IGNORECASE)
+_IFRAME_SRC_RE = re.compile(r'(<iframe\b[^>]*\bsrc=")([^"]+)(")', re.IGNORECASE)
+_ABSOLUTE_SRC_RE = re.compile(r'^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|/)')  # a URL scheme, or an absolute path
+_SRC_ATTR_RE = re.compile(r'\bsrc="([^"]+)"', re.IGNORECASE)
+_WIDTH_ATTR_RE = re.compile(r'\bwidth="([\d.]+)"', re.IGNORECASE)
+_HEIGHT_ATTR_RE = re.compile(r'\bheight="([\d.]+)"', re.IGNORECASE)
+
+# A hard ceiling on either dimension of a PDF-embedded picture, once
+# rasterized - regardless of what DPI the math below otherwise settles
+# on. A Numbers/Pages/Keynote sheet can embed its *entire* content (a
+# whole spreadsheet, potentially thousands of points on a side) as one
+# such "picture" (see _rasterize_pdf_img_sources()), and poppler's
+# pdftoppm has its own internal allocation ceiling for how big a bitmap
+# it'll produce - past that, it prints "Bogus memory allocation size"
+# but still exits 0, having written a degenerate ~1x1px PNG instead of
+# actually failing loudly. This cap keeps the request comfortably clear
+# of that ceiling.
+OFFICE_EMBEDDED_IMG_MAX_PX = 6000
+
+
+def _pdf_page_size_pt_safe(pdf_path):
+    """Like pdf_page_size_pt(), but tolerant of failure (returns None
+    rather than die()ing the whole program) - for sizing a picture
+    embedded in a Quick Look preview, where a bad reading just means
+    falling back to a default DPI rather than aborting entirely."""
+    try:
+        out = subprocess.run(
+            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    m = re.search(r"^Page\s*(?:\d+\s+)?size:\s+([\d.]+) x ([\d.]+)", out, re.MULTILINE)
+    return (float(m.group(1)), float(m.group(2))) if m else None
 
 
 def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
-    """A Quick Look Office preview can embed a picture as
-    `<img src="AttachmentN.pdf">` - Office.qlgenerator apparently assumes
-    a renderer that can show a PDF inline as an image, the way Safari/
-    WebKit (Quick Look's own host) does; plain Chrome can't, and just
-    shows a broken-image icon at whatever size the <img> tag's style
-    gives it. Across every picture in a slide deck, that's often enough
-    bogus extra height to throw off later slides' measured positions
-    entirely (see _measure_slide_offsets()).
+    """A Quick Look Office/iWork preview can embed a picture as
+    `<img src="AttachmentN.pdf">` - the relevant generator apparently
+    assumes a renderer that can show a PDF inline as an image, the way
+    Safari/WebKit (Quick Look's own host) does; plain Chrome can't, and
+    just shows a broken-image icon at whatever size the <img> tag's
+    style gives it. Across every picture in a slide deck, that's often
+    enough bogus extra height to throw off later slides' measured
+    positions entirely (see _measure_slide_offsets()).
 
-    Rewrites each such reference to a PNG rasterized from that PDF via
-    poppler's pdftoppm (already a dependency for viewing PDFs directly),
-    writing the patched copy alongside the original Preview.html (under
-    a different name) rather than elsewhere, so every *other* (non-PDF)
-    `<img src>` in it - a relative path - still resolves exactly as
-    before, untouched.
+    iWork.qlgenerator (Numbers/Pages/Keynote) additionally splits a
+    multi-sheet/page document into one `<iframe src="AttachmentN.html">`
+    per sheet rather than embedding everything directly in Preview.html
+    the way Office.qlgenerator does - and it's each of *those* files
+    that actually embeds a `<img src="*.pdf">`, not Preview.html itself.
+    So this looks for that pattern recursively, through every local (not
+    http/data/...) iframe target, not just in `html_path` itself.
 
-    Returns the path to that patched copy - or `html_path` unchanged if
-    it has no `<img src="*.pdf">` references at all (nothing to
-    rasterize), or pdftoppm isn't available. `on_progress`, if given, is
-    called as `on_progress(done, total)` after each conversion finishes."""
-    try:
-        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError:
+    Rewrites each PDF reference found anywhere in that tree to a PNG
+    rasterized from that PDF via poppler's pdftoppm (already a
+    dependency for viewing PDFs directly), and rewrites each iframe
+    reference to point at its (recursively) patched target. Every
+    patched file is written alongside the original it came from (same
+    directory, different name) rather than elsewhere, so any *other*
+    (non-PDF, non-iframe) relative reference in it keeps resolving
+    exactly as before, untouched.
+
+    Returns the path to `html_path`'s own patched copy - or `html_path`
+    unchanged if nothing anywhere in the tree needed patching, or
+    pdftoppm isn't available. `on_progress`, if given, is called as
+    `on_progress(done, total)` after each PDF conversion finishes,
+    `total` counting every one found across the whole tree."""
+    # Phase 1: walk html_path plus every local HTML file it (recursively)
+    # embeds via <iframe src>, collecting each file's own content and
+    # its own <img src="*.pdf"> references.
+    file_contents = {}  # path -> content
+    pdf_refs_by_file = {}  # path -> [ref, ...]
+    to_visit = [html_path]
+    seen = set()
+    while to_visit:
+        path = to_visit.pop()
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        file_contents[path] = content
+        base_dir = os.path.dirname(path)
+        # (ref, declared width, declared height) for every <img src=
+        # "*.pdf"> - the declared size (in CSS px, i.e. ~1:1 with
+        # points) is what lets _convert() below pick a sane DPI instead
+        # of a fixed one that can be wildly wrong for a huge embedded
+        # page. Deduplicated by ref, first occurrence winning, same as
+        # a plain set() would for the src-only info this replaced.
+        pdf_refs = {}
+        for tag_m in _IMG_TAG_RE.finditer(content):
+            tag = tag_m.group(0)
+            src_m = _SRC_ATTR_RE.search(tag)
+            if not src_m or not src_m.group(1).lower().endswith(".pdf"):
+                continue
+            ref = src_m.group(1)
+            if ref in pdf_refs:
+                continue
+            w_m, h_m = _WIDTH_ATTR_RE.search(tag), _HEIGHT_ATTR_RE.search(tag)
+            pdf_refs[ref] = (
+                float(w_m.group(1)) if w_m else None,
+                float(h_m.group(1)) if h_m else None,
+            )
+        pdf_refs_by_file[path] = sorted(
+            (ref, w, h) for ref, (w, h) in pdf_refs.items()
+        )
+        for m in _IFRAME_SRC_RE.finditer(content):
+            src = m.group(2)
+            if _ABSOLUTE_SRC_RE.match(src):
+                continue  # http(s)/data/... - not a local sibling file
+            candidate = os.path.join(base_dir, src)
+            if src.lower().endswith((".html", ".htm")) and os.path.isfile(candidate):
+                to_visit.append(candidate)
+
+    if not shutil.which("pdftocairo"):
         return html_path
-    all_srcs = [m.group(2) for m in _IMG_SRC_RE.finditer(content)]
-    pdf_refs = sorted({s for s in all_srcs if s.lower().endswith(".pdf")})
-    if not pdf_refs or shutil.which("pdftoppm") is None:
+    all_refs = [
+        (path, ref, w, h)
+        for path, refs in pdf_refs_by_file.items()
+        for ref, w, h in refs
+    ]
+    if not all_refs:
         return html_path
 
-    base_dir = os.path.dirname(html_path)
-
-    def _convert(ref):
-        src_pdf = os.path.join(base_dir, ref)
+    def _convert(item):
+        path, ref, decl_w, decl_h = item
+        src_pdf = os.path.join(os.path.dirname(path), ref)
         if not os.path.isfile(src_pdf):
-            return ref, None
-        prefix = os.path.join(tmpdir, f"qlimg-{hashlib.md5(ref.encode()).hexdigest()[:12]}")
+            return path, ref, None
+
+        # A fixed DPI (this used to always be 300) is wildly wrong for
+        # a picture that's actually an entire spreadsheet/page flattened
+        # into one PDF, sized in the thousands of points on a side - Numbers
+        # in particular does this for a sheet too big to fit its normal
+        # preview. Aim instead for roughly the size the <img> tag is
+        # actually going to display it at (that's in CSS px, and a PDF
+        # point is already ~1 CSS px at 96dpi, so this is close to
+        # 1:1 - not literally 1:1 only because a page's declared point
+        # size can differ slightly from its <img> tag's declared pixel
+        # size), falling back to the old 300 if either the page size or
+        # the declared display size isn't available - then hard-capped
+        # regardless (see OFFICE_EMBEDDED_IMG_MAX_PX).
+        dpi = 300.0
+        page_size = _pdf_page_size_pt_safe(src_pdf)
+        if page_size:
+            page_w_pt, page_h_pt = page_size
+            if decl_w and page_w_pt:
+                dpi = 72.0 * decl_w / page_w_pt
+            elif decl_h and page_h_pt:
+                dpi = 72.0 * decl_h / page_h_pt
+            if page_w_pt:
+                dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_w_pt)
+            if page_h_pt:
+                dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_h_pt)
+        dpi = max(36.0, min(300.0, dpi))
+
+        prefix = os.path.join(tmpdir, f"qlimg-{hashlib.md5(src_pdf.encode()).hexdigest()[:12]}")
         try:
             subprocess.run(
-                ["pdftoppm", "-png", "-r", "300", "-singlefile", src_pdf, prefix],
+                # pdftocairo (not pdftoppm - it has no -transp option) so a
+                # picture with a transparent background (e.g. a PNG/GIF with
+                # alpha, flattened into this PDF by the Quick Look
+                # generator) keeps its transparency instead of getting
+                # composited onto an opaque white background here, before
+                # Chrome ever gets to draw it over the slide's real
+                # background.
+                ["pdftocairo", "-png", "-transp", "-r", str(round(dpi)), "-singlefile", src_pdf, prefix],
                 capture_output=True, check=True, timeout=20,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            return ref, None
+            return path, ref, None
         png_path = prefix + ".png"
-        return ref, (pathlib.Path(png_path).as_uri() if os.path.isfile(png_path) else None)
+        if not os.path.isfile(png_path):
+            return path, ref, None
+        # Defensive: pdftoppm can exit 0 even after failing internally
+        # (see OFFICE_EMBEDDED_IMG_MAX_PX) - a degenerate ~1px output
+        # means treat it as a failure (leaving the original <img
+        # src="*.pdf"> in place - a broken-image icon - rather than
+        # silently serving a blank picture).
+        try:
+            with Image.open(png_path) as probe:
+                if probe.width <= 2 or probe.height <= 2:
+                    return path, ref, None
+        except Exception:
+            return path, ref, None
+        return path, ref, pathlib.Path(png_path).as_uri()
 
     # A slide deck can embed dozens to a couple hundred of these (one
     # `pdftoppm` process each) - running them one at a time was most of
     # this whole function's cost, and each is independent, so a thread
     # pool (subprocess.run releases the GIL while the child runs) cuts
     # that down by roughly the number of workers.
-    png_by_ref = {}
+    png_by_file_ref = {}  # (path, ref) -> uri
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(_convert, ref) for ref in pdf_refs]
+        futures = [pool.submit(_convert, item) for item in all_refs]
         for future in concurrent.futures.as_completed(futures):
-            ref, uri = future.result()
+            path, ref, uri = future.result()
             if uri:
-                png_by_ref[ref] = uri
+                png_by_file_ref[(path, ref)] = uri
             done += 1
             if on_progress:
-                on_progress(done, len(pdf_refs))
+                on_progress(done, len(all_refs))
 
-    def _replace(m):
-        src = m.group(2)
-        uri = png_by_ref.get(src)
-        return f"{m.group(1)}{uri}{m.group(3)}" if uri else m.group(0)
+    # Phase 2: write a patched copy of every file that needs one - its
+    # own img srcs rasterized, and/or an iframe src repointed at its
+    # child's patched copy. _patch() recurses into iframe targets first,
+    # so by the time a parent rewrites its own iframe src, it already
+    # knows whether (and where) that child got patched.
+    patched_by_original = {}
 
-    patched_path = os.path.join(base_dir, "pdfless-images-patched.html")
-    with open(patched_path, "w", encoding="utf-8") as f:
-        f.write(_IMG_SRC_RE.sub(_replace, content))
-    return patched_path
+    def _patch(path):
+        if path in patched_by_original:
+            return patched_by_original[path]
+        content = file_contents.get(path)
+        if content is None:
+            return path
+        base_dir = os.path.dirname(path)
+        changed = False
+
+        def _replace_img(m):
+            nonlocal changed
+            uri = png_by_file_ref.get((path, m.group(2)))
+            if not uri:
+                return m.group(0)
+            changed = True
+            return f"{m.group(1)}{uri}{m.group(3)}"
+
+        def _replace_iframe(m):
+            nonlocal changed
+            src = m.group(2)
+            candidate = os.path.join(base_dir, src)
+            if candidate not in file_contents:
+                return m.group(0)
+            patched_child = _patch(candidate)
+            if patched_child == candidate:
+                return m.group(0)
+            changed = True
+            return f"{m.group(1)}{os.path.basename(patched_child)}{m.group(3)}"
+
+        content = _IMG_SRC_RE.sub(_replace_img, content)
+        content = _IFRAME_SRC_RE.sub(_replace_iframe, content)
+
+        if not changed:
+            patched_by_original[path] = path
+            return path
+        tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        patched_path = os.path.join(base_dir, f"pdfless-patched-{tag}.html")
+        with open(patched_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        patched_by_original[path] = patched_path
+        return patched_path
+
+    return _patch(html_path)
 
 
 # GPU compositing has a texture-size ceiling that a multi-page/multi-
@@ -694,52 +887,140 @@ def _trim_trailing_blank_rows(img, bg_color):
     return img.crop((0, 0, img.width, bottom)), bottom >= img.height - 2
 
 
-_SLIDE_MEASURE_SCRIPT = (
-    "<script>document.title = JSON.stringify({"
-    "total: document.body.scrollHeight,"
-    "tops: Array.from(document.querySelectorAll('div.slide'))"
-    ".map(function(e){return e.offsetTop;})"
-    "});</script>"
-)
+def _build_slide_measure_script(page_element_xpath):
+    """The plist's own "PageElementXPath" (see generate_ql_preview()) is
+    exactly what selects each page/slide's top-level element for this
+    particular generator - Office.qlgenerator (Word/PowerPoint) says
+    "/html/body/div", iWork.qlgenerator (Keynote) says
+    "/html/body/div[starts-with(@class, 'slideStyle')]" - so use it via
+    document.evaluate() rather than guessing a CSS selector (a single
+    class name that happens to work for one generator, e.g. Office's
+    "div.slide", silently selects nothing at all for another - which is
+    indistinguishable from "no pages to measure" and falls back to
+    slicing by the plist's Height instead, drifting out of alignment
+    with the actual page/slide boundaries after enough of them - this
+    was previously confirmed with PowerPoint, and resurfaces the same
+    way with Keynote using a hardcoded selector that's specific to
+    Office's own output).
+
+    Waits for every <img> to finish loading before measuring, not just
+    the page's own load event: one iWork.qlgenerator variant gives each
+    page div no explicit size at all, relying entirely on its one
+    full-bleed <img>'s natural (post-decode) height, so measuring before
+    every image is actually decoded reads every offsetTop as 0 (each
+    div still being height-0 at that point, none of them having pushed
+    the next one down yet) - confirmed on a 36-slide deck where that's
+    exactly what happened."""
+    measure_fn = (
+        "function(){"
+        "document.title = JSON.stringify({"
+        "total: document.body.scrollHeight,"
+        "tops: (function(){"
+        f"var r = document.evaluate({json.dumps(page_element_xpath)}, document, null, "
+        "XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);"
+        "var out = [];"
+        "for (var i = 0; i < r.snapshotLength; i++) { out.push(r.snapshotItem(i).offsetTop); }"
+        "return out;"
+        "})()"
+        "});"
+        "}"
+    )
+    return (
+        "<script>"
+        f"var _pdflessMeasure = {measure_fn};"
+        "var _pdflessImgs = Array.from(document.images);"
+        "var _pdflessPending = _pdflessImgs.filter(function(i){return !i.complete;}).length;"
+        "if (_pdflessPending === 0) {"
+        "_pdflessMeasure();"
+        "} else {"
+        "_pdflessImgs.forEach(function(img){"
+        "if (img.complete) return;"
+        "var done = function(){ _pdflessPending--; if (_pdflessPending <= 0) _pdflessMeasure(); };"
+        "img.addEventListener('load', done);"
+        "img.addEventListener('error', done);"
+        "});"
+        "}"
+        "</script>"
+    )
 
 
-def _measure_slide_offsets(chrome, html_path):
-    """For a PowerPoint/Keynote-style slide deck (Preview.html stacking
-    one <div class="slide"> per slide, one after another with a small
-    margin between them), ask Chrome for the exact pixel boundary
-    between each slide, via a small script injected into a scratch copy
-    of the HTML and read back with `--dump-dom` - real computed layout
-    (offsetTop) rather than a guess. This matters because slides butt
-    right up against each other with no clean gap to detect in a
-    screenshot (each one's drop shadow bleeds into the margin before
-    the next), so slicing by the plist's Height (one slide's own
+_TOP_DIV_RE = re.compile(r'<div\b.*?</div>', re.IGNORECASE | re.DOTALL)
+_TOP_DIV_IMG_ONLY_RE = re.compile(r'<div\b[^>]*>\s*<img\b[^>]*>\s*</div>', re.IGNORECASE)
+
+
+def _detect_fallback_page_xpath(content):
+    """Some Quick Look generator output (seen from an older Keynote/
+    iWork.qlgenerator variant) has no "PageElementXPath" in its plist at
+    all - unlike every other case seen so far - despite still having
+    one clearly-delimited element per slide: each is simply a `<div>`
+    directly under `<body>` wrapping one full-bleed
+    `<img src="*.pdf">`, with no distinguishing class to select by.
+
+    Detect that specific shape - rather than assuming any document
+    missing "PageElementXPath" has it, which a continuously-flowing
+    Word document very much doesn't - and if (almost) every direct
+    `<div>` child of `<body>` matches it, return the same
+    "/html/body/div" xpath a generator that DID report one would have
+    (e.g. PowerPoint's). Returns None if this doesn't look like that
+    shape."""
+    body_idx = content.find("<body")
+    if body_idx == -1:
+        return None
+    top_divs = _TOP_DIV_RE.findall(content[body_idx:])
+    if len(top_divs) < 2:
+        return None
+    matching = sum(1 for d in top_divs if _TOP_DIV_IMG_ONLY_RE.fullmatch(d.strip()))
+    return "/html/body/div" if matching >= len(top_divs) * 0.9 else None
+
+
+def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
+    """For a document whose Quick Look preview has distinct page/slide
+    elements (see generate_ql_preview()'s page_element_xpath - Word's
+    continuously-flowing text has none, so this is never called for
+    that), ask Chrome for the exact pixel boundary between each one, via
+    a small script injected into a scratch copy of the HTML and read
+    back with `--dump-dom` - real computed layout (offsetTop) rather
+    than a guess. This matters because they can butt right up against
+    each other with no clean gap to detect in a screenshot (e.g. a
+    PowerPoint slide's drop shadow bleeding into the margin before the
+    next one), so slicing by the plist's Height (one page/slide's own
     height, not counting that margin) drifts out of alignment with the
-    actual slide boundaries after enough slides.
+    actual boundaries after enough of them.
 
     Returns (total_height, [offset, ...]) in logical (unscaled) CSS
-    pixels - one offset per slide, in document order - or None if
-    Preview.html has no slide divs, or Chrome/parsing failed.
+    pixels - one offset per page/slide, in document order - or None if
+    page_element_xpath matched nothing, or Chrome/parsing failed.
 
     Note this still can't guarantee a slide's content never bleeds onto
-    the next one: PowerPoint auto-shrinks text at display time so it
-    fits its placeholder, but this static HTML preview doesn't reproduce
-    that, so a slide relying on it can render past its box's bottom
-    edge despite the box's own overflow:hidden - that's a limitation of
-    Office.qlgenerator's HTML output itself (also visible in Quick Look
-    proper), not something fixable from here."""
+    the next one: PowerPoint/Keynote auto-shrink text at display time so
+    it fits its placeholder, but this static HTML preview doesn't
+    reproduce that, so a slide relying on it can render past its box's
+    bottom edge despite the box's own overflow:hidden - that's a
+    limitation of the generator's HTML output itself (also visible in
+    Quick Look proper), not something fixable from here.
+
+    `width` must match the logical width the real screenshot is later
+    taken at (build_office_pages()'s own `width`): layout - and so each
+    element's offsetTop - can depend on the viewport's width (e.g. a
+    slide whose content is one `<img width="100%">`, scaling with the
+    container), so measuring at any other width (Chrome's own headless
+    default, if not given explicitly) can silently disagree with the
+    boundaries the real capture ends up with, throwing off every slice
+    from that point on."""
     try:
         with open(html_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
     except OSError:
         return None
-    if '<div class="slide"' not in content:
-        return None
+
+    if not page_element_xpath:
+        page_element_xpath = _detect_fallback_page_xpath(content)
+        if not page_element_xpath:
+            return None
 
     idx = content.rfind("</body>")
-    instrumented = (
-        content[:idx] + _SLIDE_MEASURE_SCRIPT + content[idx:]
-        if idx != -1 else content + _SLIDE_MEASURE_SCRIPT
-    )
+    script = _build_slide_measure_script(page_element_xpath)
+    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
     measure_path = os.path.join(os.path.dirname(html_path), "pdfless-slide-measure.html")
     with open(measure_path, "w", encoding="utf-8") as f:
         f.write(instrumented)
@@ -747,7 +1028,18 @@ def _measure_slide_offsets(chrome, html_path):
         r = subprocess.run(
             [
                 chrome, "--headless", "--no-sandbox",
-                "--dump-dom", "--virtual-time-budget=2000",
+                # Must match the real capture's width (see the
+                # docstring): a tall, arbitrary height is fine since
+                # dump-dom doesn't render/screenshot anything, just
+                # loads and serializes the DOM at that viewport size.
+                f"--window-size={width},1080",
+                # 8s, not 2s: an upper bound on how long the injected
+                # script (see _build_slide_measure_script()) is allowed
+                # to wait for every <img> to finish decoding before
+                # giving up and dumping whatever it's got - it resolves
+                # as soon as they're all ready, so this only matters as
+                # a cap for a deck with many/large embedded images.
+                "--dump-dom", "--virtual-time-budget=8000",
                 f"file://{os.path.abspath(measure_path)}",
             ],
             capture_output=True, text=True, timeout=30, check=True,
@@ -764,6 +1056,20 @@ def _measure_slide_offsets(chrome, html_path):
         data = json.loads(html.unescape(m.group(1)))
         tops = [float(t) for t in data["tops"]]
         if not tops:
+            return None
+        # Sanity check: a real stack of pages/slides lays out top to
+        # bottom, so each offsetTop should be strictly greater than the
+        # last. Seen in the wild for one Keynote/iWork.qlgenerator
+        # variant: the same shape _detect_fallback_page_xpath() looks
+        # for (a <div> wrapping one full-bleed <img> per slide), but
+        # with every single one reporting offsetTop 0 and a tiny total
+        # scrollHeight - i.e. this generator overlaps them (probably
+        # meant to be shown one at a time via some JS this static
+        # capture doesn't run), not stacked in document flow at all. If
+        # so, slicing by these numbers would compute zero- or negative-
+        # height "pages" - return None and let the caller fall back to
+        # the plain grow-and-trim path instead of acting on bogus data.
+        if any(tops[i + 1] <= tops[i] for i in range(len(tops) - 1)):
             return None
         return float(data["total"]), tops
     except (ValueError, KeyError, TypeError):
@@ -810,6 +1116,7 @@ def _render_office_error_placeholder(path, tmpdir, message):
 
 def build_office_pages(
     path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE, progress=None,
+    continuous=False,
 ):
     """Try to render `path` - any file this Mac's Quick Look generators
     can preview (Word, Excel, PowerPoint, Keynote, Pages, ...) - into one
@@ -820,10 +1127,30 @@ def build_office_pages(
     (and which browser got used) to stderr, plus a total at the end.
     `render_scale` is the device-pixel-ratio to rasterize at
     (--rendering-scale) - higher is sharper when zoomed in but slower
-    for a large document. `progress`, if given, is a _ProgressLine to
+    for a large document; left at its default (OFFICE_RENDER_SCALE),
+    continuously-flowing text (Word and the like) renders at
+    OFFICE_RENDER_SCALE_FLOWING instead, favoring sharpness since these
+    documents are usually short. `progress`, if given, is a _ProgressLine to
     post a one-line "what's happening right now" status to, since this
     whole function can take anywhere from under a second to tens of
-    seconds and would otherwise look like pdfless had simply hung."""
+    seconds and would otherwise look like pdfless had simply hung.
+
+    Pagination (splitting into distinct page/slide images, so `n`/`p`/`g`/
+    `G` and jumping straight to page N work) is only used when the slide
+    boundaries are known with confidence - i.e. the Quick Look
+    generator's own plist named a PageElementXPath (currently true for
+    PowerPoint and some Keynote decks), and measuring it produced
+    sane (strictly increasing) offsets. Anything else - Word's
+    continuously-flowing text, spreadsheets, and Keynote/Pages variants
+    where the boundary can only be guessed via a content-shape heuristic
+    (see _detect_fallback_page_xpath()) - is rendered as a single,
+    continuously-scrollable "page" instead (the same as a plain image
+    file), since a guessed boundary has been observed to drift/overflow
+    on some real decks.
+
+    continuous=True (-c/--continuous) forces the single-continuous-page
+    behavior even for a document that would otherwise paginate
+    confidently."""
     if progress is None:
         progress = _ProgressLine(enabled=False)
     name = os.path.basename(path)
@@ -841,7 +1168,7 @@ def build_office_pages(
             preview = generate_ql_preview(path, tmpdir)
         if preview is None:
             return None
-        html_path, width, height, should_not_scale = preview
+        html_path, width, height, should_not_scale, page_element_xpath = preview
         width = width or OFFICE_DEFAULT_WIDTH
         height = height or OFFICE_DEFAULT_HEIGHT
         progress.update(f"{name}: converting embedded images...")
@@ -858,11 +1185,35 @@ def build_office_pages(
         # being freed.
         tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
         out_png = os.path.join(tmpdir, f"office-capture-{tag}.png")
+        # Confident means the Quick Look generator itself named the
+        # page/slide element (page_element_xpath came from the plist,
+        # not guessed by _detect_fallback_page_xpath inside
+        # _measure_slide_offsets) - only then is pagination trusted; see
+        # this function's docstring for why a guessed boundary defaults
+        # to continuous instead.
+        confident = bool(page_element_xpath)
         slide_offsets = None
-        if not should_not_scale:
+        if not should_not_scale and not continuous:
+            # _measure_slide_offsets() still tries a content-shape-based
+            # fallback before giving up even when page_element_xpath is
+            # None, purely so the "attempt 1/2/3..." growth loop below
+            # can be skipped when it happens to work out - but a result
+            # obtained that way isn't "confident" (see above) and won't
+            # be used to paginate. Skipped entirely in continuous mode -
+            # nothing needs a per-page/slide boundary if there's only
+            # ever going to be one "page".
             progress.update(f"{name}: measuring page/slide layout...")
             with _DebugTimer(debug, f"{name}: measure slide/page offsets"):
-                slide_offsets = _measure_slide_offsets(chrome, html_path)
+                slide_offsets = _measure_slide_offsets(chrome, html_path, page_element_xpath, width)
+        if (
+            render_scale == OFFICE_RENDER_SCALE
+            and not should_not_scale
+            and slide_offsets is None
+        ):
+            # Continuously-flowing text (Word and the like) - see
+            # OFFICE_RENDER_SCALE_FLOWING - unless the caller (-s/
+            # --rendering-scale) asked for a specific scale explicitly.
+            render_scale = OFFICE_RENDER_SCALE_FLOWING
         try:
             if should_not_scale:
                 # See the comment above: Excel's sheet-tab selector is
@@ -935,17 +1286,30 @@ def build_office_pages(
                 os.unlink(out_png)
 
         page_paths = []
-        if should_not_scale:
+        if continuous or should_not_scale:
+            # continuous: always exactly one "page", regardless of how
+            # many real pages/slides the document has - see this
+            # function's docstring. should_not_scale (e.g. Excel) is
+            # already just one page/canvas anyway either way.
             bounds = [0, trimmed.height]
-        elif slide_offsets is not None:
+        elif slide_offsets is not None and confident:
             # Slice at each slide's own measured start, in physical
             # (scaled) pixels - exact, unlike guessing from the
             # screenshot itself (see _measure_slide_offsets() for why
-            # that doesn't work here).
+            # that doesn't work here). Only trusted when the boundary
+            # came from the plist's own PageElementXPath (see
+            # `confident` above) - not from a guessed one.
             total_height, tops = slide_offsets
             bounds = [
                 min(trimmed.height, round(t * render_scale)) for t in tops
             ] + [trimmed.height]
+        elif slide_offsets is not None:
+            # A boundary was found, but only by guessing (no
+            # PageElementXPath in the plist - see _detect_fallback_page_xpath())
+            # - that guess has been observed to drift/overflow on some
+            # real decks, so play it safe and fall back to one
+            # continuous "page" instead of trusting it.
+            bounds = [0, trimmed.height]
         else:
             page_px = max(1, round(height * render_scale))
             npages = max(1, -(-trimmed.height // page_px))  # ceil division
@@ -1631,6 +1995,7 @@ class Viewer:
         self, files, file_index, page, tmpdir, fd, fit="width",
         frame=True, wheel_scroll_step=1, office_pages_by_path=None,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
+        office_continuous=False,
     ):
         self.files = files  # [(path, kind, npages), ...] - one per CLI argument
         self.file_index = file_index
@@ -1640,6 +2005,7 @@ class Viewer:
         self.office_pages_by_path = office_pages_by_path or {}
         self.debug = debug  # -d/--debug: print office-preview stage timing
         self.office_render_scale = office_render_scale  # --rendering-scale
+        self.office_continuous = office_continuous  # -c/--continuous
         self.fd = fd
         self.fit = fit
         self.wheel_scroll_step = wheel_scroll_step
@@ -1739,6 +2105,7 @@ class Viewer:
         pages = build_office_pages(
             self.pdf_path, self.tmpdir, debug=self.debug,
             render_scale=self.office_render_scale, progress=_ViewerProgress(self),
+            continuous=self.office_continuous,
         )
         if not pages:
             pages = _render_office_error_placeholder(
@@ -2629,7 +2996,7 @@ class Viewer:
             pages = build_office_pages(
                 self.pdf_path, self.tmpdir,
                 debug=self.debug, render_scale=self.office_render_scale,
-                progress=_ViewerProgress(self),
+                progress=_ViewerProgress(self), continuous=self.office_continuous,
             )
             if pages:
                 self.office_pages_by_path[self.pdf_path] = pages
@@ -2913,6 +3280,7 @@ def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
     frame=True, follow=False, wheel_scroll_step=1, keep=False,
     office_pages_by_path=None, debug=False, office_render_scale=OFFICE_RENDER_SCALE,
+    office_continuous=False,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
     caller can inspect its final geometry (e.g. to tidy up the screen)."""
@@ -2920,7 +3288,7 @@ def run_viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
         frame=frame, wheel_scroll_step=wheel_scroll_step,
         office_pages_by_path=office_pages_by_path, debug=debug,
-        office_render_scale=office_render_scale,
+        office_render_scale=office_render_scale, office_continuous=office_continuous,
     )
 
     def on_winch(signum, frame):
@@ -3289,6 +3657,19 @@ def main():
              "for a document with many pages/slides (default: %(default)s)",
     )
     parser.add_argument(
+        "-c", "--continuous",
+        action="store_true",
+        help="for a Quick Look preview file (Word/Excel/PowerPoint/etc., "
+             "macOS only), always scroll through it continuously instead "
+             "of splitting it into pages/slides, the same as a plain "
+             "image file. By default this already happens automatically "
+             "whenever the page/slide boundary can't be determined with "
+             "confidence (most reliable for PowerPoint; other formats "
+             "vary); this forces it even for a file that would otherwise "
+             "paginate, at the cost of not being able to jump straight "
+             "to page/slide N",
+    )
+    parser.add_argument(
         "-k", "--keep",
         action="store_true",
         help="leave the last page on screen when quitting (q or ^C) "
@@ -3426,6 +3807,7 @@ def main():
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
                     office_pages_by_path=office_pages_by_path, debug=args.debug,
                     office_render_scale=args.rendering_scale,
+                    office_continuous=args.continuous,
                 )
             finally:
                 if args.keep and viewer is not None:

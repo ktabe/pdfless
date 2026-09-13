@@ -143,8 +143,8 @@ python3 pdfless.py some.pdf
 ## Usage
 
 ```
-usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-k] [-h] [--no-frame] [-F]
-               [--wheel-scroll-step N]
+usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [--no-frame]
+               [-F] [--wheel-scroll-step N]
                file [file ...]
 
 positional arguments:
@@ -164,6 +164,16 @@ options:
                         looks sharper when zoomed in but is slower to render,
                         especially for a document with many pages/slides
                         (default: 1)
+  -c, --continuous      for a Quick Look preview file (Word/Excel/PowerPoint/
+                        etc., macOS only), always scroll through it
+                        continuously instead of splitting it into pages/
+                        slides, the same as a plain image file. By default
+                        this already happens automatically whenever the
+                        page/slide boundary can't be determined with
+                        confidence (most reliable for PowerPoint; other
+                        formats vary); this forces it even for a file that
+                        would otherwise paginate, at the cost of not being
+                        able to jump straight to page/slide N
   -k, --keep            leave the last page on screen when quitting (q or ^C)
                         instead of restoring the terminal screen
   -h, --fit-height      fit each page to the terminal's full height instead of
