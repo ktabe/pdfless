@@ -1793,6 +1793,212 @@ def find_search_matches(index, query):
     return matches
 
 
+# --- DocumentHandler hierarchy (Stage 0 of an ongoing refactor) -----------
+#
+# main()'s file-kind classification and a good deal of format-dependent
+# behavior elsewhere (PageCache, text-mode extraction, search/text-mode
+# key-handling gates, ...) is currently a set of "kind" string
+# comparisons plus a handful of extra flags (should_not_scale,
+# page_element_xpath, is_rtf_file, ...) scattered across many
+# functions/methods. This hierarchy is the start of replacing that with
+# per-format subclasses each owning their own behavior - "replace
+# conditional with polymorphism". For now these classes are pure
+# scaffolding: nothing outside this block constructs or calls them yet,
+# and every method is a thin wrapper around the existing free functions
+# (is_pdf_file(), extract_page_text(), build_office_pages(), ...), so
+# this introduces no behavior change. Later stages will migrate
+# main()'s classification loop, PageCache, and Viewer's text-mode/search
+# gating onto these one at a time.
+
+
+class DocumentHandler:
+    """Base class for a file's format-specific behavior. Each subclass
+    corresponds to one of main()'s "kind" strings ("pdf"/"image"/
+    "text"/"office") and is tried, in a fixed priority order, via
+    sniff() - see HANDLER_CLASSES."""
+
+    kind = None  # overridden per subclass
+
+    def __init__(self, path):
+        self.path = path
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        """Return an instance of this class if `path` looks like this
+        kind, else None. `tmpdir`/`debug` are only used by
+        OfficeDocument (qlmanage needs a scratch dir; -d wants to know
+        about a crashed qlmanage) - every other subclass ignores them;
+        they're part of the common signature so a future dispatcher can
+        try each class uniformly without knowing which."""
+        raise NotImplementedError
+
+    def page_count(self):
+        """Number of pages, or None if unknown until the file is
+        actually rendered (only OfficeDocument - its page count isn't
+        known until Quick Look + Chrome have run; see
+        Viewer._ensure_office_pages())."""
+        raise NotImplementedError
+
+    def extract_text(self, page):
+        """Text-mode content for `page` (1-based) - or the whole
+        document, for a handler whose text isn't paginated (see
+        text_mode_is_paginated()), which ignores `page` entirely. None
+        means there's nothing to show (the 't' key reports that)."""
+        return None
+
+    def supports_text_mode(self):
+        """Whether 't' should even try entering text mode at all - the
+        actual content still comes from extract_text(), which can
+        return None for a specific file even when this is True (e.g.
+        OfficeDocument: textutil produces nothing for a PowerPoint/
+        Excel file even though it works for Word)."""
+        return False
+
+    def supports_search(self):
+        return False
+
+    def text_mode_is_paginated(self):
+        """Whether text mode's content is naturally split into pages
+        the same way image mode is, so n/p/g/G page navigation should
+        apply to it too. False means text mode shows one flowing blob
+        regardless of the current image-mode page (e.g. TextDocument/
+        RtfDocument's whole file, OfficeDocument's whole document via
+        textutil)."""
+        return False
+
+
+class PdfDocument(DocumentHandler):
+    kind = "pdf"
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        return cls(path) if is_pdf_file(path) else None
+
+    def page_count(self):
+        return pdf_page_count(self.path)
+
+    def extract_text(self, page):
+        return extract_page_text(self.path, page)
+
+    def supports_text_mode(self):
+        return True
+
+    def supports_search(self):
+        return True
+
+    def text_mode_is_paginated(self):
+        return True
+
+
+class ImageDocument(DocumentHandler):
+    kind = "image"
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        try:
+            # .load() rather than the lighter .verify(): some formats
+            # (e.g. WMF without a system loader available) pass
+            # verify() - which only sanity-checks the file structure -
+            # but still fail to actually decode.
+            with Image.open(path) as probe:
+                probe.load()
+        except Exception:
+            return None
+        return cls(path)
+
+    def page_count(self):
+        return 1
+
+
+class TextDocument(DocumentHandler):
+    kind = "text"
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        if not is_probably_text(path):
+            return None
+        try:
+            read_plain_text_lines(path)  # just to validate it decodes
+        except Exception:
+            return None
+        return cls(path)
+
+    def page_count(self):
+        return 1
+
+    def extract_text(self, page):
+        return read_plain_text_lines(self.path)
+
+    def supports_text_mode(self):
+        return True
+
+    def supports_search(self):
+        return True
+
+
+class RtfDocument(TextDocument):
+    """An RTF file is - deliberately - plain ASCII text, so it sniffs
+    as TextDocument too; tried first (see HANDLER_CLASSES) so its own
+    signature wins. Everything else is inherited from TextDocument -
+    only extract_text() differs: showing an RTF file's "plain text"
+    verbatim would mean showing its raw markup (control words, font/
+    color tables, ...), not the document's actual content - see
+    is_rtf_file()."""
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        return cls(path) if is_rtf_file(path) else None
+
+    def extract_text(self, page):
+        return extract_office_text(self.path) or super().extract_text(page)
+
+
+class OfficeDocument(DocumentHandler):
+    """Anything this Mac's Quick Look generators can preview (Word,
+    Excel, PowerPoint, Keynote, Pages, ...) via qlmanage + a local
+    Chrome. page_count() is deliberately None - unknown until
+    build_pages() actually renders it (see
+    Viewer._ensure_office_pages()). build_pages() is still just a thin
+    wrapper around build_office_pages() for now - its own
+    should_not_scale/page_element_xpath/sheet_tabs/continuous branching
+    becomes a family of subclasses in a later stage of this refactor."""
+
+    kind = "office"
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        return cls(path) if _probe_office_preview(path, tmpdir, debug=debug) else None
+
+    def page_count(self):
+        return None
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        return build_office_pages(
+            self.path, tmpdir, debug=debug, render_scale=render_scale,
+            progress=progress, continuous=continuous,
+        )
+
+    def extract_text(self, page):
+        # textutil (see extract_office_text()) has no notion of pages -
+        # the whole document, or None for a format it can't handle at
+        # all (a spreadsheet or slide deck).
+        return extract_office_text(self.path)
+
+    def supports_text_mode(self):
+        return True
+
+
+# The order main()'s classification loop will eventually try these in
+# (a later stage of this refactor) - RtfDocument before TextDocument
+# since both would otherwise match the same file (RTF is plain ASCII
+# text), and OfficeDocument last since it's the only one that actually
+# shells out to qlmanage.
+HANDLER_CLASSES = [PdfDocument, ImageDocument, RtfDocument, TextDocument, OfficeDocument]
+
+
 class RawTerminal:
     """Puts the tty into raw (cbreak-ish) mode for the duration of the block."""
 
