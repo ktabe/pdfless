@@ -568,6 +568,43 @@ _SRC_ATTR_RE = re.compile(r'\bsrc="([^"]+)"', re.IGNORECASE)
 _WIDTH_ATTR_RE = re.compile(r'\bwidth="([\d.]+)"', re.IGNORECASE)
 _HEIGHT_ATTR_RE = re.compile(r'\bheight="([\d.]+)"', re.IGNORECASE)
 
+# Office.qlgenerator's tab strip for a multi-sheet spreadsheet - see
+# _parse_sheet_tabs(). One <div class="TabViewItem ..."> per sheet, each
+# with a <div class="TabHeader"> (the sheet's own name) and an <a
+# href="..."> pointing at that sheet's already-rendered AttachmentN.html.
+_TAB_VIEW_ITEM_RE = re.compile(
+    r'<div\s+class="TabViewItem[^"]*">\s*'
+    r'<div\s+class="TabHeader">(.*?)</div>\s*'
+    r'<a\s+href="([^"]+)">',
+    re.IGNORECASE | re.DOTALL,
+)
+_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _parse_sheet_tabs(html_path):
+    """For a multi-sheet Excel-like Quick Look preview, return an
+    ordered [(sheet_name, absolute_html_path), ...] - one per sheet - by
+    reading the tab strip out of `html_path`'s own content (see
+    _TAB_VIEW_ITEM_RE). A single-sheet workbook's Preview.html *is* the
+    sheet itself (no tab strip, no <iframe>) and this returns []."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return []
+    base_dir = os.path.dirname(html_path)
+    tabs = []
+    for m in _TAB_VIEW_ITEM_RE.finditer(content):
+        href = m.group(2)
+        if _ABSOLUTE_SRC_RE.match(href):
+            continue  # http(s)/data/... - not a local sibling file
+        candidate = os.path.join(base_dir, href)
+        if not os.path.isfile(candidate):
+            continue
+        name = html.unescape(_TAG_RE.sub("", m.group(1))).strip()
+        tabs.append((name or f"Sheet {len(tabs) + 1}", candidate))
+    return tabs
+
 # A hard ceiling on either dimension of a PDF-embedded picture, once
 # rasterized - regardless of what DPI the math below otherwise settles
 # on. A Numbers/Pages/Keynote sheet can embed its *entire* content (a
@@ -1171,12 +1208,6 @@ def build_office_pages(
         html_path, width, height, should_not_scale, page_element_xpath = preview
         width = width or OFFICE_DEFAULT_WIDTH
         height = height or OFFICE_DEFAULT_HEIGHT
-        progress.update(f"{name}: converting embedded images...")
-        on_img_progress = lambda done, total: progress.update(
-            f"{name}: converting embedded images ({done}/{total})..."
-        )
-        with _DebugTimer(debug, f"{name}: pdftoppm (embedded images)"):
-            html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
 
         # A short, stable-per-path tag so this file's capture/page PNGs
         # don't collide with another file's (or its own previous ones,
@@ -1184,6 +1215,53 @@ def build_office_pages(
         # odds are negligible even if a path string gets reused after
         # being freed.
         tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+
+        # A spreadsheet with more than one sheet (should_not_scale is
+        # Excel's tell - see below): Office.qlgenerator renders every
+        # sheet up front as its own AttachmentN.html, with Preview.html
+        # itself being just a JS tab strip that swaps an <iframe> between
+        # them - so each is rendered as its own page here instead of only
+        # ever showing whichever sheet happened to be selected first.
+        sheet_tabs = _parse_sheet_tabs(html_path) if should_not_scale else []
+        if sheet_tabs:
+            page_paths = []
+            for i, (sheet_name, sheet_html_path) in enumerate(sheet_tabs):
+                progress.update(
+                    f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): "
+                    "converting embedded images..."
+                )
+                on_img_progress = lambda done, total, i=i: progress.update(
+                    f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): "
+                    f"converting embedded images ({done}/{total})..."
+                )
+                with _DebugTimer(debug, f"{name}: sheet {i + 1} ({sheet_name}): pdftoppm (embedded images)"):
+                    sheet_html_path = _rasterize_pdf_img_sources(
+                        sheet_html_path, tmpdir, on_progress=on_img_progress
+                    )
+                page_path = os.path.join(tmpdir, f"office-page-{tag}-{i + 1}.png")
+                label = f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): rendering"
+                try:
+                    with _DebugTimer(debug, label), progress.spin(label + "..."):
+                        _capture_html_screenshot(
+                            chrome, sheet_html_path, width, height, page_path, render_scale
+                        )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                    return None
+                page_paths.append(page_path)
+            if debug:
+                print(
+                    f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
+                    file=sys.stderr, end="\r\n",
+                )
+            return page_paths
+
+        progress.update(f"{name}: converting embedded images...")
+        on_img_progress = lambda done, total: progress.update(
+            f"{name}: converting embedded images ({done}/{total})..."
+        )
+        with _DebugTimer(debug, f"{name}: pdftoppm (embedded images)"):
+            html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
+
         out_png = os.path.join(tmpdir, f"office-capture-{tag}.png")
         # Confident means the Quick Look generator itself named the
         # page/slide element (page_element_xpath came from the plist,

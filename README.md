@@ -34,8 +34,8 @@ anything your Mac's Quick Look generators know how to preview — Word,
 Excel, PowerPoint, Keynote, Pages, and more — by rendering that Quick
 Look preview through a headless Chrome. A multi-page document (e.g.
 Word) is paged through with the same `n`/`p`/`g`/`G` keys as a PDF;
-a spreadsheet only shows its active sheet (tab switching isn't
-supported).
+a spreadsheet with more than one sheet is paged through the same way,
+one sheet per page.
 
 Since it's just a terminal program, it works the same way over SSH — no
 X11 forwarding, and no need to copy the PDF to your local machine first.
