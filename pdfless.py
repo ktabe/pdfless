@@ -1458,6 +1458,30 @@ def extract_page_text(pdf_path, page):
     return out.splitlines()
 
 
+def extract_office_text(path):
+    """Plain-text extraction of a whole Word-family document (.doc,
+    .docx, .rtf, .odt, ...), via macOS's own `textutil -convert txt
+    -stdout` - unlike pdftotext for a PDF, this has no notion of pages,
+    so it's always the entire document at once (see how kind=="office"
+    is handled in Viewer._load_text_page() and around it). Returns None
+    if textutil isn't available, doesn't understand this file at all
+    (a spreadsheet or a slide deck: no single flowing "text" to extract,
+    and textutil silently produces nothing), or the conversion otherwise
+    failed."""
+    if shutil.which("textutil") is None:
+        return None
+    try:
+        out = subprocess.run(
+            ["textutil", "-convert", "txt", "-stdout", path],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    return out.stdout.splitlines()
+
+
 def is_probably_text(path, sniff_bytes=8000):
     """The same binary/text heuristic git and file(1) use: if the first
     few KB contain a NUL byte, treat it as binary. (NUL is technically
@@ -2138,6 +2162,11 @@ class Viewer:
         # "in text mode", the same rendering PDF's `t` key switches to.
         self.text_mode = self.kind == "text"
         self.text_lines = []
+        # kind=="office"'s whole-document text (see extract_office_text())
+        # - unlike a PDF's per-page pdftotext, textutil has no notion of
+        # pages, so this is extracted once (on entering text mode, or on
+        # -F/--follow reload) and reused as-is regardless of self.page.
+        self._office_text_lines = None
         self.text_scroll = 0
         self.text_scroll_min = 0
         self.text_scroll_max = 0
@@ -2231,6 +2260,7 @@ class Viewer:
         self._history_back = []
         self._history_forward = []
         self.text_mode = self.kind == "text"
+        self._office_text_lines = None  # stale for the previous file - reload on next 't'
         # Mouse reporting is only useful in the page image (clicking
         # hyperlinks, wheel scroll); off in any kind of text view, the
         # same as enter_text_mode()/exit_text_mode() do for a PDF's `t`
@@ -2342,6 +2372,15 @@ class Viewer:
         self.refresh()
 
     def enter_text_mode(self):
+        """Switch to text mode - False (no-op) if there's no text to
+        show at all, which for kind=="office" means textutil couldn't
+        extract anything from this particular file (e.g. a spreadsheet
+        or slide deck - see extract_office_text())."""
+        if self.kind == "office":
+            lines = extract_office_text(self.pdf_path)
+            if lines is None:
+                return False
+            self._office_text_lines = lines
         self.text_mode = True
         # Mouse reporting is only useful (and only turned on) for
         # clicking hyperlinks in the page image; leave it off here so
@@ -2356,6 +2395,7 @@ class Viewer:
         if match:
             self._scroll_text_to_match(match)
         self.refresh()
+        return True
 
     def exit_text_mode(self):
         self.text_mode = False
@@ -2377,14 +2417,22 @@ class Viewer:
         self.refresh()
 
     def toggle_text_mode(self):
+        """Returns False if switching (specifically *into* text mode)
+        failed for lack of any text to show - see enter_text_mode()."""
         if self.text_mode:
             self.exit_text_mode()
-        else:
-            self.enter_text_mode()
+            return True
+        return self.enter_text_mode()
 
     def _load_text_page(self):
         if self.kind == "text":
             self.text_lines = read_plain_text_lines(self.pdf_path)
+        elif self.kind == "office":
+            # Unlike a PDF's extract_page_text(), textutil has no notion
+            # of pages - self._office_text_lines is the whole document,
+            # extracted once by enter_text_mode()/reload() and reused
+            # here regardless of self.page.
+            self.text_lines = self._office_text_lines
         else:
             self.text_lines = extract_page_text(self.pdf_path, self.page)
         self.text_scroll = 0
@@ -3095,6 +3143,11 @@ class Viewer:
         self._search_index = None
         self.clear_search()
         if self.text_mode:
+            if self.kind == "office":
+                # self._office_text_lines is otherwise only refreshed by
+                # re-entering text mode - re-extract it here too, or a
+                # changed file would just keep showing its old text.
+                self._office_text_lines = extract_office_text(self.pdf_path) or []
             self._load_text_page()
         else:
             self._load_page()
@@ -3303,10 +3356,13 @@ class Viewer:
         elif key in ("J", "D", "SHIFT-DOWN", "G"):
             self.text_scroll = self.text_scroll_max
         elif key == "n":
-            if self.page < self.npages:
+            # kind=="office": text is the whole document at once (see
+            # _load_text_page()), not one page/slide at a time - nothing
+            # for "next" to do.
+            if self.kind != "office" and self.page < self.npages:
                 self.go_to_page_text(self.page + 1, 0)
         elif key == "p":
-            if self.page > 1:
+            if self.kind != "office" and self.page > 1:
                 self.go_to_page_text(self.page - 1, 0)
         elif key == "q":
             return False
@@ -3586,8 +3642,9 @@ def run_viewer(
             continue
 
         if key == "t":
-            if viewer.kind == "pdf":
-                viewer.toggle_text_mode()
+            if viewer.kind in ("pdf", "office"):
+                if not viewer.toggle_text_mode():
+                    viewer.draw_status("no text could be extracted from this file")
             elif viewer.kind == "text":
                 viewer.draw_status("this is already a plain text file")
             else:
