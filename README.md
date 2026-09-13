@@ -253,6 +253,19 @@ Misc:
 | `?` | show a keybinding help box (`q` to close it) |
 | `q` / `^C` | quit |
 
+## Testing
+
+```sh
+cd tests
+uv run --with pytest --with pytest-timeout --with pillow --with pypdf python -m pytest
+```
+
+Most of the suite is fast (file-classification/caching unit tests); a
+few tests drive a real `pdfless.py` through a pseudo-terminal to catch
+crashes in the Viewer itself, since that needs an actual tty. One test
+(`.docx` via a Quick Look preview) is skipped unless `qlmanage` and a
+local Chrome/Chromium are both available.
+
 ## Acknowledgements
 
 The code of this program was written by [Claude Code](https://claude.com/claude-code).

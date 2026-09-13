@@ -208,6 +208,15 @@ options:
 | `?` | キーバインドのヘルプを表示（`q` で閉じる） |
 | `q` / `^C` | 終了 |
 
+## テスト
+
+```sh
+cd tests
+uv run --with pytest --with pytest-timeout --with pillow --with pypdf python -m pytest
+```
+
+大半は高速なユニットテスト（ファイル分類・ページキャッシュ関連）です。一部は実際に`pdfless.py`を擬似端末（pty）経由で起動し、Viewer自体のクラッシュを検出します（実端末でしか再現しない挙動があるため）。`qlmanage`とローカルのChrome/Chromiumが両方使える環境でなければ、`.docx`（Quick Lookプレビュー経由）のテストは自動的にスキップされます。
+
 ## 謝辞
 
 本プログラムのコードは [Claude Code](https://claude.com/claude-code) が書きました。
