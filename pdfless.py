@@ -517,7 +517,7 @@ def find_chrome():
     return None
 
 
-def generate_ql_preview(path, tmpdir):
+def generate_ql_preview(path, tmpdir, debug=False):
     """Ask Quick Look for an HTML preview of `path` via `qlmanage -p`.
     Returns (html_path, width, height, should_not_scale,
     page_element_xpath) - width/height are None if the plist didn't
@@ -525,20 +525,49 @@ def generate_ql_preview(path, tmpdir):
     "PageElementXPath" (meaning this document has no distinct
     page/slide elements to speak of - e.g. Word's continuously-flowing
     text) - or None if qlmanage isn't available, has no generator for
-    this file, or produced nothing."""
+    this file, or produced nothing.
+
+    With debug=True (-d/--debug), a `qlmanage` that crashed or exited
+    non-zero is reported to stderr - this isn't rare: buggy third-party
+    (or even Apple's own) Quick Look generators can crash qlmanage
+    outright (e.g. an uncaught NSException, seen in the wild for some
+    .odt files) rather than just fail to produce a preview, and without
+    this it's indistinguishable from "no generator for this file at
+    all", which looks identical from here (no Preview.html either way)."""
     if shutil.which("qlmanage") is None:
         return None
     outdir = tempfile.mkdtemp(dir=tmpdir, prefix="qlpreview-")
+    name = os.path.basename(path)
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["qlmanage", "-o", outdir, "-p", path],
             capture_output=True, timeout=30,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError) as e:
+        if debug:
+            print(
+                f"pdfless: [debug] {name}: qlmanage failed to run: {e}",
+                file=sys.stderr, end="\r\n",
+            )
         return None
     bundle = os.path.join(outdir, f"{os.path.basename(path)}.qlpreview")
     html_path = os.path.join(bundle, "Preview.html")
     if not os.path.isfile(html_path):
+        if debug and result.returncode != 0:
+            # A negative code means killed by that signal (e.g. -6/SIGABRT
+            # for an uncaught Objective-C exception) - qlmanage itself
+            # crashed, not just "no generator for this file".
+            how = (
+                f"crashed (signal {-result.returncode})"
+                if result.returncode < 0
+                else f"exited with status {result.returncode}"
+            )
+            stderr_lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
+            detail = f" - {stderr_lines[0]}" if stderr_lines else ""
+            print(
+                f"pdfless: [debug] {name}: qlmanage {how}{detail}",
+                file=sys.stderr, end="\r\n",
+            )
         return None
 
     width = height = page_element_xpath = None
@@ -1113,7 +1142,7 @@ def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
         return None
 
 
-def _probe_office_preview(path, tmpdir):
+def _probe_office_preview(path, tmpdir, debug=False):
     """Cheaply check whether `path` is something this Mac's Quick Look
     generators can preview at all (Word, Excel, PowerPoint, Keynote,
     Pages, ...) - i.e. whether build_office_pages() has any chance of
@@ -1122,10 +1151,13 @@ def _probe_office_preview(path, tmpdir):
     (main()) without paying for a render that may never be looked at:
     with multiple files given on the command line, each office-kind one
     is only actually rendered once it's displayed - see
-    Viewer._ensure_office_pages()."""
+    Viewer._ensure_office_pages().
+
+    debug=True (-d/--debug) reports a crashed/failing qlmanage - see
+    generate_ql_preview()."""
     if find_chrome() is None:
         return False
-    return generate_ql_preview(path, tmpdir) is not None
+    return generate_ql_preview(path, tmpdir, debug=debug) is not None
 
 
 def _render_office_error_placeholder(path, tmpdir, message):
@@ -1202,7 +1234,7 @@ def build_office_pages(
 
         progress.update(f"{name}: reading Quick Look preview...")
         with _DebugTimer(debug, f"{name}: qlmanage preview"):
-            preview = generate_ql_preview(path, tmpdir)
+            preview = generate_ql_preview(path, tmpdir, debug=debug)
         if preview is None:
             return None
         html_path, width, height, should_not_scale, page_element_xpath = preview
@@ -3939,7 +3971,7 @@ def main():
             # such files at once doesn't pay for rendering every one of
             # them upfront when only whichever is looked at ever needs
             # it - see Viewer._ensure_office_pages().
-            if _probe_office_preview(path, tmpdir):
+            if _probe_office_preview(path, tmpdir, debug=args.debug):
                 files.append((path, "office", None))  # npages: unknown until rendered
                 continue
 
