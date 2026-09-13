@@ -1811,6 +1811,18 @@ def find_search_matches(index, query):
 # gating onto these one at a time.
 
 
+class UnusableFile(Exception):
+    """Raised by DocumentHandler.sniff() when a file's format was
+    positively identified (e.g. its PDF magic bytes matched) but it
+    turned out not to be actually usable (failed to decode/parse) -
+    distinct from sniff() returning None, which means "not this kind,
+    try the next one instead". The caller (main()) reports this
+    exception's own message and skips the file, without trying any
+    further handler classes - once a format is positively identified,
+    a failure to actually use it is that format's problem, not a sign
+    the file might be some other kind instead."""
+
+
 class DocumentHandler:
     """Base class for a file's format-specific behavior. Each subclass
     corresponds to one of main()'s "kind" strings ("pdf"/"image"/
@@ -1825,11 +1837,13 @@ class DocumentHandler:
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
         """Return an instance of this class if `path` looks like this
-        kind, else None. `tmpdir`/`debug` are only used by
-        OfficeDocument (qlmanage needs a scratch dir; -d wants to know
-        about a crashed qlmanage) - every other subclass ignores them;
-        they're part of the common signature so a future dispatcher can
-        try each class uniformly without knowing which."""
+        kind, else None if it doesn't (try the next class). Raises
+        UnusableFile if it does look like this kind but isn't actually
+        usable. `tmpdir`/`debug` are only used by OfficeDocument
+        (qlmanage needs a scratch dir; -d wants to know about a crashed
+        qlmanage) - every other subclass ignores them; they're part of
+        the common signature so a dispatcher can try each class
+        uniformly without knowing which."""
         raise NotImplementedError
 
     def page_count(self):
@@ -1872,7 +1886,13 @@ class PdfDocument(DocumentHandler):
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
-        return cls(path) if is_pdf_file(path) else None
+        if not is_pdf_file(path):
+            return None
+        try:
+            pdf_page_count(path)
+        except Exception as e:
+            raise UnusableFile(f"not a usable PDF ({e})") from e
+        return cls(path)
 
     def page_count(self):
         return pdf_page_count(self.path)
@@ -1919,8 +1939,8 @@ class TextDocument(DocumentHandler):
             return None
         try:
             read_plain_text_lines(path)  # just to validate it decodes
-        except Exception:
-            return None
+        except Exception as e:
+            raise UnusableFile(f"not valid UTF-8 text ({e})") from e
         return cls(path)
 
     def page_count(self):
@@ -1937,17 +1957,29 @@ class TextDocument(DocumentHandler):
 
 
 class RtfDocument(TextDocument):
-    """An RTF file is - deliberately - plain ASCII text, so it sniffs
-    as TextDocument too; tried first (see HANDLER_CLASSES) so its own
-    signature wins. Everything else is inherited from TextDocument -
-    only extract_text() differs: showing an RTF file's "plain text"
-    verbatim would mean showing its raw markup (control words, font/
-    color tables, ...), not the document's actual content - see
-    is_rtf_file()."""
+    """An RTF file is - deliberately - plain ASCII text, so it also
+    matches TextDocument's own signature; tried first (see
+    HANDLER_CLASSES) so its more specific one wins. Everything else is
+    inherited from TextDocument - only extract_text() differs: showing
+    an RTF file's "plain text" verbatim would mean showing its raw
+    markup (control words, font/color tables, ...), not the document's
+    actual content - see is_rtf_file()."""
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
-        return cls(path) if is_rtf_file(path) else None
+        if not is_rtf_file(path):
+            return None
+        if not is_probably_text(path):
+            # Vanishingly unlikely for genuine RTF (it's pure ASCII by
+            # spec) - but keep the same NUL-byte safety net
+            # TextDocument itself applies, rather than trusting the RTF
+            # signature alone.
+            return None
+        try:
+            read_plain_text_lines(path)  # just to validate it decodes
+        except Exception as e:
+            raise UnusableFile(f"not valid UTF-8 text ({e})") from e
+        return cls(path)
 
     def extract_text(self, page):
         return extract_office_text(self.path) or super().extract_text(page)
@@ -4117,14 +4149,13 @@ def main():
     # into raw/alternate-screen mode. An invalid file is skipped (with a
     # warning) rather than aborting the whole thing, so one bad path in
     # a big batch doesn't stop you from seeing the rest.
-    candidates = []  # [(abs_path, is_pdf), ...] - files that at least exist
+    candidates = []  # [abs_path, ...] - files that at least exist
     for arg in args.files:
         if not os.path.isfile(arg):
             print(f"pdfless: no such file, skipping: {arg}", file=sys.stderr)
             continue
-        path = os.path.abspath(arg)
-        candidates.append((path, is_pdf_file(path)))
-    if any(is_pdf for _, is_pdf in candidates):
+        candidates.append(os.path.abspath(arg))
+    if any(is_pdf_file(path) for path in candidates):
         check_deps()
 
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
@@ -4132,60 +4163,33 @@ def main():
         files = []  # [(abs_path, kind, npages), ...], in the given order
         office_pages_by_path = {}  # kind=="office" files' page PNGs - see
         # build_office_pages() - keyed by absolute path
-        for path, is_pdf in candidates:
-            if is_pdf:
-                try:
-                    npages = pdf_page_count(path)
-                except Exception as e:
-                    print(f"pdfless: not a usable PDF, skipping: {path} ({e})", file=sys.stderr)
-                    continue
-                files.append((path, "pdf", npages))
-                continue
-
+        for path in candidates:
+            # Try each DocumentHandler subclass, in priority order, for
+            # the first one whose sniff() claims this file - see
+            # HANDLER_CLASSES. A raised UnusableFile means one of them
+            # positively identified the format but couldn't actually use
+            # it (e.g. corrupt PDF) - that's specific enough to report
+            # and skip outright, rather than falling through to try
+            # treating it as some other kind.
+            handler = None
             try:
-                # .load() rather than the lighter .verify(): some formats
-                # (e.g. WMF without a system loader available) pass
-                # verify() - which only sanity-checks the file structure
-                # - but still fail to actually decode, which we'd rather
-                # catch here than mid-session once the raw/alternate-
-                # screen terminal is up.
-                with Image.open(path) as probe:
-                    probe.load()
-                files.append((path, "image", 1))
-                continue
-            except Exception:
-                pass  # not an image either - try plain text next
-
-            if is_probably_text(path):
-                try:
-                    read_plain_text_lines(path)  # just to validate it decodes
-                except Exception as e:
-                    print(
-                        f"pdfless: not valid UTF-8 text, skipping: {path} ({e})",
-                        file=sys.stderr,
-                    )
-                    continue
-                files.append((path, "text", 1))
+                for handler_cls in HANDLER_CLASSES:
+                    handler = handler_cls.sniff(path, tmpdir, debug=args.debug)
+                    if handler is not None:
+                        break
+            except UnusableFile as e:
+                print(f"pdfless: {e}, skipping: {path}", file=sys.stderr)
                 continue
 
-            # Last resort: anything this Mac's Quick Look generators know
-            # how to preview (Word, Excel, PowerPoint, Keynote, Pages,
-            # ...), via qlmanage + a local Chrome. Only cheaply checked
-            # here (does qlmanage have a generator for it at all) - the
-            # expensive part (actually rendering it with Chrome) is
-            # deferred until the file is displayed, so opening several
-            # such files at once doesn't pay for rendering every one of
-            # them upfront when only whichever is looked at ever needs
-            # it - see Viewer._ensure_office_pages().
-            if _probe_office_preview(path, tmpdir, debug=args.debug):
-                files.append((path, "office", None))  # npages: unknown until rendered
+            if handler is None:
+                print(
+                    f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
+                    f"file, skipping: {path}",
+                    file=sys.stderr,
+                )
                 continue
 
-            print(
-                f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
-                f"file, skipping: {path}",
-                file=sys.stderr,
-            )
+            files.append((path, handler.kind, handler.page_count()))
 
         if not files:
             die("no valid PDF, image, text, or Quick-Look-previewable files given")
