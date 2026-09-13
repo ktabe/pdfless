@@ -1976,6 +1976,70 @@ class DocumentHandler:
         textutil)."""
         return False
 
+    def get_page_image(self, cache, page, target_px, fit):
+        """Return `page`'s image (a PIL.Image), scaled so it's
+        `target_px` wide (fit="width") or tall (fit="height") - used by
+        PageCache.get(), which only ever calls this for the kinds it's
+        used for at all (pdf/image/office - never text). `cache` (a
+        PageCache) owns the shared LRU eviction bookkeeping (see
+        cache._cached()/cache._store()) while each handler owns the
+        format-specific way to actually produce/scale the page.
+
+        This default implementation - used by ImageDocument and
+        OfficeDocument via _source_for_page() - treats the page as a
+        single native image, loaded once (see _native_page_image()) and
+        resized by pixel ratio; PdfDocument overrides this entirely,
+        rasterizing on demand at whatever DPI the target size implies
+        instead, since a PDF has no fixed native pixel size at all."""
+        native = self._native_page_image(cache, page)
+        native_dim = native.width if fit == "width" else native.height
+        key = (page, round(target_px))
+        cached = cache._cached(key)
+        if cached is not None:
+            return cached
+        scale = target_px / native_dim
+        new_size = (
+            max(1, round(native.width * scale)),
+            max(1, round(native.height * scale)),
+        )
+        img = native.resize(new_size, Image.Resampling.LANCZOS)
+        cache._store(key, img)
+        return img
+
+    def _native_page_image(self, cache, page):
+        """Load (once per page, cached in `cache`) and normalize
+        _source_for_page()'s file - shared by every get_page_image()
+        that treats a page as a single native image (see there)."""
+        native = cache._native_images.get(page)
+        if native is not None:
+            return native
+        source = self._source_for_page(cache, page)
+        try:
+            img = Image.open(source)
+            img = ImageOps.exif_transpose(img)  # also .load()s it
+            if img.mode in ("RGBA", "LA") or (
+                img.mode == "P" and "transparency" in img.info
+            ):
+                img = img.convert("RGBA")
+            else:
+                img = img.convert("RGB")
+        except Exception as e:
+            # Reached from -F/--follow noticing the file changed into
+            # something that fails to decode - main() already checks
+            # this once up front, but the file can always go bad again
+            # later. Re-raised as a plain RuntimeError so callers
+            # (reload()'s caller in run_viewer) don't need to know
+            # anything PIL-specific to catch it.
+            raise RuntimeError(f"cannot load {source}: {e}") from e
+        cache._native_images[page] = img
+        return img
+
+    def _source_for_page(self, cache, page):
+        """The file to load for `page`, for the default get_page_image()
+        - overridden by ImageDocument (always its own path) and
+        OfficeDocument (one pre-rendered PNG per page, from `cache`)."""
+        raise NotImplementedError
+
 
 class PdfDocument(DocumentHandler):
     kind = "pdf"
@@ -2005,6 +2069,36 @@ class PdfDocument(DocumentHandler):
     def text_mode_is_paginated(self):
         return True
 
+    def get_page_image(self, cache, page, target_px, fit):
+        """Rasterize `page` at whatever DPI makes it `target_px` wide
+        (fit="width") or tall (fit="height") - a PDF page has no fixed
+        native pixel size, unlike a plain image or an office-preview
+        PNG (see DocumentHandler.get_page_image()'s default)."""
+        width_pt, height_pt = pdf_page_size_pt(self.path, page)
+        page_pt = width_pt if fit == "width" else height_pt
+        dpi = 72.0 * target_px / page_pt
+        key = (page, round(dpi))
+
+        cached = cache._cached(key)
+        if cached is not None:
+            return cached
+
+        prefix = os.path.join(cache.tmpdir, f"page-{page}-{round(dpi)}")
+        subprocess.run(
+            [
+                "pdftoppm", "-png", "-r", str(dpi),
+                "-f", str(page), "-l", str(page),
+                "-singlefile", self.path, prefix,
+            ],
+            check=True,
+        )
+        img = Image.open(prefix + ".png")
+        img.load()
+        os.unlink(prefix + ".png")
+
+        cache._store(key, img)
+        return img
+
 
 class ImageDocument(DocumentHandler):
     kind = "image"
@@ -2024,6 +2118,9 @@ class ImageDocument(DocumentHandler):
 
     def page_count(self):
         return 1
+
+    def _source_for_page(self, cache, page):
+        return self.path  # always page 1 - see page_count()
 
 
 class TextDocument(DocumentHandler):
@@ -2087,9 +2184,8 @@ class OfficeDocument(DocumentHandler):
     Chrome. page_count() is deliberately None - unknown until
     build_pages() actually renders it (see
     Viewer._ensure_office_pages()). build_pages() is still just a thin
-    wrapper around build_office_pages() for now - its own
-    should_not_scale/page_element_xpath/sheet_tabs/continuous branching
-    becomes a family of subclasses in a later stage of this refactor."""
+    wrapper around build_office_pages() (itself now backed by the
+    ExcelWorkbook/SlideDeck/FlowingText OfficeVariant hierarchy)."""
 
     kind = "office"
 
@@ -2117,6 +2213,14 @@ class OfficeDocument(DocumentHandler):
 
     def supports_text_mode(self):
         return True
+
+    def _source_for_page(self, cache, page):
+        # One pre-rendered PNG per page (see build_office_pages()) -
+        # unlike ImageDocument, there's no single fixed path, so this
+        # reads the current list back from `cache` (kept in sync by
+        # Viewer.reload() after a -F/--follow re-render) rather than
+        # storing its own copy that could go stale.
+        return cache.office_pages[page - 1]
 
 
 # The order main()'s classification loop will eventually try these in
@@ -2369,7 +2473,30 @@ def _strip_leading_home(s):
     return s
 
 
+def _page_handler_for_kind(kind, doc_path):
+    """The DocumentHandler that owns PageCache.get()'s actual per-page
+    rendering for `kind` - only pdf/image/office ever go through
+    PageCache at all (a "text"-kind file is shown by Viewer's text mode
+    directly, never via a page image), so this only needs to cover
+    those three."""
+    if kind == "pdf":
+        return PdfDocument(doc_path)
+    if kind == "image":
+        return ImageDocument(doc_path)
+    if kind == "office":
+        return OfficeDocument(doc_path)
+    return None
+
+
 class PageCache:
+    """Caches rasterized/resized page images, keyed by (page, size) -
+    the actual per-kind work (rasterize a PDF page at some DPI, resize
+    a pre-rendered image/office PNG) is delegated to a DocumentHandler
+    (see _page_handler_for_kind()), which reaches back into this cache's
+    own bookkeeping (_cached()/_store(), and tmpdir/office_pages) since
+    that bookkeeping - LRU eviction, the "loaded once natively" table -
+    is shared machinery than any one kind's own concern."""
+
     def __init__(self, doc_path, tmpdir, kind, size=CACHE_SIZE, office_pages=None):
         self.doc_path = doc_path
         self.tmpdir = tmpdir
@@ -2378,8 +2505,10 @@ class PageCache:
         self.size = size
         self._cache = OrderedDict()  # (page, dpi_or_px_rounded) -> PIL.Image
         self._native_images = {}  # page -> PIL.Image, loaded once each - see
-        # _get_static_page(): for kind == "image" there's only ever page 1,
-        # but kind == "office" has one source file per pre-rendered page.
+        # DocumentHandler._native_page_image(): for kind == "image"
+        # there's only ever page 1, but kind == "office" has one source
+        # file per pre-rendered page.
+        self.handler = _page_handler_for_kind(kind, doc_path)
 
     def clear(self):
         self._cache.clear()
@@ -2390,86 +2519,20 @@ class PageCache:
         kind=="image", or one of the pre-sliced Quick Look preview PNGs
         for kind=="office"), scaled so it's `target_px` wide (fit="width")
         or tall (fit="height")."""
-        if self.kind == "pdf":
-            return self._get_pdf_page(page, target_px, fit)
-        return self._get_static_page(page, target_px, fit)
+        return self.handler.get_page_image(self, page, target_px, fit)
 
-    def _get_pdf_page(self, page, target_px, fit):
-        """Rasterize `page` at whatever DPI makes it `target_px` wide
-        (fit="width") or tall (fit="height")."""
-        width_pt, height_pt = pdf_page_size_pt(self.doc_path, page)
-        page_pt = width_pt if fit == "width" else height_pt
-        dpi = 72.0 * target_px / page_pt
-        key = (page, round(dpi))
-
+    def _cached(self, key):
+        """A previously-computed page image for `key`, or None - shared
+        LRU bookkeeping used by every DocumentHandler.get_page_image()."""
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
+        return None
 
-        prefix = os.path.join(self.tmpdir, f"page-{page}-{round(dpi)}")
-        subprocess.run(
-            [
-                "pdftoppm", "-png", "-r", str(dpi),
-                "-f", str(page), "-l", str(page),
-                "-singlefile", self.doc_path, prefix,
-            ],
-            check=True,
-        )
-        img = Image.open(prefix + ".png")
-        img.load()
-        os.unlink(prefix + ".png")
-
+    def _store(self, key, img):
         self._cache[key] = img
         if len(self._cache) > self.size:
             self._cache.popitem(last=False)
-        return img
-
-    def _get_static_page(self, page, target_px, fit):
-        """Scale a pre-rendered page (loaded once per page and cached
-        natively) to `target_px` wide or tall, mirroring _get_pdf_page()'s
-        DPI-based resize but by pixel ratio instead - there's no "page
-        size in points" for a plain image or an office-preview PNG. The
-        source file is self.doc_path itself for kind=="image" (always
-        page 1), or self.office_pages[page - 1] for kind=="office"."""
-        native = self._native_images.get(page)
-        if native is None:
-            source = self.doc_path if self.kind == "image" else self.office_pages[page - 1]
-            try:
-                img = Image.open(source)
-                img = ImageOps.exif_transpose(img)  # also .load()s it
-                if img.mode in ("RGBA", "LA") or (
-                    img.mode == "P" and "transparency" in img.info
-                ):
-                    img = img.convert("RGBA")
-                else:
-                    img = img.convert("RGB")
-            except Exception as e:
-                # Reached from -F/--follow noticing the file changed into
-                # something that fails to decode - main() already checks
-                # this once up front, but the file can always go bad
-                # again later. Re-raised as a plain RuntimeError so
-                # callers (reload()'s caller in run_viewer) don't need to
-                # know anything PIL-specific to catch it.
-                raise RuntimeError(f"cannot load {source}: {e}") from e
-            self._native_images[page] = img
-            native = img
-
-        native_dim = native.width if fit == "width" else native.height
-        key = (page, round(target_px))
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
-
-        scale = target_px / native_dim
-        new_size = (
-            max(1, round(native.width * scale)),
-            max(1, round(native.height * scale)),
-        )
-        img = native.resize(new_size, Image.Resampling.LANCZOS)
-        self._cache[key] = img
-        if len(self._cache) > self.size:
-            self._cache.popitem(last=False)
-        return img
 
 
 class EncodeCache:
