@@ -1183,6 +1183,245 @@ def _render_office_error_placeholder(path, tmpdir, message):
     return [out_path]
 
 
+def _slice_and_save_pages(trimmed, bounds, tmpdir, tag):
+    """Crop `trimmed` at each consecutive pair in `bounds` (a list of Y
+    pixel offsets, first always 0, last always trimmed.height) and save
+    each slice as its own page PNG - shared by every OfficeVariant that
+    captures one big image and then splits it, as opposed to
+    ExcelWorkbook's multi-sheet case, which renders each page directly
+    and never needs slicing at all."""
+    page_paths = []
+    for i in range(len(bounds) - 1):
+        top, bottom = bounds[i], bounds[i + 1]
+        page_path = os.path.join(tmpdir, f"office-page-{tag}-{i + 1}.png")
+        trimmed.crop((0, top, trimmed.width, bottom)).save(page_path)
+        page_paths.append(page_path)
+    return page_paths
+
+
+class OfficeVariant:
+    """Base class for the different "how to turn this Quick Look
+    preview into page images" strategies build_office_pages() can use -
+    one of these is chosen once qlmanage's plist/HTML are known (see
+    build_office_pages()), and it owns the capture strategy and the
+    bounds/pagination decision for its own case. The shared preamble
+    (finding Chrome, running qlmanage, deciding which variant to use)
+    lives in build_office_pages() itself, since it has to run before
+    any variant can even be chosen."""
+
+    def __init__(self, chrome, html_path, width, height, tag, name):
+        self.chrome = chrome
+        self.html_path = html_path
+        self.width = width
+        self.height = height
+        self.tag = tag
+        self.name = name
+
+    def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
+        """Returns a list of page PNG paths, or None on failure (a
+        Chrome screenshot subprocess failing)."""
+        raise NotImplementedError
+
+    def _save_pages(self, trimmed, bounds, tmpdir, debug, progress):
+        """Wraps _slice_and_save_pages() with the same progress/debug
+        reporting every variant that slices one big capture wants -
+        not used by ExcelWorkbook's multi-sheet case, which has no
+        single `trimmed` capture to slice at all (each sheet's capture
+        already *is* its own page)."""
+        npages = len(bounds) - 1
+        progress.update(f"{self.name}: splitting into {npages} page(s)...")
+        with _DebugTimer(debug, f"{self.name}: splitting into {npages} page(s)"):
+            return _slice_and_save_pages(trimmed, bounds, tmpdir, self.tag)
+
+
+class ExcelWorkbook(OfficeVariant):
+    """should_not_scale (Excel's tell - see build_office_pages()).
+    `sheet_tabs`, if non-empty (see _parse_sheet_tabs()), means a
+    multi-sheet workbook: Office.qlgenerator renders every sheet up
+    front as its own AttachmentN.html, with Preview.html itself being
+    just a JS tab strip - each sheet is rendered as its own page here,
+    concurrently, and never needs slicing (each capture already *is* a
+    whole page). Otherwise (a single-sheet workbook, where Preview.html
+    *is* the sheet) it's one capture at exactly the plist's own Width/
+    Height - already sized to fit this generator's content exactly,
+    unlike FlowingText's grow-and-trim approach (Excel's sheet-tab
+    selector is pinned to the bottom of the viewport regardless of
+    window height, which would defeat that trick)."""
+
+    def __init__(self, chrome, html_path, width, height, tag, name, sheet_tabs):
+        super().__init__(chrome, html_path, width, height, tag, name)
+        self.sheet_tabs = sheet_tabs
+
+    def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
+        if self.sheet_tabs:
+            return self._build_multi_sheet(tmpdir, debug, render_scale, progress)
+        return self._build_single_sheet(tmpdir, debug, render_scale, progress)
+
+    def _build_multi_sheet(self, tmpdir, debug, render_scale, progress):
+        # Each sheet is an independent render (its own already-
+        # rasterized HTML, its own Chrome screenshot subprocess), so -
+        # like _rasterize_pdf_img_sources()'s embedded-image conversion
+        # - run them concurrently rather than one at a time; a workbook
+        # can have dozens of sheets, and each is mostly subprocess wait
+        # (releases the GIL), not CPU time here.
+        sheet_tabs = self.sheet_tabs
+        name = self.name
+
+        def _render_sheet(i, sheet_name, sheet_html_path):
+            with _DebugTimer(
+                debug, f"{name}: sheet {i + 1} ({sheet_name}): pdftoppm (embedded images)"
+            ):
+                sheet_html_path = _rasterize_pdf_img_sources(sheet_html_path, tmpdir)
+            page_path = os.path.join(tmpdir, f"office-page-{self.tag}-{i + 1}.png")
+            label = f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): rendering"
+            with _DebugTimer(debug, label):
+                _capture_html_screenshot(
+                    self.chrome, sheet_html_path, self.width, self.height, page_path, render_scale
+                )
+            return page_path
+
+        page_paths = [None] * len(sheet_tabs)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(sheet_tabs))) as pool:
+            futures = {
+                pool.submit(_render_sheet, i, sheet_name, sheet_html_path): i
+                for i, (sheet_name, sheet_html_path) in enumerate(sheet_tabs)
+            }
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    page_paths[futures[future]] = future.result()
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                    return None
+                done += 1
+                progress.update(f"{name}: rendered {done}/{len(sheet_tabs)} sheet(s)...")
+        return page_paths
+
+    def _build_single_sheet(self, tmpdir, debug, render_scale, progress):
+        out_png = os.path.join(tmpdir, f"office-capture-{self.tag}.png")
+        label = f"{self.name}: rendering ({self.width * render_scale:.0f}x{self.height * render_scale:.0f})"
+        try:
+            with _DebugTimer(debug, label), progress.spin(label + "..."):
+                _capture_html_screenshot(
+                    self.chrome, self.html_path, self.width, self.height, out_png, render_scale
+                )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return None
+        try:
+            trimmed = Image.open(out_png)
+            trimmed.load()
+            return self._save_pages(trimmed, [0, trimmed.height], tmpdir, debug, progress)
+        finally:
+            if os.path.exists(out_png):
+                os.unlink(out_png)
+
+
+class SlideDeck(OfficeVariant):
+    """A slide deck (PowerPoint/Keynote) whose page/slide boundaries
+    were measured (see _measure_slide_offsets()) - the exact total
+    height is already known, so this is captured in one shot rather
+    than guessed. `confident` (see build_office_pages()) is whether the
+    boundary came from the plist's own PageElementXPath, as opposed to
+    a shape-based guess (_detect_fallback_page_xpath()) - only then is
+    it trusted to paginate; a guessed boundary has been observed to
+    drift/overflow on some real decks, so it's rendered as a single
+    continuous page instead, the same as -c/--continuous forces for
+    any deck."""
+
+    def __init__(self, chrome, html_path, width, height, tag, name, slide_offsets, confident):
+        super().__init__(chrome, html_path, width, height, tag, name)
+        self.slide_offsets = slide_offsets
+        self.confident = confident
+
+    def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
+        total_height, tops = self.slide_offsets
+        capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(1, round(total_height)))
+        out_png = os.path.join(tmpdir, f"office-capture-{self.tag}.png")
+        label = (
+            f"{self.name}: rendering "
+            f"({self.width * render_scale:.0f}x{capture_height * render_scale:.0f})"
+        )
+        try:
+            with _DebugTimer(debug, label), progress.spin(label + "..."):
+                _capture_html_screenshot(
+                    self.chrome, self.html_path, self.width, capture_height, out_png, render_scale
+                )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return None
+        try:
+            trimmed = Image.open(out_png)
+            trimmed.load()
+            if continuous or not self.confident:
+                bounds = [0, trimmed.height]
+            else:
+                # Slice at each slide's own measured start, in physical
+                # (scaled) pixels - exact, unlike guessing from the
+                # screenshot itself (see _measure_slide_offsets() for
+                # why that doesn't work here).
+                bounds = [
+                    min(trimmed.height, round(t * render_scale)) for t in tops
+                ] + [trimmed.height]
+            return self._save_pages(trimmed, bounds, tmpdir, debug, progress)
+        finally:
+            if os.path.exists(out_png):
+                os.unlink(out_png)
+
+
+class FlowingText(OfficeVariant):
+    """A continuously-flowing document with no slide markers (e.g.
+    Word), or one whose measurement simply didn't pan out - its true
+    total content height isn't known up front, so this starts with a
+    guess and doubles it if the content still reaches the bottom edge,
+    up to a hard cap. Renders at OFFICE_RENDER_SCALE_FLOWING rather
+    than the caller's default - these documents are usually short and
+    text-heavy enough that sharpness matters more than the render-time
+    tradeoff the default otherwise makes for a large slide deck -
+    unless the caller (-s/--rendering-scale) asked for a specific scale
+    explicitly."""
+
+    def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
+        if render_scale == OFFICE_RENDER_SCALE:
+            render_scale = OFFICE_RENDER_SCALE_FLOWING
+        out_png = os.path.join(tmpdir, f"office-capture-{self.tag}.png")
+        # Starting small (rather than generously large) matters for
+        # speed, not just to avoid over-capturing a short document: it
+        # also keeps a short document's capture(s) under
+        # _capture_html_screenshot's GPU-safe size threshold, where
+        # every doubling from here on is much faster than the single
+        # oversized one this used to start with.
+        capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(self.height * 3, 1500))
+        try:
+            attempt = 0
+            while True:
+                attempt += 1
+                label = (
+                    f"{self.name}: rendering attempt {attempt} "
+                    f"({self.width * render_scale:.0f}x{capture_height * render_scale:.0f})"
+                )
+                try:
+                    with _DebugTimer(debug, label), progress.spin(label + "..."):
+                        _capture_html_screenshot(
+                            self.chrome, self.html_path, self.width, capture_height, out_png, render_scale
+                        )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                    return None
+                img = Image.open(out_png)
+                img.load()
+                trimmed, cut_off = _trim_trailing_blank_rows(img, _sample_background_color(img))
+                if not cut_off or capture_height >= OFFICE_MAX_CAPTURE_HEIGHT:
+                    break
+                capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, capture_height * 2)
+            if continuous:
+                bounds = [0, trimmed.height]
+            else:
+                page_px = max(1, round(self.height * render_scale))
+                npages = max(1, -(-trimmed.height // page_px))  # ceil division
+                bounds = [min(trimmed.height, i * page_px) for i in range(npages + 1)]
+            return self._save_pages(trimmed, bounds, tmpdir, debug, progress)
+        finally:
+            if os.path.exists(out_png):
+                os.unlink(out_png)
+
+
 def build_office_pages(
     path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE, progress=None,
     continuous=False,
@@ -1248,201 +1487,58 @@ def build_office_pages(
         # being freed.
         tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
 
-        # A spreadsheet with more than one sheet (should_not_scale is
-        # Excel's tell - see below): Office.qlgenerator renders every
-        # sheet up front as its own AttachmentN.html, with Preview.html
-        # itself being just a JS tab strip that swaps an <iframe> between
-        # them - so each is rendered as its own page here instead of only
-        # ever showing whichever sheet happened to be selected first.
-        sheet_tabs = _parse_sheet_tabs(html_path) if should_not_scale else []
-        if sheet_tabs:
-            # Each sheet is an independent render (its own already-
-            # rasterized HTML, its own Chrome screenshot subprocess), so
-            # - like _rasterize_pdf_img_sources()'s embedded-image
-            # conversion - run them concurrently rather than one at a
-            # time; a workbook can have dozens of sheets, and each is
-            # mostly subprocess wait (releases the GIL), not CPU time
-            # here.
-            def _render_sheet(i, sheet_name, sheet_html_path):
-                with _DebugTimer(
-                    debug, f"{name}: sheet {i + 1} ({sheet_name}): pdftoppm (embedded images)"
-                ):
-                    sheet_html_path = _rasterize_pdf_img_sources(sheet_html_path, tmpdir)
-                page_path = os.path.join(tmpdir, f"office-page-{tag}-{i + 1}.png")
-                label = f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): rendering"
-                with _DebugTimer(debug, label):
-                    _capture_html_screenshot(
-                        chrome, sheet_html_path, width, height, page_path, render_scale
-                    )
-                return page_path
-
-            page_paths = [None] * len(sheet_tabs)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(sheet_tabs))) as pool:
-                futures = {
-                    pool.submit(_render_sheet, i, sheet_name, sheet_html_path): i
-                    for i, (sheet_name, sheet_html_path) in enumerate(sheet_tabs)
-                }
-                done = 0
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        page_paths[futures[future]] = future.result()
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                        return None
-                    done += 1
-                    progress.update(f"{name}: rendered {done}/{len(sheet_tabs)} sheet(s)...")
-            if debug:
-                print(
-                    f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
-                    file=sys.stderr, end="\r\n",
-                )
-            return page_paths
-
-        progress.update(f"{name}: converting embedded images...")
-        on_img_progress = lambda done, total: progress.update(
-            f"{name}: converting embedded images ({done}/{total})..."
-        )
-        with _DebugTimer(debug, f"{name}: pdftoppm (embedded images)"):
-            html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
-
-        out_png = os.path.join(tmpdir, f"office-capture-{tag}.png")
-        # Confident means the Quick Look generator itself named the
-        # page/slide element (page_element_xpath came from the plist,
-        # not guessed by _detect_fallback_page_xpath inside
-        # _measure_slide_offsets) - only then is pagination trusted; see
-        # this function's docstring for why a guessed boundary defaults
-        # to continuous instead.
-        confident = bool(page_element_xpath)
-        slide_offsets = None
-        if not should_not_scale and not continuous:
-            # _measure_slide_offsets() still tries a content-shape-based
-            # fallback before giving up even when page_element_xpath is
-            # None, purely so the "attempt 1/2/3..." growth loop below
-            # can be skipped when it happens to work out - but a result
-            # obtained that way isn't "confident" (see above) and won't
-            # be used to paginate. Skipped entirely in continuous mode -
-            # nothing needs a per-page/slide boundary if there's only
-            # ever going to be one "page".
-            progress.update(f"{name}: measuring page/slide layout...")
-            with _DebugTimer(debug, f"{name}: measure slide/page offsets"):
-                slide_offsets = _measure_slide_offsets(chrome, html_path, page_element_xpath, width)
-        if (
-            render_scale == OFFICE_RENDER_SCALE
-            and not should_not_scale
-            and slide_offsets is None
-        ):
-            # Continuously-flowing text (Word and the like) - see
-            # OFFICE_RENDER_SCALE_FLOWING - unless the caller (-s/
-            # --rendering-scale) asked for a specific scale explicitly.
-            render_scale = OFFICE_RENDER_SCALE_FLOWING
-        try:
-            if should_not_scale:
-                # See the comment above: Excel's sheet-tab selector is
-                # pinned to the bottom of the viewport regardless of
-                # window height, so the grow-and-trim approach below
-                # would never see it stop looking "cut off". Trust the
-                # plist's Height as-is instead - it's already sized to
-                # fit this generator's content exactly.
-                label = f"{name}: rendering ({width * render_scale:.0f}x{height * render_scale:.0f})"
-                try:
-                    with _DebugTimer(debug, label), progress.spin(label + "..."):
-                        _capture_html_screenshot(chrome, html_path, width, height, out_png, render_scale)
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                    return None
-                trimmed = Image.open(out_png)
-                trimmed.load()
-            elif slide_offsets is not None:
-                # A slide deck (PowerPoint/Keynote) - the exact total
-                # height is already known (see _measure_slide_offsets()),
-                # so this can be captured in one shot rather than
-                # guessing.
-                total_height, _ = slide_offsets
-                capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(1, round(total_height)))
-                label = (
-                    f"{name}: rendering "
-                    f"({width * render_scale:.0f}x{capture_height * render_scale:.0f})"
-                )
-                try:
-                    with _DebugTimer(debug, label), progress.spin(label + "..."):
-                        _capture_html_screenshot(chrome, html_path, width, capture_height, out_png, render_scale)
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                    return None
-                trimmed = Image.open(out_png)
-                trimmed.load()
-            else:
-                # A continuously-flowing document with no slide markers
-                # (e.g. Word) - its true total content height isn't
-                # known up front, so start with a guess and double it if
-                # the content still reaches the bottom edge, up to a
-                # hard cap. Starting small (rather than generously
-                # large) matters for speed, not just to avoid
-                # over-capturing a short document: it also keeps a short
-                # document's capture(s) under _capture_html_screenshot's
-                # GPU-safe size threshold, where every doubling from here
-                # on is much faster than the single oversized one this
-                # used to start with.
-                capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(height * 3, 1500))
-                attempt = 0
-                while True:
-                    attempt += 1
-                    label = (
-                        f"{name}: rendering attempt {attempt} "
-                        f"({width * render_scale:.0f}x{capture_height * render_scale:.0f})"
-                    )
-                    try:
-                        with _DebugTimer(debug, label), progress.spin(label + "..."):
-                            _capture_html_screenshot(
-                                chrome, html_path, width, capture_height, out_png, render_scale
-                            )
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                        return None
-                    img = Image.open(out_png)
-                    img.load()
-                    trimmed, cut_off = _trim_trailing_blank_rows(img, _sample_background_color(img))
-                    if not cut_off or capture_height >= OFFICE_MAX_CAPTURE_HEIGHT:
-                        break
-                    capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, capture_height * 2)
-        finally:
-            if os.path.exists(out_png):
-                os.unlink(out_png)
-
-        page_paths = []
-        if continuous or should_not_scale:
-            # continuous: always exactly one "page", regardless of how
-            # many real pages/slides the document has - see this
-            # function's docstring. should_not_scale (e.g. Excel) is
-            # already just one page/canvas anyway either way.
-            bounds = [0, trimmed.height]
-        elif slide_offsets is not None and confident:
-            # Slice at each slide's own measured start, in physical
-            # (scaled) pixels - exact, unlike guessing from the
-            # screenshot itself (see _measure_slide_offsets() for why
-            # that doesn't work here). Only trusted when the boundary
-            # came from the plist's own PageElementXPath (see
-            # `confident` above) - not from a guessed one.
-            total_height, tops = slide_offsets
-            bounds = [
-                min(trimmed.height, round(t * render_scale)) for t in tops
-            ] + [trimmed.height]
-        elif slide_offsets is not None:
-            # A boundary was found, but only by guessing (no
-            # PageElementXPath in the plist - see _detect_fallback_page_xpath())
-            # - that guess has been observed to drift/overflow on some
-            # real decks, so play it safe and fall back to one
-            # continuous "page" instead of trusting it.
-            bounds = [0, trimmed.height]
+        # Pick which OfficeVariant strategy applies - see their own
+        # docstrings for what distinguishes each. should_not_scale (a
+        # plist flag) is Excel's tell and is cheap to check up front;
+        # the rest can only be told apart by actually attempting to
+        # measure the slide/page layout.
+        if should_not_scale:
+            # A spreadsheet with more than one sheet: Office.qlgenerator
+            # renders every sheet up front as its own AttachmentN.html,
+            # with Preview.html itself being just a JS tab strip that
+            # swaps an <iframe> between them - _parse_sheet_tabs() reads
+            # that strip back out; empty for a single-sheet workbook,
+            # where Preview.html *is* the sheet.
+            sheet_tabs = _parse_sheet_tabs(html_path)
+            variant = ExcelWorkbook(chrome, html_path, width, height, tag, name, sheet_tabs)
         else:
-            page_px = max(1, round(height * render_scale))
-            npages = max(1, -(-trimmed.height // page_px))  # ceil division
-            bounds = [min(trimmed.height, i * page_px) for i in range(npages + 1)]
+            progress.update(f"{name}: converting embedded images...")
+            on_img_progress = lambda done, total: progress.update(
+                f"{name}: converting embedded images ({done}/{total})..."
+            )
+            with _DebugTimer(debug, f"{name}: pdftoppm (embedded images)"):
+                html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
 
-        npages = len(bounds) - 1
-        progress.update(f"{name}: splitting into {npages} page(s)...")
-        with _DebugTimer(debug, f"{name}: splitting into {npages} page(s)"):
-            for i in range(npages):
-                top, bottom = bounds[i], bounds[i + 1]
-                page_path = os.path.join(tmpdir, f"office-page-{tag}-{i + 1}.png")
-                trimmed.crop((0, top, trimmed.width, bottom)).save(page_path)
-                page_paths.append(page_path)
+            # Confident means the Quick Look generator itself named the
+            # page/slide element (page_element_xpath came from the
+            # plist, not guessed by _detect_fallback_page_xpath inside
+            # _measure_slide_offsets) - only then is pagination trusted;
+            # see SlideDeck's docstring for why a guessed boundary
+            # defaults to continuous instead.
+            confident = bool(page_element_xpath)
+            slide_offsets = None
+            if not continuous:
+                # _measure_slide_offsets() still tries a content-shape-
+                # based fallback before giving up even when
+                # page_element_xpath is None, purely so FlowingText's
+                # "attempt 1/2/3..." growth loop can be skipped when it
+                # happens to work out - but a result obtained that way
+                # isn't "confident" (see above) and won't be used to
+                # paginate. Skipped entirely in continuous mode -
+                # nothing needs a per-page/slide boundary if there's
+                # only ever going to be one "page".
+                progress.update(f"{name}: measuring page/slide layout...")
+                with _DebugTimer(debug, f"{name}: measure slide/page offsets"):
+                    slide_offsets = _measure_slide_offsets(chrome, html_path, page_element_xpath, width)
+
+            if slide_offsets is not None:
+                variant = SlideDeck(chrome, html_path, width, height, tag, name, slide_offsets, confident)
+            else:
+                variant = FlowingText(chrome, html_path, width, height, tag, name)
+
+        page_paths = variant.build_pages(tmpdir, debug, render_scale, progress, continuous)
+        if page_paths is None:
+            return None
         if debug:
             print(
                 f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
