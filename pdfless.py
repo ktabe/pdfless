@@ -2243,6 +2243,11 @@ class OfficeDocument(DocumentHandler):
 
     kind = "office"
 
+    def __init__(self, path):
+        super().__init__(path)
+        self.pages = None  # [png_path, ...] once rendered - see
+        # build_pages()/ensure_pages(); None until the first render.
+
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
         return cls(path) if _probe_office_preview(path, tmpdir, debug=debug) else None
@@ -2254,10 +2259,30 @@ class OfficeDocument(DocumentHandler):
         self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
         progress=None, continuous=False,
     ):
-        return build_office_pages(
+        """Render fresh - always, regardless of self.pages - remembering
+        the result for _source_for_page() and any later ensure_pages()
+        call. Used directly by Viewer.reload() (which always wants a
+        fresh render, since the file changed on disk); see
+        ensure_pages() for the memoized entry point everything else
+        wants instead."""
+        return self._render_and_remember(
             self.path, tmpdir, debug=debug, render_scale=render_scale,
             progress=progress, continuous=continuous,
         )
+
+    def _render_and_remember(self, source_path, tmpdir, **kwargs):
+        pages = build_office_pages(source_path, tmpdir, **kwargs)
+        if pages:
+            self.pages = pages
+        return pages
+
+    def ensure_pages(self, tmpdir, **kwargs):
+        """Render once and reuse afterward - a no-op on every call after
+        the first (see Viewer._ensure_office_pages(), which only needs
+        this once per file no matter how many times it's revisited)."""
+        if self.pages is None:
+            self.build_pages(tmpdir, **kwargs)
+        return self.pages
 
     def extract_text(self, page):
         # textutil (see extract_office_text()) has no notion of pages -
@@ -2271,10 +2296,9 @@ class OfficeDocument(DocumentHandler):
     def _source_for_page(self, cache, page):
         # One pre-rendered PNG per page (see build_office_pages()) -
         # unlike ImageDocument, there's no single fixed path, so this
-        # reads the current list back from `cache` (kept in sync by
-        # Viewer.reload() after a -F/--follow re-render) rather than
-        # storing its own copy that could go stale.
-        return cache.office_pages[page - 1]
+        # reads self.pages (kept in sync by build_pages()/
+        # ensure_pages()) rather than a path fixed at construction time.
+        return self.pages[page - 1]
 
 
 class RtfOfficeDocument(OfficeDocument):
@@ -2314,7 +2338,7 @@ class RtfOfficeDocument(OfficeDocument):
         # correspond to anything in the original RTF, so it's not worth
         # trusting as a page boundary the way a native Word document's
         # is.
-        return build_office_pages(
+        return self._render_and_remember(
             docx_path, tmpdir, debug=debug, render_scale=render_scale,
             progress=progress, continuous=True,
         )
@@ -2584,22 +2608,22 @@ class PageCache:
     the actual per-kind work (rasterize a PDF page at some DPI, resize
     a pre-rendered image/office PNG) is delegated to `handler` (the
     same DocumentHandler instance Viewer itself uses - see
-    Viewer._set_current_file()), which reaches back into this cache's
-    own bookkeeping (_cached()/_store(), and tmpdir/office_pages) since
-    that bookkeeping - LRU eviction, the "loaded once natively" table -
-    is shared machinery rather than any one kind's own concern."""
+    Viewer._set_current_file() - which for an OfficeDocument owns its
+    own rendered page list, self.pages), which reaches back into this
+    cache's own bookkeeping (_cached()/_store(), and tmpdir) since that
+    bookkeeping - LRU eviction, the "loaded once natively" table - is
+    shared machinery rather than any one kind's own concern."""
 
-    def __init__(self, doc_path, tmpdir, handler, size=CACHE_SIZE, office_pages=None):
+    def __init__(self, doc_path, tmpdir, handler, size=CACHE_SIZE):
         self.doc_path = doc_path
         self.tmpdir = tmpdir
         self.kind = handler.kind  # "pdf", "image", or "office"
-        self.office_pages = office_pages  # [png_path, ...], only for kind == "office"
         self.size = size
         self._cache = OrderedDict()  # (page, dpi_or_px_rounded) -> PIL.Image
         self._native_images = {}  # page -> PIL.Image, loaded once each - see
         # DocumentHandler._native_page_image(): for kind == "image"
         # there's only ever page 1, but kind == "office" has one source
-        # file per pre-rendered page.
+        # file per pre-rendered page (handler.pages).
         self.handler = handler
 
     def clear(self):
@@ -2652,16 +2676,13 @@ class EncodeCache:
 class Viewer:
     def __init__(
         self, files, file_index, page, tmpdir, fd, fit="width",
-        frame=True, wheel_scroll_step=1, office_pages_by_path=None,
+        frame=True, wheel_scroll_step=1,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False,
     ):
         self.files = files  # [(path, DocumentHandler), ...] - one per CLI argument
         self.file_index = file_index
         self.tmpdir = tmpdir
-        # kind == "office" files' pre-rendered page PNGs (see
-        # build_office_pages()), keyed by absolute path.
-        self.office_pages_by_path = office_pages_by_path or {}
         self.debug = debug  # -d/--debug: print office-preview stage timing
         self.office_render_scale = office_render_scale  # --rendering-scale
         self.office_continuous = office_continuous  # -c/--continuous
@@ -2744,20 +2765,13 @@ class Viewer:
         self.pdf_name = os.path.basename(path)
         self.doc_handler = handler
         self.kind = handler.kind  # "pdf", "image", "text", or "office"
-        if isinstance(handler, OfficeDocument) and path in self.office_pages_by_path:
-            # Already rendered on an earlier visit to this file (see
-            # _ensure_office_pages()) - handler.page_count() is always
-            # None (an OfficeDocument's page count isn't known until
-            # it's actually rendered), so the real count instead comes
-            # from that previous render's own result.
-            self.npages = len(self.office_pages_by_path[path])
-        else:
-            self.npages = handler.page_count()
+        self.npages = handler.page_count()  # None for an OfficeDocument
+        # until _ensure_office_pages() below actually renders it
         self._ensure_office_pages()  # a no-op unless doc_handler is an
-        # OfficeDocument and this file hasn't been rendered yet - may
-        # update self.npages, see below
-        office_pages = self.office_pages_by_path.get(path) if isinstance(handler, OfficeDocument) else None
-        self.cache = PageCache(path, self.tmpdir, handler, office_pages=office_pages)
+        # OfficeDocument, and sets self.npages for real in that case
+        # (memoized on the handler itself - see OfficeDocument.pages -
+        # so a revisit to an already-rendered file is still cheap)
+        self.cache = PageCache(path, self.tmpdir, handler)
 
     def _ensure_office_pages(self):
         """With multiple files on the command line, an office-kind one
@@ -2765,13 +2779,13 @@ class Viewer:
         rendered the moment it's about to be displayed - not upfront for
         every such file regardless of whether it's ever looked at - so
         this is where that render happens, the first time doc_handler is
-        an OfficeDocument and self.pdf_path isn't already in
-        self.office_pages_by_path. A no-op every time after that (the
-        result is cached there for the rest of the session, same as a
-        file that's always been rendered up front would be)."""
-        if not isinstance(self.doc_handler, OfficeDocument) or self.pdf_path in self.office_pages_by_path:
+        an OfficeDocument. A no-op every time after that (doc_handler.
+        ensure_pages() remembers its own result on the handler itself,
+        the same as a file that's always been rendered up front would
+        be) other than resetting self.npages, which is cheap."""
+        if not isinstance(self.doc_handler, OfficeDocument):
             return
-        pages = self.doc_handler.build_pages(
+        pages = self.doc_handler.ensure_pages(
             self.tmpdir, debug=self.debug,
             render_scale=self.office_render_scale, progress=_ViewerProgress(self),
             continuous=self.office_continuous,
@@ -2781,7 +2795,7 @@ class Viewer:
                 self.pdf_path, self.tmpdir,
                 "Quick Look rendering failed - see -d/--debug for details",
             )
-        self.office_pages_by_path[self.pdf_path] = pages
+            self.doc_handler.pages = pages  # remember the placeholder too - don't retry every revisit
         self.npages = len(pages)
 
     @property
@@ -3691,8 +3705,10 @@ class Viewer:
                 progress=_ViewerProgress(self), continuous=self.office_continuous,
             )
             if pages:
-                self.office_pages_by_path[self.pdf_path] = pages
-                self.cache.office_pages = pages
+                # build_pages() already updated self.doc_handler.pages
+                # (see OfficeDocument._render_and_remember()) - just
+                # self.cache.clear() below is needed to drop any now-stale
+                # resized/cached images.
                 self.npages = len(pages)
                 self.page = max(1, min(self.npages, self.page))
         self.cache.clear()
@@ -3976,7 +3992,7 @@ class Viewer:
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
     frame=True, follow=False, wheel_scroll_step=1, keep=False,
-    office_pages_by_path=None, debug=False, office_render_scale=OFFICE_RENDER_SCALE,
+    debug=False, office_render_scale=OFFICE_RENDER_SCALE,
     office_continuous=False,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
@@ -3984,7 +4000,7 @@ def run_viewer(
     viewer = Viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
         frame=frame, wheel_scroll_step=wheel_scroll_step,
-        office_pages_by_path=office_pages_by_path, debug=debug,
+        debug=debug,
         office_render_scale=office_render_scale, office_continuous=office_continuous,
     )
 
@@ -4427,8 +4443,6 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
     try:
         files = []  # [(abs_path, DocumentHandler), ...], in the given order
-        office_pages_by_path = {}  # kind=="office" files' page PNGs - see
-        # build_office_pages() - keyed by absolute path
         for path in candidates:
             # Try each DocumentHandler subclass, in priority order, for
             # the first one whose sniff() claims this file - see
@@ -4485,7 +4499,7 @@ def main():
                     files, 0, start_page, tmpdir, fd, rt.old,
                     fit=fit, frame=args.frame, follow=args.follow,
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
-                    office_pages_by_path=office_pages_by_path, debug=args.debug,
+                    debug=args.debug,
                     office_render_scale=args.rendering_scale,
                     office_continuous=args.continuous,
                 )

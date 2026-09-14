@@ -20,11 +20,11 @@ def test_image_page_cache_returns_correctly_sized_image(sample_image, tmp_path):
     assert img.height == 96
 
 
-def test_office_page_cache_reads_from_cache_office_pages_live(tmp_path):
-    """OfficeDocument._source_for_page() must read cache.office_pages
-    fresh each call (not a copy captured at construction time), or a
-    Viewer.reload() swapping in freshly-rendered pages after a
-    -F/--follow change wouldn't be picked up."""
+def test_office_page_cache_reads_from_handler_pages_live(tmp_path):
+    """OfficeDocument._source_for_page() must read self.pages fresh
+    each call (not a copy captured elsewhere), since Viewer.reload()
+    (after a -F/--follow change) replaces it via a fresh build_pages()
+    call on the very same handler instance."""
     from PIL import Image
 
     page1 = tmp_path / "page1.png"
@@ -33,15 +33,15 @@ def test_office_page_cache_reads_from_cache_office_pages_live(tmp_path):
     Image.new("RGB", (100, 100), "blue").save(page2)
 
     handler = pdfless.OfficeDocument("/does/not/matter.pptx")
-    cache = pdfless.PageCache(
-        "/does/not/matter.pptx", str(tmp_path), handler,
-        office_pages=[str(page1)],
-    )
+    handler.pages = [str(page1)]
+    cache = pdfless.PageCache("/does/not/matter.pptx", str(tmp_path), handler)
     first = cache.get(1, 50, fit="width")
     assert first.getpixel((0, 0))[:3] == (255, 0, 0)
 
-    # Simulate a -F/--follow reload: new pages, cache cleared.
-    cache.office_pages = [str(page2)]
+    # Simulate a -F/--follow reload: build_pages() (via
+    # _render_and_remember()) replaces handler.pages, and Viewer clears
+    # the cache so the new pages actually get (re)loaded.
+    handler.pages = [str(page2)]
     cache.clear()
     second = cache.get(1, 50, fit="width")
     assert second.getpixel((0, 0))[:3] == (0, 0, 255)
