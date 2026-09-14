@@ -52,6 +52,73 @@ def sample_docx():
     return os.path.join(FIXTURES_DIR, "sample.docx")
 
 
+@pytest.fixture
+def sample_multisheet_xlsx():
+    """A 3-sheet workbook (Alpha/Beta/Gamma), each with distinct
+    content in A1 - built via openpyxl (see the fixture-generation
+    notes below)."""
+    return os.path.join(FIXTURES_DIR, "sample_multisheet.xlsx")
+
+
+@pytest.fixture
+def sample_multisheet_xls():
+    """Same workbook as sample_multisheet_xlsx, converted to the
+    legacy binary format via `soffice --headless --convert-to xls`."""
+    return os.path.join(FIXTURES_DIR, "sample_multisheet.xls")
+
+
+@pytest.fixture
+def sample_multisheet_numbers():
+    """Same 3-sheet structure, but built with the real Numbers app
+    (via AppleScript) rather than openpyxl - Numbers' own Quick Look
+    generator (iWork.qlgenerator) marks up its sheet-tab strip
+    differently from Excel's (Office.qlgenerator), which is why this
+    is a separate fixture rather than just another Excel conversion."""
+    return os.path.join(FIXTURES_DIR, "sample_multisheet.numbers")
+
+
+@pytest.fixture
+def sample_twopage_docx():
+    """A 2-page Word document (an explicit page break between two
+    paragraphs of body text) - built via python-docx."""
+    return os.path.join(FIXTURES_DIR, "sample_twopage.docx")
+
+
+@pytest.fixture
+def sample_twopage_doc():
+    """Same document as sample_twopage_docx, converted to the legacy
+    binary format via `soffice --headless --convert-to doc`."""
+    return os.path.join(FIXTURES_DIR, "sample_twopage.doc")
+
+
+@pytest.fixture
+def sample_twopage_pages():
+    """A 2-page Pages document (body text long enough to overflow one
+    page) - built with the real Pages app via AppleScript."""
+    return os.path.join(FIXTURES_DIR, "sample_twopage.pages")
+
+
+@pytest.fixture
+def sample_twoslide_pptx():
+    """A 2-slide PowerPoint deck ("Slide one/two content" text boxes)
+    - built via python-pptx."""
+    return os.path.join(FIXTURES_DIR, "sample_twoslide.pptx")
+
+
+@pytest.fixture
+def sample_twoslide_ppt():
+    """Same deck as sample_twoslide_pptx, converted to the legacy
+    binary format via `soffice --headless --convert-to ppt`."""
+    return os.path.join(FIXTURES_DIR, "sample_twoslide.ppt")
+
+
+@pytest.fixture
+def sample_twoslide_key():
+    """A 2-slide Keynote deck ("Slide one/two content" titles) - built
+    with the real Keynote app via AppleScript."""
+    return os.path.join(FIXTURES_DIR, "sample_twoslide.key")
+
+
 def office_support_available():
     return (
         shutil.which("qlmanage") is not None
