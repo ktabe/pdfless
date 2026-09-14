@@ -8,7 +8,6 @@ raw escape-sequence output is unreliable to parse - see
 test_viewer_integration.py for the subprocess-level smoke tests."""
 
 import fcntl
-import os
 import pty
 import struct
 import termios
@@ -18,7 +17,7 @@ import pdfless
 from conftest import requires_office_support
 
 
-def make_viewer(path, handler):
+def make_viewer(handler):
     """A real Viewer, with page/match-scroll rendering stubbed out -
     this synthetic pty has no real terminal pixel size
     (get_pixel_size()), which _load_page()/the image-mode match-scroll
@@ -30,7 +29,7 @@ def make_viewer(path, handler):
     _master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 960, 720))
     tmpdir = tempfile.mkdtemp()
-    viewer = pdfless.Viewer([(os.path.abspath(path), handler)], 0, 1, tmpdir, slave, None)
+    viewer = pdfless.Viewer([handler], 0, 1, tmpdir, slave, None)
     viewer._load_page = lambda: None
     viewer._scroll_image_to_match = lambda match: None
     viewer._scroll_text_to_match = lambda match: None
@@ -42,7 +41,7 @@ def make_viewer(path, handler):
 
 @requires_office_support
 def test_office_document_search_only_works_in_text_mode(sample_docx):
-    viewer = make_viewer(sample_docx, pdfless.OfficeDocument(sample_docx))
+    viewer = make_viewer(pdfless.OfficeDocument(sample_docx))
     assert isinstance(viewer.doc_handler, pdfless.OfficeDocument)
 
     # Not yet in text mode: doc_handler.supports_search() alone
@@ -61,7 +60,7 @@ def test_office_document_search_only_works_in_text_mode(sample_docx):
 
 
 def test_plain_text_file_search_works(sample_text):
-    viewer = make_viewer(sample_text, pdfless.TextDocument(sample_text))
+    viewer = make_viewer(pdfless.TextDocument(sample_text))
     assert viewer.text_mode is True  # permanently, for kind=="text"
     assert viewer.text_lines == ["line one", "line two", "line three"]
 
@@ -75,7 +74,7 @@ def test_pdf_search_uses_bbox_index_in_both_modes(sample_pdf):
     rather than the line-based search text/rtf/office use - in image
     mode (already worked before this change) and in text mode (must
     keep working the same way after it)."""
-    viewer = make_viewer(sample_pdf, pdfless.PdfDocument(sample_pdf))
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
 
     viewer.start_search("Lorem")
     assert viewer.search_matches
@@ -88,7 +87,7 @@ def test_pdf_search_uses_bbox_index_in_both_modes(sample_pdf):
 
 
 def test_image_document_never_supports_search(sample_image):
-    viewer = make_viewer(sample_image, pdfless.ImageDocument(sample_image))
+    viewer = make_viewer(pdfless.ImageDocument(sample_image))
     assert viewer.doc_handler.supports_search() is False
     assert viewer.doc_handler.supports_text_mode() is False
     assert viewer.text_mode is False

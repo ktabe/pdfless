@@ -1404,20 +1404,6 @@ def compile_search_pattern(query):
 
 
 
-# --- DocumentHandler hierarchy (Stage 0 of an ongoing refactor) -----------
-#
-# main()'s file-kind classification and a good deal of format-dependent
-# behavior elsewhere (PageCache, text-mode extraction, search/text-mode
-# key-handling gates, ...) is currently a set of "kind" string
-# comparisons plus a handful of extra flags (should_not_scale,
-# page_element_xpath, is_rtf_file, ...) scattered across many
-# functions/methods. This hierarchy is the start of replacing that with
-# per-format subclasses each owning their own behavior - "replace
-# conditional with polymorphism". Format-specific logic (PdfDocument's
-# own page-count/size/text-extraction methods, read_plain_text_lines(),
-# ...) has since migrated onto these subclasses directly.
-
-
 class UnusableFile(Exception):
     """Raised by DocumentHandler.sniff() when a file's format was
     positively identified (e.g. its PDF magic bytes matched) but it
@@ -2692,7 +2678,7 @@ class Viewer:
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False,
     ):
-        self.files = files  # [(path, DocumentHandler), ...] - one per CLI argument
+        self.files = files  # [DocumentHandler, ...] - one per CLI argument
         self.file_index = file_index
         self.tmpdir = tmpdir
         self.debug = debug  # -d/--debug: print office-preview stage timing
@@ -2711,7 +2697,7 @@ class Viewer:
         # but the status line alone doesn't touch any of that.
         self.rows, self.cols, _, _ = get_term_cells(fd)
         self.page = page
-        self._set_current_file()  # sets pdf_path/pdf_name/kind/npages/cache
+        self._set_current_file()  # sets path/name/kind/npages/cache
         # For an office-kind first file, self.npages was just determined
         # above (by _ensure_office_pages(), lazily) rather than known
         # ahead of time the way main() clamps a PDF/image/text file's
@@ -2768,13 +2754,13 @@ class Viewer:
         self.help_active = False
 
     def _set_current_file(self):
-        """Point pdf_path/pdf_name/kind/npages/doc_handler/cache at
+        """Point path/name/kind/npages/doc_handler/cache at
         self.files[self.file_index] - just the file's identity, not the
         page/zoom/search/etc. state, which __init__ sets up once and
         go_to_file() resets explicitly on every later switch."""
-        path, handler = self.files[self.file_index]
-        self.pdf_path = path  # a plain image, text, or office file, when not a PDF
-        self.pdf_name = os.path.basename(path)
+        handler = self.files[self.file_index]
+        self.path = handler.path
+        self.name = os.path.basename(handler.path)
         self.doc_handler = handler
         self.kind = handler.kind  # "pdf", "image", "text", or "office"
         self.npages = handler.page_count()  # None for an OfficeDocument
@@ -2783,7 +2769,7 @@ class Viewer:
         # OfficeDocument, and sets self.npages for real in that case
         # (memoized on the handler itself - see OfficeDocument.pages -
         # so a revisit to an already-rendered file is still cheap)
-        self.cache = PageCache(path, self.tmpdir, handler)
+        self.cache = PageCache(handler.path, self.tmpdir, handler)
 
     def _ensure_office_pages(self):
         """With multiple files on the command line, an office-kind one
@@ -3489,7 +3475,7 @@ class Viewer:
                 else int(100 * self.scroll / self.scroll_max)
             )
             mode_field = f" zoom {round(self.zoom * 100)}% "
-        segments = [(f" {self.pdf_name} ", STATUS_COLOR_FILENAME)]
+        segments = [(f" {self.name} ", STATUS_COLOR_FILENAME)]
         if len(self.files) > 1:
             segments.append((
                 f" file {self.file_index + 1}/{len(self.files)} ",
@@ -4024,7 +4010,7 @@ def run_viewer(
     search_buf = None  # None: not typing; otherwise the "/query" in progress
     colon_pending = False  # True right after ":", awaiting n/p (next/previous file)
 
-    last_follow_path = viewer.pdf_path
+    last_follow_path = viewer.path
     try:
         last_mtime = os.path.getmtime(last_follow_path) if follow else None
     except OSError:
@@ -4035,11 +4021,11 @@ def run_viewer(
     while True:
         r, _, _ = select.select([fd], [], [], 0.3)
 
-        if follow and viewer.pdf_path != last_follow_path:
+        if follow and viewer.path != last_follow_path:
             # :n/:p switched to a different file - start tracking that
             # one instead, rather than comparing its mtime against
             # whatever the previous file's was.
-            last_follow_path = viewer.pdf_path
+            last_follow_path = viewer.path
             try:
                 last_mtime = os.path.getmtime(last_follow_path)
             except OSError:
@@ -4445,7 +4431,7 @@ def main():
 
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
     try:
-        files = []  # [(abs_path, DocumentHandler), ...], in the given order
+        files = []  # [DocumentHandler, ...], in the given order (each knows its own .path)
         for path in candidates:
             # Try each DocumentHandler subclass, in priority order, for
             # the first one whose sniff() claims this file - see
@@ -4472,7 +4458,7 @@ def main():
                 )
                 continue
 
-            files.append((path, handler))
+            files.append(handler)
 
         if not files:
             die("no valid PDF, image, text, or Quick-Look-previewable files given")
@@ -4480,7 +4466,7 @@ def main():
         # page count isn't known until Viewer.__init__ actually renders
         # it, which also clamps self.page against it then; here just
         # keep whatever page number was asked for (>= 1).
-        first_npages = files[0][1].page_count()
+        first_npages = files[0].page_count()
         start_page = args.page if first_npages is None else min(first_npages, args.page)
         start_page = max(1, start_page)
 
@@ -4492,7 +4478,7 @@ def main():
             # A text-kind first file starts straight in text mode (see
             # Viewer.__init__), where mouse reporting should be off, the
             # same as it would be for a PDF's `t` toggle.
-            initial_mouse = MOUSE_OFF if files[0][1].starts_in_text_mode() else MOUSE_ON
+            initial_mouse = MOUSE_OFF if files[0].starts_in_text_mode() else MOUSE_ON
             sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON)
             sys.stdout.flush()
             viewer = None
