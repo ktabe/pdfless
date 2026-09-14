@@ -3020,8 +3020,13 @@ class Viewer:
         ))
 
     def reset_view(self):
+        """"0": back to the untouched view of this page - zoom 1 and the
+        left edge. The pan has to be put back by hand: _load_page() only
+        clamps x_offset these days, and at zoom 1 a -h page can still be
+        wider than the terminal, so there'd be nothing to clamp it to."""
         self.zoom = 1.0
         self._load_page()
+        self.x_offset = 0
 
     def set_fit(self, fit):
         self.fit = fit

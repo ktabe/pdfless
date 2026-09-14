@@ -67,6 +67,19 @@ def test_scrolling_off_the_bottom_of_a_page_keeps_the_pan(sample_pdf):
     assert viewer.x_offset == 0
 
 
+def test_reset_view_goes_back_to_the_left_edge(sample_pdf):
+    """"0" is documented as resetting zoom AND pan (see KEY_TABLE), and
+    at zoom 1 a height-fitted page can still be wider than the terminal
+    - so the pan has to be reset explicitly, not just clamped."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    viewer.handle_key("L")
+    assert viewer.x_offset > 0
+
+    viewer.handle_key("0")
+    assert viewer.zoom == 1.0
+    assert viewer.x_offset == 0
+
+
 def test_zoom_stays_centered_on_what_was_on_screen(sample_pdf):
     """Zoom is the one thing that does move the pan, deliberately: the
     point in the middle of the window stays in the middle."""
