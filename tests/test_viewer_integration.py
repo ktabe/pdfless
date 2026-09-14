@@ -1,0 +1,74 @@
+"""End-to-end tests driving a real `pdfless.py` subprocess through a
+pty - the only way to exercise Viewer at all (it needs a real terminal
+for ioctl-based size queries). These are slower than the unit tests in
+the other modules, but they're what actually catches a crash in the
+Viewer/DocumentHandler wiring - e.g. the regression this module is
+named for, where opening a plain text file crashed with
+`TypeError: object of type 'NoneType' has no len()` because
+_load_text_page() assumed a cache that's only populated by
+enter_text_mode()/reload(), neither of which ever runs for a
+kind=="text" file (it starts permanently in text mode)."""
+
+import os
+import signal
+import time
+
+from conftest import requires_office_support
+
+
+def assert_no_crash(session, keys, wait=0.5, initial_wait=3):
+    time.sleep(initial_wait)
+    for k in keys:
+        session.send(k, wait=wait)
+    out = session.read_all().decode(errors="replace")
+    assert "Traceback" not in out, out
+
+
+def test_plain_text_file_opens_without_crashing(pty_session, sample_text):
+    session = pty_session([sample_text])
+    assert_no_crash(session, [b"q"])
+
+
+def test_rtf_file_opens_without_crashing(pty_session, sample_rtf):
+    session = pty_session([sample_rtf])
+    assert_no_crash(session, [b"q"])
+
+
+def test_plain_text_file_survives_a_resize(pty_session, sample_text):
+    """A kind=="text" file's _load_text_page() runs again on every
+    resize (refresh()'s SIGWINCH path) - make sure that doesn't crash
+    either, not just the very first load."""
+    session = pty_session([sample_text])
+    time.sleep(3)
+    os.kill(session.pid, signal.SIGWINCH)
+    time.sleep(0.5)
+    session.send(b"q")
+    out = session.read_all().decode(errors="replace")
+    assert "Traceback" not in out
+
+
+def test_pdf_text_mode_toggle_and_search(pty_session, sample_pdf):
+    session = pty_session([sample_pdf])
+    assert_no_crash(session, [b"t", b"/", b"Lorem\r", b"n", b"t", b"q"])
+
+
+def test_image_file_refuses_text_mode_and_search(pty_session, sample_image):
+    session = pty_session([sample_image])
+    assert_no_crash(session, [b"t", b"/", b"q"])
+
+
+@requires_office_support
+def test_docx_office_text_mode_toggle(pty_session, sample_docx):
+    session = pty_session([sample_docx])
+    assert_no_crash(session, [b"t", b"t", b"q"], wait=1.0, initial_wait=6)
+
+
+@requires_office_support
+def test_rtf_office_text_mode_toggle(pty_session, sample_rtf):
+    """An RTF file now renders as an image via RtfOfficeDocument (a
+    textutil-to-docx conversion feeding the same pipeline as a native
+    Word document) - make sure both the image view and 't' toggling
+    into/out of text mode work end-to-end, not just the plain-text
+    fallback path."""
+    session = pty_session([sample_rtf])
+    assert_no_crash(session, [b"t", b"t", b"q"], wait=1.0, initial_wait=6)
