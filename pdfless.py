@@ -2006,6 +2006,14 @@ class DocumentHandler:
         textutil)."""
         return False
 
+    def starts_in_text_mode(self):
+        """Whether this handler has no image view at all - permanently
+        "in text mode" from the moment the file opens (a plain text
+        file - see TextDocument, and so by inheritance RtfDocument) -
+        as opposed to starting in image mode and only switching to text
+        mode via 't' (a PDF, or a Quick Look preview file)."""
+        return False
+
     def default_text_frame(self, frame_default):
         """Whether text mode's border should be on by default for this
         handler - see Viewer._default_text_frame(). `frame_default` is
@@ -2184,6 +2192,9 @@ class TextDocument(DocumentHandler):
         return True
 
     def supports_search(self):
+        return True
+
+    def starts_in_text_mode(self):
         return True
 
     def default_text_frame(self, frame_default):
@@ -2578,10 +2589,10 @@ class PageCache:
     that bookkeeping - LRU eviction, the "loaded once natively" table -
     is shared machinery rather than any one kind's own concern."""
 
-    def __init__(self, doc_path, tmpdir, kind, handler, size=CACHE_SIZE, office_pages=None):
+    def __init__(self, doc_path, tmpdir, handler, size=CACHE_SIZE, office_pages=None):
         self.doc_path = doc_path
         self.tmpdir = tmpdir
-        self.kind = kind  # "pdf", "image", or "office"
+        self.kind = handler.kind  # "pdf", "image", or "office"
         self.office_pages = office_pages  # [png_path, ...], only for kind == "office"
         self.size = size
         self._cache = OrderedDict()  # (page, dpi_or_px_rounded) -> PIL.Image
@@ -2696,7 +2707,7 @@ class Viewer:
         self.search_pos = None
         # A plain text file has no image view at all - it's permanently
         # "in text mode", the same rendering PDF's `t` key switches to.
-        self.text_mode = self.kind == "text"
+        self.text_mode = self.doc_handler.starts_in_text_mode()
         self.text_lines = []
         self.text_scroll = 0
         self.text_scroll_min = 0
@@ -2733,7 +2744,7 @@ class Viewer:
         self.pdf_name = os.path.basename(path)
         self.doc_handler = handler
         self.kind = handler.kind  # "pdf", "image", "text", or "office"
-        if handler.kind == "office" and path in self.office_pages_by_path:
+        if isinstance(handler, OfficeDocument) and path in self.office_pages_by_path:
             # Already rendered on an earlier visit to this file (see
             # _ensure_office_pages()) - handler.page_count() is always
             # None (an OfficeDocument's page count isn't known until
@@ -2742,22 +2753,23 @@ class Viewer:
             self.npages = len(self.office_pages_by_path[path])
         else:
             self.npages = handler.page_count()
-        self._ensure_office_pages()  # a no-op unless kind == "office" and
-        # this file hasn't been rendered yet - may update self.npages, see below
-        office_pages = self.office_pages_by_path.get(path) if handler.kind == "office" else None
-        self.cache = PageCache(path, self.tmpdir, handler.kind, handler, office_pages=office_pages)
+        self._ensure_office_pages()  # a no-op unless doc_handler is an
+        # OfficeDocument and this file hasn't been rendered yet - may
+        # update self.npages, see below
+        office_pages = self.office_pages_by_path.get(path) if isinstance(handler, OfficeDocument) else None
+        self.cache = PageCache(path, self.tmpdir, handler, office_pages=office_pages)
 
     def _ensure_office_pages(self):
         """With multiple files on the command line, an office-kind one
         (Word/Excel/PowerPoint/etc. via Quick Look) is only actually
         rendered the moment it's about to be displayed - not upfront for
         every such file regardless of whether it's ever looked at - so
-        this is where that render happens, the first time self.kind ==
-        "office" and self.pdf_path isn't already in
+        this is where that render happens, the first time doc_handler is
+        an OfficeDocument and self.pdf_path isn't already in
         self.office_pages_by_path. A no-op every time after that (the
         result is cached there for the rest of the session, same as a
         file that's always been rendered up front would be)."""
-        if self.kind != "office" or self.pdf_path in self.office_pages_by_path:
+        if not isinstance(self.doc_handler, OfficeDocument) or self.pdf_path in self.office_pages_by_path:
             return
         pages = self.doc_handler.build_pages(
             self.tmpdir, debug=self.debug,
@@ -2774,7 +2786,7 @@ class Viewer:
 
     @property
     def is_pdf(self):
-        return self.kind == "pdf"
+        return isinstance(self.doc_handler, PdfDocument)
 
     def next_file(self):
         self.go_to_file(self.file_index + 1, "no next file")
@@ -2798,7 +2810,7 @@ class Viewer:
         self._link_index = None
         self._history_back = []
         self._history_forward = []
-        self.text_mode = self.kind == "text"
+        self.text_mode = self.doc_handler.starts_in_text_mode()
         self.text_frame = self._default_text_frame()
         # Mouse reporting is only useful in the page image (clicking
         # hyperlinks, wheel scroll); off in any kind of text view, the
@@ -2812,7 +2824,7 @@ class Viewer:
         self.x_offset = 0
         self._last_viewport_set = False
         self._last_marker_bounds = None
-        if self.kind == "text":
+        if self.text_mode:
             self._load_text_page()
         else:
             self._load_page()
@@ -2874,7 +2886,7 @@ class Viewer:
         if self.resized:
             self._recompute_geometry()
             self.resized = False
-            if self.kind == "text":
+            if self.doc_handler.starts_in_text_mode():
                 self._load_text_page()  # (re)read the file - it's always "page 1"
             elif self.text_mode:
                 self._clamp_text_scroll()
@@ -3667,7 +3679,7 @@ class Viewer:
         if self.is_pdf:
             self.npages = pdf_page_count(self.pdf_path)
             self.page = max(1, min(self.npages, self.page))
-        elif self.kind == "office":
+        elif isinstance(self.doc_handler, OfficeDocument):
             # Unlike a PDF, an office-preview's pages are pre-rendered
             # PNGs on disk (see build_office_pages()) rather than
             # generated on demand - those need regenerating too, not
@@ -4183,7 +4195,7 @@ def run_viewer(
             continue
 
         if key == "t":
-            if viewer.kind == "text":
+            if viewer.doc_handler.starts_in_text_mode():
                 # Always-on text mode already - toggling would try to
                 # switch to an image view this kind doesn't have.
                 viewer.draw_status("this is already a plain text file")
@@ -4463,7 +4475,7 @@ def main():
             # A text-kind first file starts straight in text mode (see
             # Viewer.__init__), where mouse reporting should be off, the
             # same as it would be for a PDF's `t` toggle.
-            initial_mouse = MOUSE_OFF if files[0][1].kind == "text" else MOUSE_ON
+            initial_mouse = MOUSE_OFF if files[0][1].starts_in_text_mode() else MOUSE_ON
             sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON)
             sys.stdout.flush()
             viewer = None
