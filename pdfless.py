@@ -255,16 +255,6 @@ POPPLER_INSTALL_HINT = (
 )
 
 
-def is_pdf_file(path):
-    """Sniff the file's own content rather than trusting its extension -
-    a PDF always starts with "%PDF-", regardless of what it's named."""
-    try:
-        with open(path, "rb") as f:
-            return f.read(5) == b"%PDF-"
-    except OSError:
-        return False
-
-
 def check_deps():
     for tool in ("pdftoppm", "pdfinfo"):
         if shutil.which(tool) is None:
@@ -540,30 +530,6 @@ _TAB_VIEW_ITEM_RE = re.compile(
 _TAG_RE = re.compile(r'<[^>]+>')
 
 
-def _parse_sheet_tabs(html_path):
-    """For a multi-sheet Excel-like Quick Look preview, return an
-    ordered [(sheet_name, absolute_html_path), ...] - one per sheet - by
-    reading the tab strip out of `html_path`'s own content (see
-    _TAB_VIEW_ITEM_RE). A single-sheet workbook's Preview.html *is* the
-    sheet itself (no tab strip, no <iframe>) and this returns []."""
-    try:
-        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError:
-        return []
-    base_dir = os.path.dirname(html_path)
-    tabs = []
-    for m in _TAB_VIEW_ITEM_RE.finditer(content):
-        href = m.group(2)
-        if _ABSOLUTE_SRC_RE.match(href):
-            continue  # http(s)/data/... - not a local sibling file
-        candidate = os.path.join(base_dir, href)
-        if not os.path.isfile(candidate):
-            continue
-        name = html.unescape(_TAG_RE.sub("", m.group(1))).strip()
-        tabs.append((name or f"Sheet {len(tabs) + 1}", candidate))
-    return tabs
-
 # A hard ceiling on either dimension of a PDF-embedded picture, once
 # rasterized - regardless of what DPI the math below otherwise settles
 # on. A Numbers/Pages/Keynote sheet can embed its *entire* content (a
@@ -578,7 +544,7 @@ OFFICE_EMBEDDED_IMG_MAX_PX = 6000
 
 
 def _pdf_page_size_pt_safe(pdf_path):
-    """Like pdf_page_size_pt(), but tolerant of failure (returns None
+    """Like PdfDocument.page_size_pt(), but tolerant of failure (returns None
     rather than die()ing the whole program) - for sizing a picture
     embedded in a Quick Look preview, where a bad reading just means
     falling back to a default DPI rather than aborting entirely."""
@@ -1127,7 +1093,7 @@ class OfficeVariant:
 
 class ExcelWorkbook(OfficeVariant):
     """should_not_scale (Excel's tell - see OfficeDocument._render_office_pages()).
-    `sheet_tabs`, if non-empty (see _parse_sheet_tabs()), means a
+    `sheet_tabs`, if non-empty (see OfficeDocument._parse_sheet_tabs()), means a
     multi-sheet workbook: Office.qlgenerator renders every sheet up
     front as its own AttachmentN.html, with Preview.html itself being
     just a JS tab strip - each sheet is rendered as its own page here,
@@ -1313,43 +1279,6 @@ class FlowingText(OfficeVariant):
                 os.unlink(out_png)
 
 
-def pdf_page_count(pdf_path):
-    out = subprocess.run(
-        ["pdfinfo", pdf_path], capture_output=True, text=True, check=True
-    ).stdout
-    m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
-    if not m:
-        die("could not determine page count")
-    return int(m.group(1))
-
-
-def pdf_page_size_pt(pdf_path, page):
-    """Return (width_pt, height_pt) for the given page."""
-    out = subprocess.run(
-        ["pdfinfo", "-f", str(page), "-l", str(page), pdf_path],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    m = re.search(r"^Page\s*(?:\d+\s+)?size:\s+([\d.]+) x ([\d.]+)", out, re.MULTILINE)
-    if not m:
-        die(f"could not determine page size for page {page}")
-    return float(m.group(1)), float(m.group(2))
-
-
-def extract_page_text(pdf_path, page):
-    """Plain-text rendering of one page, via poppler's pdftotext -layout
-    (which tries to preserve the page's visual line/column layout, unlike
-    the flat word-run text used for search)."""
-    out = subprocess.run(
-        ["pdftotext", "-f", str(page), "-l", str(page), "-layout", pdf_path, "-"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    return out.splitlines()
-
-
 def extract_office_text(path):
     """Plain-text extraction of a whole Word-family document (.doc,
     .docx, .rtf, .odt, ...), via macOS's own `textutil -convert txt
@@ -1390,7 +1319,7 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 def is_rtf_file(path):
     """Sniff for RTF's own signature ("{\\rtf1" right at the start),
-    the same way is_pdf_file() sniffs "%PDF-" rather than trusting the
+    the same way PdfDocument.is_pdf_file() sniffs "%PDF-" rather than trusting the
     extension. RTF is - deliberately - plain ASCII text, so
     is_probably_text()'s NUL-byte heuristic happily calls it plain
     text too; read_plain_text_lines() uses this to tell the two apart,
@@ -1436,170 +1365,6 @@ _BBOX_WORD_RE = re.compile(
 )
 
 
-def build_search_index(pdf_path):
-    """Extract per-page text and word positions (via poppler's pdftotext
-    -bbox) for searching. Returns a list, one entry per page, each
-    {"width_pt": float, "height_pt": float, "text": str,
-    "words": [(start, end, xMin, yMin, xMax, yMax), ...]} (all in points)
-    where (start, end) are offsets into "text" for that word."""
-    out = subprocess.run(
-        ["pdftotext", "-bbox", pdf_path, "-"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-
-    pages = []
-    for width, height, body in _BBOX_PAGE_RE.findall(out):
-        words = []
-        parts = []
-        offset = 0
-        for xmin, ymin, xmax, ymax, word_html in _BBOX_WORD_RE.findall(body):
-            word_text = html.unescape(word_html)
-            if not word_text:
-                continue
-            start = offset
-            parts.append(word_text)
-            offset += len(word_text)
-            words.append(
-                (start, offset, float(xmin), float(ymin), float(xmax), float(ymax))
-            )
-            parts.append(" ")
-            offset += 1
-        pages.append(
-            {
-                "width_pt": float(width),
-                "height_pt": float(height),
-                "text": "".join(parts),
-                "words": words,
-            }
-        )
-    return pages
-
-
-def _resolve_link_dest(reader, page_num_by_ref, dest):
-    """A /Dest or action /D value - either an explicit destination array,
-    or a name/bytestring to look up among the document's named
-    destinations. Returns (page_num, top_pt) - top_pt is the target's y
-    position in PDF points (bottom-up, i.e. still in the PDF's own
-    coordinate system - the caller converts it), or None if it isn't
-    specified by this destination type. Returns None outright if the
-    destination can't be resolved at all (e.g. it points outside this
-    document, or the PDF is malformed)."""
-    from pypdf.generic import IndirectObject
-
-    if isinstance(dest, (str, bytes)):
-        name = dest if isinstance(dest, str) else dest.decode("utf-8", "replace")
-        named = reader.named_destinations.get(name)
-        if named is None:
-            return None
-        dest = getattr(named, "dest_array", named)
-    if not dest:
-        return None
-
-    target = dest[0]
-    ref = target if isinstance(target, IndirectObject) else getattr(
-        target, "indirect_reference", None
-    )
-    if ref is None:
-        return None
-    page_num = page_num_by_ref.get((ref.idnum, ref.generation))
-    if page_num is None:
-        return None
-
-    top_pt = None
-    fit_type = str(dest[1]) if len(dest) > 1 else None
-    try:
-        if fit_type == "/XYZ" and len(dest) > 3 and dest[3] is not None:
-            top_pt = float(dest[3])
-        elif fit_type in ("/FitH", "/FitBH") and len(dest) > 2 and dest[2] is not None:
-            top_pt = float(dest[2])
-    except (TypeError, ValueError):
-        top_pt = None
-    return page_num, top_pt
-
-
-def build_link_index(pdf_path, npages):
-    """Extract clickable link annotations for every page, via pypdf.
-    Returns a list of `npages` dicts, one per page in order, each
-    {"width_pt": float, "height_pt": float, "links": [...]}, where each
-    link is {"xmin", "ymin", "xmax", "ymax"} (points, top-down - flipped
-    from the PDF's own bottom-up rects to match this file's coordinate
-    system elsewhere, e.g. build_search_index()) plus either
-    {"kind": "uri", "uri": str} for an external link or
-    {"kind": "page", "page": int, "top_pt": float | None} for a jump to
-    another page in the same document."""
-    empty = [{"width_pt": 0.0, "height_pt": 0.0, "links": []} for _ in range(npages)]
-    try:
-        from pypdf import PdfReader
-    except ImportError:
-        return empty
-
-    try:
-        reader = PdfReader(pdf_path)
-    except Exception:
-        return empty
-
-    page_num_by_ref = {}
-    for i, p in enumerate(reader.pages):
-        ref = p.indirect_reference
-        if ref is not None:
-            page_num_by_ref[(ref.idnum, ref.generation)] = i + 1
-
-    result = []
-    for i in range(npages):
-        links = []
-        width_pt = height_pt = 0.0
-        try:
-            page = reader.pages[i]
-            box = page.mediabox
-            width_pt, height_pt = float(box.width), float(box.height)
-            for annot_ref in page.get("/Annots") or []:
-                try:
-                    annot = annot_ref.get_object()
-                    if annot.get("/Subtype") != "/Link":
-                        continue
-                    rect = annot.get("/Rect")
-                    if rect is None or len(rect) != 4:
-                        continue
-                    x0, y0, x1, y1 = (float(v) for v in rect)
-                    xmin, xmax = min(x0, x1), max(x0, x1)
-                    ymin_bu, ymax_bu = min(y0, y1), max(y0, y1)
-                    # Flip the PDF's bottom-up rect into the top-down
-                    # system used everywhere else here.
-                    ymin, ymax = height_pt - ymax_bu, height_pt - ymin_bu
-
-                    action = annot.get("/A")
-                    if action is not None and action.get("/S") == "/URI":
-                        uri = action.get("/URI")
-                        if uri:
-                            links.append({
-                                "xmin": xmin, "ymin": ymin,
-                                "xmax": xmax, "ymax": ymax,
-                                "kind": "uri", "uri": str(uri),
-                            })
-                        continue
-
-                    dest = annot.get("/Dest")
-                    if dest is None and action is not None and action.get("/S") == "/GoTo":
-                        dest = action.get("/D")
-                    if dest is None:
-                        continue
-                    resolved = _resolve_link_dest(reader, page_num_by_ref, dest)
-                    if resolved is None:
-                        continue
-                    page_num, top_pt = resolved
-                    links.append({
-                        "xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax,
-                        "kind": "page", "page": page_num, "top_pt": top_pt,
-                    })
-                except Exception:
-                    continue  # one malformed annotation shouldn't lose the rest
-        except Exception:
-            pass
-        result.append({"width_pt": width_pt, "height_pt": height_pt, "links": links})
-    return result
-
 
 def compile_search_pattern(query):
     """Compile `query` as a case-insensitive regex. If it isn't valid
@@ -1612,46 +1377,6 @@ def compile_search_pattern(query):
         return re.compile(re.escape(query), re.IGNORECASE)
 
 
-def find_search_matches(index, query):
-    """Return every match of `query` (a case-insensitive regex, or a
-    literal substring if it isn't valid regex syntax) across the whole
-    document, as a list of (page_number, xMin, yMin, xMax, yMax) bounding
-    boxes (in points, the union of every word the match touches), in
-    reading order."""
-    pattern = compile_search_pattern(query)
-    matches = []
-    for page_num, page in enumerate(index, start=1):
-        for m in pattern.finditer(page["text"]):
-            pos, match_end = m.start(), m.end()
-            if pos == match_end:
-                continue  # skip zero-width matches (e.g. a pattern like "x*")
-            box = None
-            for word_start, word_end, xmin, ymin, xmax, ymax in page["words"]:
-                if word_start < match_end and word_end > pos:
-                    # poppler often lumps a whole run of CJK text (with no
-                    # spaces to split on) into a single <word>, sometimes
-                    # spanning most of a line. Highlighting that whole word
-                    # would hugely overstate the match, so narrow the box
-                    # to just the matched characters' share of it, assuming
-                    # roughly uniform character width left-to-right.
-                    word_len = word_end - word_start
-                    local_start = max(pos, word_start) - word_start
-                    local_end = min(match_end, word_end) - word_start
-                    frac_start = local_start / word_len if word_len else 0.0
-                    frac_end = local_end / word_len if word_len else 1.0
-                    sub_xmin = xmin + frac_start * (xmax - xmin)
-                    sub_xmax = xmin + frac_end * (xmax - xmin)
-                    if box is None:
-                        box = [sub_xmin, ymin, sub_xmax, ymax]
-                    else:
-                        box[0] = min(box[0], sub_xmin)
-                        box[1] = min(box[1], ymin)
-                        box[2] = max(box[2], sub_xmax)
-                        box[3] = max(box[3], ymax)
-            if box is not None:
-                matches.append((page_num, box[0], box[1], box[2], box[3]))
-    return matches
-
 
 # --- DocumentHandler hierarchy (Stage 0 of an ongoing refactor) -----------
 #
@@ -1662,13 +1387,9 @@ def find_search_matches(index, query):
 # page_element_xpath, is_rtf_file, ...) scattered across many
 # functions/methods. This hierarchy is the start of replacing that with
 # per-format subclasses each owning their own behavior - "replace
-# conditional with polymorphism". For now these classes are pure
-# scaffolding: nothing outside this block constructs or calls them yet,
-# and every method is a thin wrapper around the existing free functions
-# (is_pdf_file(), extract_page_text(), read_plain_text_lines(), ...), so
-# this introduces no behavior change. Later stages will migrate
-# main()'s classification loop, PageCache, and Viewer's text-mode/search
-# gating onto these one at a time.
+# conditional with polymorphism". Format-specific logic (PdfDocument's
+# own page-count/size/text-extraction methods, read_plain_text_lines(),
+# ...) has since migrated onto these subclasses directly.
 
 
 class UnusableFile(Exception):
@@ -1824,21 +1545,271 @@ class DocumentHandler:
 class PdfDocument(DocumentHandler):
     kind = "pdf"
 
+    @staticmethod
+    def is_pdf_file(path):
+        """Sniff the file's own content rather than trusting its
+        extension - a PDF always starts with "%PDF-", regardless of
+        what it's named. A staticmethod (not reading self.path) since
+        main() also calls this directly, on a candidate path, before
+        any classification (and so any PdfDocument instance) exists -
+        to decide up front whether poppler is required at all."""
+        try:
+            with open(path, "rb") as f:
+                return f.read(5) == b"%PDF-"
+        except OSError:
+            return False
+
+    @staticmethod
+    def _pdf_page_count(path):
+        out = subprocess.run(
+            ["pdfinfo", path], capture_output=True, text=True, check=True
+        ).stdout
+        m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
+        if not m:
+            die("could not determine page count")
+        return int(m.group(1))
+
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
-        if not is_pdf_file(path):
+        if not cls.is_pdf_file(path):
             return None
         try:
-            pdf_page_count(path)
+            cls._pdf_page_count(path)
         except Exception as e:
             raise UnusableFile(f"not a usable PDF ({e})") from e
         return cls(path)
 
     def page_count(self):
-        return pdf_page_count(self.path)
+        return self._pdf_page_count(self.path)
+
+    def page_size_pt(self, page):
+        """(width_pt, height_pt) for `page`."""
+        out = subprocess.run(
+            ["pdfinfo", "-f", str(page), "-l", str(page), self.path],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        m = re.search(r"^Page\s*(?:\d+\s+)?size:\s+([\d.]+) x ([\d.]+)", out, re.MULTILINE)
+        if not m:
+            die(f"could not determine page size for page {page}")
+        return float(m.group(1)), float(m.group(2))
 
     def extract_text(self, page):
-        return extract_page_text(self.path, page)
+        """Plain-text rendering of one page, via poppler's pdftotext
+        -layout (which tries to preserve the page's visual line/column
+        layout, unlike the flat word-run text used for search)."""
+        out = subprocess.run(
+            ["pdftotext", "-f", str(page), "-l", str(page), "-layout", self.path, "-"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return out.splitlines()
+
+    def build_search_index(self):
+        """Extract per-page text and word positions (via poppler's pdftotext
+        -bbox) for searching. Returns a list, one entry per page, each
+        {"width_pt": float, "height_pt": float, "text": str,
+        "words": [(start, end, xMin, yMin, xMax, yMax), ...]} (all in points)
+        where (start, end) are offsets into "text" for that word."""
+        out = subprocess.run(
+            ["pdftotext", "-bbox", self.path, "-"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+        pages = []
+        for width, height, body in _BBOX_PAGE_RE.findall(out):
+            words = []
+            parts = []
+            offset = 0
+            for xmin, ymin, xmax, ymax, word_html in _BBOX_WORD_RE.findall(body):
+                word_text = html.unescape(word_html)
+                if not word_text:
+                    continue
+                start = offset
+                parts.append(word_text)
+                offset += len(word_text)
+                words.append(
+                    (start, offset, float(xmin), float(ymin), float(xmax), float(ymax))
+                )
+                parts.append(" ")
+                offset += 1
+            pages.append(
+                {
+                    "width_pt": float(width),
+                    "height_pt": float(height),
+                    "text": "".join(parts),
+                    "words": words,
+                }
+            )
+        return pages
+
+    @staticmethod
+    def _resolve_link_dest(reader, page_num_by_ref, dest):
+        """A /Dest or action /D value - either an explicit destination array,
+        or a name/bytestring to look up among the document's named
+        destinations. Returns (page_num, top_pt) - top_pt is the target's y
+        position in PDF points (bottom-up, i.e. still in the PDF's own
+        coordinate system - the caller converts it), or None if it isn't
+        specified by this destination type. Returns None outright if the
+        destination can't be resolved at all (e.g. it points outside this
+        document, or the PDF is malformed)."""
+        from pypdf.generic import IndirectObject
+
+        if isinstance(dest, (str, bytes)):
+            name = dest if isinstance(dest, str) else dest.decode("utf-8", "replace")
+            named = reader.named_destinations.get(name)
+            if named is None:
+                return None
+            dest = getattr(named, "dest_array", named)
+        if not dest:
+            return None
+
+        target = dest[0]
+        ref = target if isinstance(target, IndirectObject) else getattr(
+            target, "indirect_reference", None
+        )
+        if ref is None:
+            return None
+        page_num = page_num_by_ref.get((ref.idnum, ref.generation))
+        if page_num is None:
+            return None
+
+        top_pt = None
+        fit_type = str(dest[1]) if len(dest) > 1 else None
+        try:
+            if fit_type == "/XYZ" and len(dest) > 3 and dest[3] is not None:
+                top_pt = float(dest[3])
+            elif fit_type in ("/FitH", "/FitBH") and len(dest) > 2 and dest[2] is not None:
+                top_pt = float(dest[2])
+        except (TypeError, ValueError):
+            top_pt = None
+        return page_num, top_pt
+
+    def build_link_index(self, npages):
+        """Extract clickable link annotations for every page, via pypdf.
+        Returns a list of `npages` dicts, one per page in order, each
+        {"width_pt": float, "height_pt": float, "links": [...]}, where each
+        link is {"xmin", "ymin", "xmax", "ymax"} (points, top-down - flipped
+        from the PDF's own bottom-up rects to match this file's coordinate
+        system elsewhere, e.g. build_search_index()) plus either
+        {"kind": "uri", "uri": str} for an external link or
+        {"kind": "page", "page": int, "top_pt": float | None} for a jump to
+        another page in the same document."""
+        empty = [{"width_pt": 0.0, "height_pt": 0.0, "links": []} for _ in range(npages)]
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return empty
+
+        try:
+            reader = PdfReader(self.path)
+        except Exception:
+            return empty
+
+        page_num_by_ref = {}
+        for i, p in enumerate(reader.pages):
+            ref = p.indirect_reference
+            if ref is not None:
+                page_num_by_ref[(ref.idnum, ref.generation)] = i + 1
+
+        result = []
+        for i in range(npages):
+            links = []
+            width_pt = height_pt = 0.0
+            try:
+                page = reader.pages[i]
+                box = page.mediabox
+                width_pt, height_pt = float(box.width), float(box.height)
+                for annot_ref in page.get("/Annots") or []:
+                    try:
+                        annot = annot_ref.get_object()
+                        if annot.get("/Subtype") != "/Link":
+                            continue
+                        rect = annot.get("/Rect")
+                        if rect is None or len(rect) != 4:
+                            continue
+                        x0, y0, x1, y1 = (float(v) for v in rect)
+                        xmin, xmax = min(x0, x1), max(x0, x1)
+                        ymin_bu, ymax_bu = min(y0, y1), max(y0, y1)
+                        # Flip the PDF's bottom-up rect into the top-down
+                        # system used everywhere else here.
+                        ymin, ymax = height_pt - ymax_bu, height_pt - ymin_bu
+
+                        action = annot.get("/A")
+                        if action is not None and action.get("/S") == "/URI":
+                            uri = action.get("/URI")
+                            if uri:
+                                links.append({
+                                    "xmin": xmin, "ymin": ymin,
+                                    "xmax": xmax, "ymax": ymax,
+                                    "kind": "uri", "uri": str(uri),
+                                })
+                            continue
+
+                        dest = annot.get("/Dest")
+                        if dest is None and action is not None and action.get("/S") == "/GoTo":
+                            dest = action.get("/D")
+                        if dest is None:
+                            continue
+                        resolved = self._resolve_link_dest(reader, page_num_by_ref, dest)
+                        if resolved is None:
+                            continue
+                        page_num, top_pt = resolved
+                        links.append({
+                            "xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax,
+                            "kind": "page", "page": page_num, "top_pt": top_pt,
+                        })
+                    except Exception:
+                        continue  # one malformed annotation shouldn't lose the rest
+            except Exception:
+                pass
+            result.append({"width_pt": width_pt, "height_pt": height_pt, "links": links})
+        return result
+
+    @staticmethod
+    def find_search_matches(index, query):
+        """Return every match of `query` (a case-insensitive regex, or a
+        literal substring if it isn't valid regex syntax) across the whole
+        document, as a list of (page_number, xMin, yMin, xMax, yMax) bounding
+        boxes (in points, the union of every word the match touches), in
+        reading order."""
+        pattern = compile_search_pattern(query)
+        matches = []
+        for page_num, page in enumerate(index, start=1):
+            for m in pattern.finditer(page["text"]):
+                pos, match_end = m.start(), m.end()
+                if pos == match_end:
+                    continue  # skip zero-width matches (e.g. a pattern like "x*")
+                box = None
+                for word_start, word_end, xmin, ymin, xmax, ymax in page["words"]:
+                    if word_start < match_end and word_end > pos:
+                        # poppler often lumps a whole run of CJK text (with no
+                        # spaces to split on) into a single <word>, sometimes
+                        # spanning most of a line. Highlighting that whole word
+                        # would hugely overstate the match, so narrow the box
+                        # to just the matched characters' share of it, assuming
+                        # roughly uniform character width left-to-right.
+                        word_len = word_end - word_start
+                        local_start = max(pos, word_start) - word_start
+                        local_end = min(match_end, word_end) - word_start
+                        frac_start = local_start / word_len if word_len else 0.0
+                        frac_end = local_end / word_len if word_len else 1.0
+                        sub_xmin = xmin + frac_start * (xmax - xmin)
+                        sub_xmax = xmin + frac_end * (xmax - xmin)
+                        if box is None:
+                            box = [sub_xmin, ymin, sub_xmax, ymax]
+                        else:
+                            box[0] = min(box[0], sub_xmin)
+                            box[1] = min(box[1], ymin)
+                            box[2] = max(box[2], sub_xmax)
+                            box[3] = max(box[3], ymax)
+                if box is not None:
+                    matches.append((page_num, box[0], box[1], box[2], box[3]))
+        return matches
 
     def supports_text_mode(self):
         return True
@@ -1854,7 +1825,7 @@ class PdfDocument(DocumentHandler):
         (fit="width") or tall (fit="height") - a PDF page has no fixed
         native pixel size, unlike a plain image or an office-preview
         PNG (see DocumentHandler.get_page_image()'s default)."""
-        width_pt, height_pt = pdf_page_size_pt(self.path, page)
+        width_pt, height_pt = self.page_size_pt(page)
         page_pt = width_pt if fit == "width" else height_pt
         dpi = 72.0 * target_px / page_pt
         key = (page, round(dpi))
@@ -2065,6 +2036,32 @@ class OfficeDocument(DocumentHandler):
         return html_path, width, height, should_not_scale, page_element_xpath
 
     @staticmethod
+    def _parse_sheet_tabs(html_path):
+        """For a multi-sheet Excel-like Quick Look preview, return an
+        ordered [(sheet_name, absolute_html_path), ...] - one per sheet
+        - by reading the tab strip out of `html_path`'s own content
+        (see _TAB_VIEW_ITEM_RE). A single-sheet workbook's Preview.html
+        *is* the sheet itself (no tab strip, no <iframe>) and this
+        returns []."""
+        try:
+            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            return []
+        base_dir = os.path.dirname(html_path)
+        tabs = []
+        for m in _TAB_VIEW_ITEM_RE.finditer(content):
+            href = m.group(2)
+            if _ABSOLUTE_SRC_RE.match(href):
+                continue  # http(s)/data/... - not a local sibling file
+            candidate = os.path.join(base_dir, href)
+            if not os.path.isfile(candidate):
+                continue
+            name = html.unescape(_TAG_RE.sub("", m.group(1))).strip()
+            tabs.append((name or f"Sheet {len(tabs) + 1}", candidate))
+        return tabs
+
+    @staticmethod
     def _probe_preview(path, tmpdir, debug=False):
         """Cheaply check whether `path` is something this Mac's Quick
         Look generators can preview at all (Word, Excel, PowerPoint,
@@ -2214,7 +2211,7 @@ class OfficeDocument(DocumentHandler):
                 # them - _parse_sheet_tabs() reads that strip back out;
                 # empty for a single-sheet workbook, where Preview.html
                 # *is* the sheet.
-                sheet_tabs = _parse_sheet_tabs(html_path)
+                sheet_tabs = self._parse_sheet_tabs(html_path)
                 variant = ExcelWorkbook(chrome, html_path, width, height, tag, name, sheet_tabs)
             else:
                 progress.update(f"{name}: converting embedded images...")
@@ -2735,8 +2732,8 @@ class Viewer:
         self.x_offset = 0
         self.help_active = False
         self.help_scroll = 0
-        self._search_index = None  # lazily built, via build_search_index()
-        self._link_index = None  # lazily built, via build_link_index()
+        self._search_index = None  # lazily built, via PdfDocument.build_search_index()
+        self._link_index = None  # lazily built, via PdfDocument.build_link_index()
         self._history_back = []  # [(page, scroll, x_offset), ...]
         self._history_forward = []
         self.search_query = None
@@ -3565,7 +3562,7 @@ class Viewer:
     def _ensure_link_index(self):
         if self._link_index is None:
             if self.is_pdf:
-                self._link_index = build_link_index(self.pdf_path, self.npages)
+                self._link_index = self.doc_handler.build_link_index(self.npages)
             else:
                 # No hyperlinks outside a PDF, but a multi-page "office"
                 # preview (or, in principle, a multi-page "image") still
@@ -3689,7 +3686,7 @@ class Viewer:
         if top_pt is None:
             self.scroll = 0
             return
-        _, height_pt = pdf_page_size_pt(self.pdf_path, self.page)
+        _, height_pt = self.doc_handler.page_size_pt(self.page)
         if not height_pt:
             self.scroll = 0
             return
@@ -3706,7 +3703,7 @@ class Viewer:
         any in-progress search is cleared too, since its match list may
         no longer correspond to anything in the new file."""
         if self.is_pdf:
-            self.npages = pdf_page_count(self.pdf_path)
+            self.npages = self.doc_handler.page_count()
             self.page = max(1, min(self.npages, self.page))
         elif isinstance(self.doc_handler, OfficeDocument):
             # Unlike a PDF, an office-preview's pages are pre-rendered
@@ -3765,8 +3762,8 @@ class Viewer:
 
         if self._search_index is None:
             self.draw_status("building search index...")
-            self._search_index = build_search_index(self.pdf_path)
-        self.search_matches = find_search_matches(self._search_index, query)
+            self._search_index = self.doc_handler.build_search_index()
+        self.search_matches = self.doc_handler.find_search_matches(self._search_index, query)
         if not self.search_matches:
             self.search_pos = None
             self.draw_status(f'"{query}" not found')
@@ -4452,7 +4449,7 @@ def main():
             print(f"pdfless: no such file, skipping: {arg}", file=sys.stderr)
             continue
         candidates.append(os.path.abspath(arg))
-    if any(is_pdf_file(path) for path in candidates):
+    if any(PdfDocument.is_pdf_file(path) for path in candidates):
         check_deps()
 
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
