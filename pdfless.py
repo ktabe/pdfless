@@ -259,8 +259,12 @@ Keys (mirroring less(1)):
                           start without it)
   # / -N                  (text mode) toggle a line-number gutter - off
                           by default (-N/--line-numbers to start with
-                          it on; -N is kept for less(1) compatibility,
-                          # is primary)
+                          it on)
+  C                       (text mode) clear the way for a select-and-
+                          copy: turn off the EOL markers, the border,
+                          the scrollbar and the line numbers at once,
+                          and put back whatever was on before on a
+                          second press
   r                       toggle the scrollbar (a column on the
                           terminal's right edge marking your position
                           in the whole document, in both image and text
@@ -2838,6 +2842,8 @@ class Viewer:
         # _line_number_gutter_width(); no per-kind default (unlike
         # border/wrap/eol_mark) since there's no kind numbering wouldn't
         # make sense for
+        self._copy_mode_saved = None  # while "C" has the decorations
+        # off, what to put back on the next press - see toggle_copy_mode()
         self._scrollbar_drag = False  # a press landed on the scrollbar
         # and the button hasn't come back up yet - see handle_drag()
         self._scrollbar_drag_row = None  # its latest position, not acted
@@ -3028,6 +3034,47 @@ class Viewer:
         max_offset = max(0, self.img.width - self.crop_width)
         self.x_offset = max(0, min(max_offset, self.x_offset + dx))
 
+    def _relayout(self):
+        """Redo the layout after something on screen changed how much
+        room is left for the content itself (the scrollbar's column,
+        copy mode's four decorations) - everything a terminal resize
+        recomputes, except that it keeps you where you were reading.
+        refresh()'s resize path can't be reused for this: for a file
+        that starts in text mode it re-reads the whole file, which
+        starts you over at the top - fine when the terminal really did
+        change size, but not for a keystroke that just hid a column."""
+        # Read before the recompute, put back after it: a narrower or
+        # wider content area re-splits every wrapped line, so the row
+        # number text_scroll holds stops meaning the same place.
+        top_line = self._top_text_line() if self.text_mode else None
+        self._recompute_geometry()
+        self.resized = False
+        if self.text_mode:
+            self._scroll_to_text_line(top_line)
+        else:
+            self._load_page()
+
+    def _top_text_line(self):
+        """The raw text_lines index showing at the top of the screen:
+        text_scroll itself when text is unwrapped, and the line the top
+        display row belongs to when it's wrapped (text_scroll counts
+        display rows then - see _ensure_display_rows())."""
+        if not self.text_wrap:
+            return max(0, self.text_scroll)  # -1 is the border's own row
+        self._ensure_display_rows()
+        if not self._display_rows:
+            return 0
+        row = max(0, min(self.text_scroll, len(self._display_rows) - 1))
+        return self._display_rows[row][0]
+
+    def _scroll_to_text_line(self, line_idx):
+        """Put raw line `line_idx` back at the top of the screen, in
+        whichever unit the current mode scrolls in - the inverse of
+        _top_text_line(), so the pair of them carry a reading position
+        across anything that changes the layout underneath it."""
+        self.text_scroll = self._row_for_line(line_idx) if self.text_wrap else line_idx
+        self._clamp_text_scroll()
+
     def refresh(self):
         if self.resized:
             self._recompute_geometry()
@@ -3168,36 +3215,67 @@ class Viewer:
 
     def toggle_text_wrap(self):
         """Switches between soft-wrapping long lines and panning across
-        them (h/l/H/L) - the less(1)-style "-S" runtime toggle (see
-        run_viewer()'s dash_pending handling). Resets to the top of the
-        current page/document rather than trying to preserve the exact
-        scroll position across the toggle - wrapped and unwrapped text
-        use different addressing (display row vs. raw line), and a
-        precise mapping between them isn't worth the complexity."""
+        them (h/l/H/L) - "s", or the less(1)-style "-S" (see
+        run_viewer()'s dash_pending handling). Keeps your place across
+        the switch: the two modes scroll in different units (a display
+        row, once wrapping has split a line across several, vs. the raw
+        text_lines index), so what carries over is the line currently at
+        the top of the screen, translated into the other mode's terms.
+        Horizontal pan doesn't carry over - there's nothing to pan while
+        wrapped, so unwrapping starts back at the left edge."""
+        top_line = self._top_text_line()  # read in the mode being left...
         self.text_wrap = not self.text_wrap
-        self._display_rows = None
-        self.text_scroll = 0
+        self._display_rows = None  # rebuilt against the new mode's layout
         self.text_x_offset = 0
-        self._clamp_text_scroll()
+        self._scroll_to_text_line(top_line)  # ...written in the one entered
 
     def toggle_eol_mark(self):
         """Switches NEWLINE_MARKER on/off - bound to "e" (see
         handle_key_text()). text_max_line_width/_display_rows both
         reserve a column for the marker only while it's on, so both
-        need recomputing here."""
+        need recomputing here - and, since that re-splits every wrapped
+        line, so does the scroll position (_top_text_line())."""
+        top_line = self._top_text_line()
         self.eol_mark = not self.eol_mark
         self._display_rows = None
-        self._clamp_text_scroll()
+        self._scroll_to_text_line(top_line)
 
     def toggle_line_numbers(self):
         """Switches the -N/--line-numbers gutter on/off - "#" (see
         handle_key_text()), or "-N"/"-n" (less(1)-style, see
         run_viewer()'s dash_pending). Its width changes what's left for
-        content, so both scroll bounds (_clamp_text_scroll()) and
-        wrapped segments (_display_rows) need recomputing."""
+        content, so the wrapped segments (_display_rows), the scroll
+        bounds and the scroll position itself (_top_text_line()) all
+        need recomputing."""
+        top_line = self._top_text_line()
         self.line_numbers = not self.line_numbers
         self._display_rows = None
-        self._clamp_text_scroll()
+        self._scroll_to_text_line(top_line)
+
+    def toggle_copy_mode(self):
+        """Clear the way for a terminal select-and-copy, and put things
+        back on a second press - "C" (see handle_key_text()). Text mode
+        exists largely to copy text out of a document, and the EOL
+        markers, the border, the scrollbar and the line-number gutter
+        all sit in the way of that: a drag across the text sweeps them
+        up along with it. Rather than hunting down e/B/r/# one at a
+        time and remembering which of them were on to begin with, this
+        turns off all four at once and remembers that for you."""
+        if self._copy_mode_saved is not None:
+            (
+                self.eol_mark, self.text_border, self.scrollbar, self.line_numbers
+            ) = self._copy_mode_saved
+            self._copy_mode_saved = None
+        else:
+            self._copy_mode_saved = (
+                self.eol_mark, self.text_border, self.scrollbar, self.line_numbers
+            )
+            self.eol_mark = self.text_border = False
+            self.scrollbar = self.line_numbers = False
+        # Each of the four frees up (or takes back) room of its own -
+        # let _relayout() work out what that means rather than spelling
+        # out which widths moved here.
+        self._relayout()
 
     def _line_number_gutter_width(self):
         """Columns reserved for the -N gutter - 0 when it's off. Right-
@@ -3214,11 +3292,10 @@ class Viewer:
         handles it at the top level since it applies in both image mode
         (_draw()) and text mode). Its column is reserved from
         base_width_px (image mode - see _recompute_geometry()) or
-        _text_avail_cols() (text mode), so this needs the same recompute
-        a real terminal resize would trigger - simplest to just request
-        one instead of duplicating that logic here."""
+        _text_avail_cols() (text mode), so the whole layout has to be
+        redone around it - see _relayout()."""
         self.scrollbar = not self.scrollbar
-        self.resized = True
+        self._relayout()
 
     def _scrollbar_fractions(self, start, avail_extent, total_extent, page, npages):
         """(start_frac, visible_frac), both in [0, 1]: where the visible
@@ -4469,6 +4546,8 @@ class Viewer:
             # The primary way to toggle wrap - "-S" (see run_viewer()'s
             # dash_pending) is kept only for less(1) compatibility.
             self.toggle_text_wrap()
+        elif key == "C":
+            self.toggle_copy_mode()
         elif key == "#":
             # "N"/"n" are both already taken (next search match, next
             # page) - "-N"/"-n" (see run_viewer()'s dash_pending, kept
@@ -4958,14 +5037,14 @@ def run_viewer(
         before = (
             viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
             viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers,
+            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers, viewer.scrollbar,
         )
         if not viewer.handle_key(key):
             break
         after = (
             viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
             viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers,
+            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers, viewer.scrollbar,
         )
         if after != before:
             viewer.refresh()

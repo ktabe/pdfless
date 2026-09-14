@@ -185,6 +185,19 @@ def test_toggle_scrollbar_off_frees_the_reserved_column(sample_text):
     assert viewer._text_avail_cols() == 19
 
 
+def test_toggling_it_stays_where_you_were_reading(tmp_path):
+    """Hiding or showing the column redoes the layout, but it isn't a
+    resize - the file isn't re-read, so the scroll position stands."""
+    viewer = make_viewer(pdfless.TextDocument(make_numbered_text(tmp_path, 100)))
+    viewer.text_scroll = 42
+    assert viewer.text_scroll_max >= 42
+
+    viewer.toggle_scrollbar()
+    assert viewer.text_scroll == 42
+    viewer.toggle_scrollbar()
+    assert viewer.text_scroll == 42
+
+
 def test_scrollbar_off_by_default_with_no_scrollbar(sample_text):
     """scrollbar=False here stands in for --no-scrollbar - main() passes
     scrollbar=args.scrollbar."""
