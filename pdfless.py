@@ -51,7 +51,7 @@ from collections import OrderedDict
 from PIL import Image, ImageChops, ImageOps
 
 # A many-page/many-slide office document's full-height capture (see
-# build_office_pages()) routinely exceeds Pillow's default "decompression
+# OfficeDocument._render_office_pages()) routinely exceeds Pillow's default "decompression
 # bomb" pixel-count ceiling - that check exists for a program decoding
 # untrusted images from elsewhere, which doesn't describe a CLI pager
 # opening files the user themselves chose to view, so it's disabled here
@@ -303,7 +303,7 @@ OFFICE_RENDER_SCALE = 1  # default device-pixel-ratio; --rendering-scale
 # resulting pixel count) for a large document
 OFFICE_RENDER_SCALE_FLOWING = 2  # default device-pixel-ratio for
 # continuously-flowing text (Word and the like - no slide/page markers
-# at all, so no slide_offsets - see build_office_pages()): these are
+# at all, so no slide_offsets - see OfficeDocument._render_office_pages()): these are
 # text-heavy and usually short, so favor sharpness over the render-time
 # tradeoff OFFICE_RENDER_SCALE otherwise makes for a many-slide deck -
 # unless --rendering-scale was passed explicitly.
@@ -356,7 +356,7 @@ def _default_browser_bundle_id():
 
 
 class _DebugTimer:
-    """Prints how long one stage of build_office_pages() took, when
+    """Prints how long one stage of OfficeDocument._render_office_pages() took, when
     -d/--debug is on - e.g. "pdfless: [debug] slides.pptx: rendering:
     0.72s". A no-op (no timing overhead beyond one monotonic() call)
     when off."""
@@ -373,7 +373,7 @@ class _DebugTimer:
     def __exit__(self, *exc):
         if self.debug:
             # end="\r\n", not the default "\n": this prints while the
-            # terminal's in raw mode (build_office_pages() only ever
+            # terminal's in raw mode (OfficeDocument._render_office_pages() only ever
             # runs from inside the interactive viewer now - even a
             # first/only file is rendered lazily, from Viewer.__init__),
             # where a bare "\n" doesn't return the cursor to column 1
@@ -389,7 +389,7 @@ class _DebugTimer:
 class _ProgressLine:
     """A single, self-overwriting status line on stderr - e.g.
     "pdfless: slides.pptx: rendering (1506x39796)..." - shown while
-    build_office_pages() works through a Quick Look file, since that can
+    OfficeDocument._render_office_pages() works through a Quick Look file, since that can
     take anywhere from under a second to tens of seconds and would
     otherwise look like pdfless had simply hung. Enabled only when
     stderr is a terminal (so a redirected/piped run doesn't get a stream
@@ -458,7 +458,7 @@ class _Spinner:
 
 
 class _ViewerProgress:
-    """Adapts build_office_pages()'s progress reporting to the Viewer's
+    """Adapts OfficeDocument._render_office_pages()'s progress reporting to the Viewer's
     own status line, for a file rendered lazily while the interactive
     session is already running (opening a file for the first time, or
     switching to one with :n/:p, now that each office-kind file is only
@@ -941,7 +941,7 @@ def _sample_background_color(img):
 def _trim_trailing_blank_rows(img, bg_color):
     """Crop `img` to drop blank (uniformly `bg_color`) rows at the
     bottom - left over from over-provisioning the capture height in
-    build_office_pages(), since the real content height isn't known
+    OfficeDocument._render_office_pages(), since the real content height isn't known
     ahead of a render. Returns (trimmed_img, might_be_cut_off) - the
     second value is True when content reaches all the way to the bottom
     of `img`, meaning the capture may have been too short to fit
@@ -1068,7 +1068,7 @@ def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
     Quick Look proper), not something fixable from here.
 
     `width` must match the logical width the real screenshot is later
-    taken at (build_office_pages()'s own `width`): layout - and so each
+    taken at (OfficeDocument._render_office_pages()'s own `width`): layout - and so each
     element's offsetTop - can depend on the viewport's width (e.g. a
     slide whose content is one `<img width="100%">`, scaling with the
     container), so measuring at any other width (Chrome's own headless
@@ -1147,7 +1147,7 @@ def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
 def _probe_office_preview(path, tmpdir, debug=False):
     """Cheaply check whether `path` is something this Mac's Quick Look
     generators can preview at all (Word, Excel, PowerPoint, Keynote,
-    Pages, ...) - i.e. whether build_office_pages() has any chance of
+    Pages, ...) - i.e. whether OfficeDocument._render_office_pages() has any chance of
     working - without doing that function's expensive part (the actual
     Chrome rendering). Used to decide whether to accept the file at all
     (main()) without paying for a render that may never be looked at:
@@ -1163,14 +1163,14 @@ def _probe_office_preview(path, tmpdir, debug=False):
 
 
 def _render_office_error_placeholder(path, tmpdir, message):
-    """A single-page fallback for when build_office_pages() succeeds
+    """A single-page fallback for when OfficeDocument._render_office_pages() succeeds
     at _probe_office_preview() time (qlmanage has a generator for this
     file) but then fails for real later (e.g. Chrome crashes or times
     out on this particular render) - rendering happening lazily, on
     first display rather than upfront, means a failure here can't just
     fall back to skipping the file the way main() does for one that
     never looked previewable in the first place. Returns a one-item
-    list of PNG paths, the same shape build_office_pages() itself
+    list of PNG paths, the same shape OfficeDocument._render_office_pages() itself
     returns on success, so callers don't need to special-case this."""
     from PIL import ImageDraw
 
@@ -1203,12 +1203,12 @@ def _slice_and_save_pages(trimmed, bounds, tmpdir, tag):
 
 class OfficeVariant:
     """Base class for the different "how to turn this Quick Look
-    preview into page images" strategies build_office_pages() can use -
+    preview into page images" strategies OfficeDocument._render_office_pages() can use -
     one of these is chosen once qlmanage's plist/HTML are known (see
-    build_office_pages()), and it owns the capture strategy and the
+    OfficeDocument._render_office_pages()), and it owns the capture strategy and the
     bounds/pagination decision for its own case. The shared preamble
     (finding Chrome, running qlmanage, deciding which variant to use)
-    lives in build_office_pages() itself, since it has to run before
+    lives in OfficeDocument._render_office_pages() itself, since it has to run before
     any variant can even be chosen."""
 
     def __init__(self, chrome, html_path, width, height, tag, name):
@@ -1237,7 +1237,7 @@ class OfficeVariant:
 
 
 class ExcelWorkbook(OfficeVariant):
-    """should_not_scale (Excel's tell - see build_office_pages()).
+    """should_not_scale (Excel's tell - see OfficeDocument._render_office_pages()).
     `sheet_tabs`, if non-empty (see _parse_sheet_tabs()), means a
     multi-sheet workbook: Office.qlgenerator renders every sheet up
     front as its own AttachmentN.html, with Preview.html itself being
@@ -1321,7 +1321,7 @@ class SlideDeck(OfficeVariant):
     """A slide deck (PowerPoint/Keynote) whose page/slide boundaries
     were measured (see _measure_slide_offsets()) - the exact total
     height is already known, so this is captured in one shot rather
-    than guessed. `confident` (see build_office_pages()) is whether the
+    than guessed. `confident` (see OfficeDocument._render_office_pages()) is whether the
     boundary came from the plist's own PageElementXPath, as opposed to
     a shape-based guess (_detect_fallback_page_xpath()) - only then is
     it trusted to paginate; a guessed boundary has been observed to
@@ -1422,133 +1422,6 @@ class FlowingText(OfficeVariant):
         finally:
             if os.path.exists(out_png):
                 os.unlink(out_png)
-
-
-def build_office_pages(
-    path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE, progress=None,
-    continuous=False,
-):
-    """Try to render `path` - any file this Mac's Quick Look generators
-    can preview (Word, Excel, PowerPoint, Keynote, Pages, ...) - into one
-    or more page PNGs, via qlmanage + a local Chrome/Chromium. Returns a
-    list of PNG file paths (one per page, in reading order), or None if
-    qlmanage has no generator for this file or no Chrome is installed.
-    With debug=True (-d/--debug), prints each stage's wall-clock time
-    (and which browser got used) to stderr, plus a total at the end.
-    `render_scale` is the device-pixel-ratio to rasterize at
-    (--rendering-scale) - higher is sharper when zoomed in but slower
-    for a large document; left at its default (OFFICE_RENDER_SCALE),
-    continuously-flowing text (Word and the like) renders at
-    OFFICE_RENDER_SCALE_FLOWING instead, favoring sharpness since these
-    documents are usually short. `progress`, if given, is a _ProgressLine to
-    post a one-line "what's happening right now" status to, since this
-    whole function can take anywhere from under a second to tens of
-    seconds and would otherwise look like pdfless had simply hung.
-
-    Pagination (splitting into distinct page/slide images, so `n`/`p`/`g`/
-    `G` and jumping straight to page N work) is only used when the slide
-    boundaries are known with confidence - i.e. the Quick Look
-    generator's own plist named a PageElementXPath (currently true for
-    PowerPoint and some Keynote decks), and measuring it produced
-    sane (strictly increasing) offsets. Anything else - Word's
-    continuously-flowing text, spreadsheets, and Keynote/Pages variants
-    where the boundary can only be guessed via a content-shape heuristic
-    (see _detect_fallback_page_xpath()) - is rendered as a single,
-    continuously-scrollable "page" instead (the same as a plain image
-    file), since a guessed boundary has been observed to drift/overflow
-    on some real decks.
-
-    continuous=True (-c/--continuous) forces the single-continuous-page
-    behavior even for a document that would otherwise paginate
-    confidently."""
-    if progress is None:
-        progress = _ProgressLine(enabled=False)
-    name = os.path.basename(path)
-    t_start = time.monotonic()
-    try:
-        progress.update(f"{name}: looking for a local Chrome...")
-        chrome = find_chrome()
-        if chrome is None:
-            return None
-        if debug:
-            print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
-
-        progress.update(f"{name}: reading Quick Look preview...")
-        with _DebugTimer(debug, f"{name}: qlmanage preview"):
-            preview = generate_ql_preview(path, tmpdir, debug=debug)
-        if preview is None:
-            return None
-        html_path, width, height, should_not_scale, page_element_xpath = preview
-        width = width or OFFICE_DEFAULT_WIDTH
-        height = height or OFFICE_DEFAULT_HEIGHT
-
-        # A short, stable-per-path tag so this file's capture/page PNGs
-        # don't collide with another file's (or its own previous ones,
-        # e.g. across a -F/--follow reload) - unlike id(path), collision
-        # odds are negligible even if a path string gets reused after
-        # being freed.
-        tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
-
-        # Pick which OfficeVariant strategy applies - see their own
-        # docstrings for what distinguishes each. should_not_scale (a
-        # plist flag) is Excel's tell and is cheap to check up front;
-        # the rest can only be told apart by actually attempting to
-        # measure the slide/page layout.
-        if should_not_scale:
-            # A spreadsheet with more than one sheet: Office.qlgenerator
-            # renders every sheet up front as its own AttachmentN.html,
-            # with Preview.html itself being just a JS tab strip that
-            # swaps an <iframe> between them - _parse_sheet_tabs() reads
-            # that strip back out; empty for a single-sheet workbook,
-            # where Preview.html *is* the sheet.
-            sheet_tabs = _parse_sheet_tabs(html_path)
-            variant = ExcelWorkbook(chrome, html_path, width, height, tag, name, sheet_tabs)
-        else:
-            progress.update(f"{name}: converting embedded images...")
-            on_img_progress = lambda done, total: progress.update(
-                f"{name}: converting embedded images ({done}/{total})..."
-            )
-            with _DebugTimer(debug, f"{name}: pdftocairo (embedded images)"):
-                html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
-
-            # Confident means the Quick Look generator itself named the
-            # page/slide element (page_element_xpath came from the
-            # plist, not guessed by _detect_fallback_page_xpath inside
-            # _measure_slide_offsets) - only then is pagination trusted;
-            # see SlideDeck's docstring for why a guessed boundary
-            # defaults to continuous instead.
-            confident = bool(page_element_xpath)
-            slide_offsets = None
-            if not continuous:
-                # _measure_slide_offsets() still tries a content-shape-
-                # based fallback before giving up even when
-                # page_element_xpath is None, purely so FlowingText's
-                # "attempt 1/2/3..." growth loop can be skipped when it
-                # happens to work out - but a result obtained that way
-                # isn't "confident" (see above) and won't be used to
-                # paginate. Skipped entirely in continuous mode -
-                # nothing needs a per-page/slide boundary if there's
-                # only ever going to be one "page".
-                progress.update(f"{name}: measuring page/slide layout...")
-                with _DebugTimer(debug, f"{name}: measure slide/page offsets"):
-                    slide_offsets = _measure_slide_offsets(chrome, html_path, page_element_xpath, width)
-
-            if slide_offsets is not None:
-                variant = SlideDeck(chrome, html_path, width, height, tag, name, slide_offsets, confident)
-            else:
-                variant = FlowingText(chrome, html_path, width, height, tag, name)
-
-        page_paths = variant.build_pages(tmpdir, debug, render_scale, progress, continuous)
-        if page_paths is None:
-            return None
-        if debug:
-            print(
-                f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
-                file=sys.stderr, end="\r\n",
-            )
-        return page_paths
-    finally:
-        progress.clear()
 
 
 def pdf_page_count(pdf_path):
@@ -1931,7 +1804,7 @@ def find_search_matches(index, query):
 # conditional with polymorphism". For now these classes are pure
 # scaffolding: nothing outside this block constructs or calls them yet,
 # and every method is a thin wrapper around the existing free functions
-# (is_pdf_file(), extract_page_text(), build_office_pages(), ...), so
+# (is_pdf_file(), extract_page_text(), read_plain_text_lines(), ...), so
 # this introduces no behavior change. Later stages will migrate
 # main()'s classification loop, PageCache, and Viewer's text-mode/search
 # gating onto these one at a time.
@@ -2237,9 +2110,9 @@ class OfficeDocument(DocumentHandler):
     Excel, PowerPoint, Keynote, Pages, ...) via qlmanage + a local
     Chrome. page_count() is deliberately None - unknown until
     build_pages() actually renders it (see
-    Viewer._ensure_office_pages()). build_pages() is still just a thin
-    wrapper around build_office_pages() (itself now backed by the
-    ExcelWorkbook/SlideDeck/FlowingText OfficeVariant hierarchy)."""
+    Viewer._ensure_office_pages()). The actual rendering
+    (_render_office_pages()) picks one of the ExcelWorkbook/SlideDeck/
+    FlowingText OfficeVariant strategies and delegates to it."""
 
     kind = "office"
 
@@ -2271,10 +2144,143 @@ class OfficeDocument(DocumentHandler):
         )
 
     def _render_and_remember(self, source_path, tmpdir, **kwargs):
-        pages = build_office_pages(source_path, tmpdir, **kwargs)
+        pages = self._render_office_pages(source_path, tmpdir, **kwargs)
         if pages:
             self.pages = pages
         return pages
+
+    def _render_office_pages(
+        self, path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        """Try to render `path` - any file this Mac's Quick Look
+        generators can preview (Word, Excel, PowerPoint, Keynote,
+        Pages, ...) - into one or more page PNGs, via qlmanage + a
+        local Chrome/Chromium. `path` isn't necessarily self.path -
+        RtfOfficeDocument renders a converted .docx instead (see its
+        build_pages()). Returns a list of PNG file paths (one per page,
+        in reading order), or None if qlmanage has no generator for
+        this file or no Chrome is installed. With debug=True
+        (-d/--debug), prints each stage's wall-clock time (and which
+        browser got used) to stderr, plus a total at the end.
+        `render_scale` is the device-pixel-ratio to rasterize at
+        (--rendering-scale) - higher is sharper when zoomed in but
+        slower for a large document; left at its default
+        (OFFICE_RENDER_SCALE), continuously-flowing text (Word and the
+        like) renders at OFFICE_RENDER_SCALE_FLOWING instead, favoring
+        sharpness since these documents are usually short. `progress`,
+        if given, is a _ProgressLine to post a one-line "what's
+        happening right now" status to, since this whole method can
+        take anywhere from under a second to tens of seconds and would
+        otherwise look like pdfless had simply hung.
+
+        Pagination (splitting into distinct page/slide images, so
+        `n`/`p`/`g`/`G` and jumping straight to page N work) is only
+        used when the slide boundaries are known with confidence - i.e.
+        the Quick Look generator's own plist named a PageElementXPath
+        (currently true for PowerPoint and some Keynote decks), and
+        measuring it produced sane (strictly increasing) offsets.
+        Anything else - Word's continuously-flowing text, spreadsheets,
+        and Keynote/Pages variants where the boundary can only be
+        guessed via a content-shape heuristic (see
+        _detect_fallback_page_xpath()) - is rendered as a single,
+        continuously-scrollable "page" instead (the same as a plain
+        image file), since a guessed boundary has been observed to
+        drift/overflow on some real decks.
+
+        continuous=True (-c/--continuous) forces the single-continuous-
+        page behavior even for a document that would otherwise paginate
+        confidently."""
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        name = os.path.basename(path)
+        t_start = time.monotonic()
+        try:
+            progress.update(f"{name}: looking for a local Chrome...")
+            chrome = find_chrome()
+            if chrome is None:
+                return None
+            if debug:
+                print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
+
+            progress.update(f"{name}: reading Quick Look preview...")
+            with _DebugTimer(debug, f"{name}: qlmanage preview"):
+                preview = generate_ql_preview(path, tmpdir, debug=debug)
+            if preview is None:
+                return None
+            html_path, width, height, should_not_scale, page_element_xpath = preview
+            width = width or OFFICE_DEFAULT_WIDTH
+            height = height or OFFICE_DEFAULT_HEIGHT
+
+            # A short, stable-per-path tag so this file's capture/page
+            # PNGs don't collide with another file's (or its own
+            # previous ones, e.g. across a -F/--follow reload) - unlike
+            # id(path), collision odds are negligible even if a path
+            # string gets reused after being freed.
+            tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+
+            # Pick which OfficeVariant strategy applies - see their own
+            # docstrings for what distinguishes each. should_not_scale
+            # (a plist flag) is Excel's tell and is cheap to check up
+            # front; the rest can only be told apart by actually
+            # attempting to measure the slide/page layout.
+            if should_not_scale:
+                # A spreadsheet with more than one sheet:
+                # Office.qlgenerator renders every sheet up front as its
+                # own AttachmentN.html, with Preview.html itself being
+                # just a JS tab strip that swaps an <iframe> between
+                # them - _parse_sheet_tabs() reads that strip back out;
+                # empty for a single-sheet workbook, where Preview.html
+                # *is* the sheet.
+                sheet_tabs = _parse_sheet_tabs(html_path)
+                variant = ExcelWorkbook(chrome, html_path, width, height, tag, name, sheet_tabs)
+            else:
+                progress.update(f"{name}: converting embedded images...")
+                on_img_progress = lambda done, total: progress.update(
+                    f"{name}: converting embedded images ({done}/{total})..."
+                )
+                with _DebugTimer(debug, f"{name}: pdftocairo (embedded images)"):
+                    html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
+
+                # Confident means the Quick Look generator itself named
+                # the page/slide element (page_element_xpath came from
+                # the plist, not guessed by _detect_fallback_page_xpath
+                # inside _measure_slide_offsets) - only then is
+                # pagination trusted; see SlideDeck's docstring for why
+                # a guessed boundary defaults to continuous instead.
+                confident = bool(page_element_xpath)
+                slide_offsets = None
+                if not continuous:
+                    # _measure_slide_offsets() still tries a
+                    # content-shape-based fallback before giving up even
+                    # when page_element_xpath is None, purely so
+                    # FlowingText's "attempt 1/2/3..." growth loop can be
+                    # skipped when it happens to work out - but a result
+                    # obtained that way isn't "confident" (see above)
+                    # and won't be used to paginate. Skipped entirely in
+                    # continuous mode - nothing needs a per-page/slide
+                    # boundary if there's only ever going to be one
+                    # "page".
+                    progress.update(f"{name}: measuring page/slide layout...")
+                    with _DebugTimer(debug, f"{name}: measure slide/page offsets"):
+                        slide_offsets = _measure_slide_offsets(chrome, html_path, page_element_xpath, width)
+
+                if slide_offsets is not None:
+                    variant = SlideDeck(chrome, html_path, width, height, tag, name, slide_offsets, confident)
+                else:
+                    variant = FlowingText(chrome, html_path, width, height, tag, name)
+
+            page_paths = variant.build_pages(tmpdir, debug, render_scale, progress, continuous)
+            if page_paths is None:
+                return None
+            if debug:
+                print(
+                    f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
+                    file=sys.stderr, end="\r\n",
+                )
+            return page_paths
+        finally:
+            progress.clear()
 
     def ensure_pages(self, tmpdir, **kwargs):
         """Render once and reuse afterward - a no-op on every call after
@@ -2294,7 +2300,7 @@ class OfficeDocument(DocumentHandler):
         return True
 
     def _source_for_page(self, cache, page):
-        # One pre-rendered PNG per page (see build_office_pages()) -
+        # One pre-rendered PNG per page (see OfficeDocument._render_office_pages()) -
         # unlike ImageDocument, there's no single fixed path, so this
         # reads self.pages (kept in sync by build_pages()/
         # ensure_pages()) rather than a path fixed at construction time.
@@ -2307,7 +2313,7 @@ class RtfOfficeDocument(OfficeDocument):
     since RTF's own Quick Look preview is just a redirect back to the
     original file (a Preview.url), not an HTML bundle qlmanage/Chrome
     could render directly (see is_rtf_file()). Once converted, it's
-    handled through the exact same build_office_pages() pipeline as any
+    handled through the exact same OfficeDocument._render_office_pages() pipeline as any
     other Word document (most often as a FlowingText OfficeVariant).
 
     Tried before the plain-text-only RtfDocument fallback (see
@@ -3695,7 +3701,7 @@ class Viewer:
             self.page = max(1, min(self.npages, self.page))
         elif isinstance(self.doc_handler, OfficeDocument):
             # Unlike a PDF, an office-preview's pages are pre-rendered
-            # PNGs on disk (see build_office_pages()) rather than
+            # PNGs on disk (see OfficeDocument._render_office_pages()) rather than
             # generated on demand - those need regenerating too, not
             # just dropping from the cache, or a changed file would just
             # redisplay the same stale pages.
