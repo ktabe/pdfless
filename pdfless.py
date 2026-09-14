@@ -2984,7 +2984,15 @@ class Viewer:
             target_width = max(1, round(self.base_width_px * self.zoom))
             self.img = self.cache.get(self.page, target_width, fit="width")
         self.crop_width = min(self.img.width, self.base_width_px)
-        self.x_offset = max(0, (self.img.width - self.crop_width) // 2)
+        # Keep whatever horizontal position you panned to (h/l/H/L),
+        # only clamping it to the image that just got loaded. Turning a
+        # page mustn't move the view sideways: with -h on a wide
+        # document (a slide deck, say) every page is wider than the
+        # terminal, so re-centering here would undo an "H" the moment
+        # you pressed j - and j is a page turn there, since a
+        # height-fitted page has nothing left to scroll. Zoom anchors
+        # itself deliberately instead; see set_zoom().
+        self.x_offset = max(0, min(self.x_offset, self.img.width - self.crop_width))
         self.scroll_max = max(0, self.img.height - self.avail_height_px)
         self.scroll = min(self.scroll, self.scroll_max)
 
@@ -2992,8 +3000,18 @@ class Viewer:
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, new_zoom))
         if new_zoom == self.zoom:
             return
+        # Zoom around the middle of what's on screen, rather than around
+        # the image's left edge: remember where the viewport's center
+        # sits as a fraction of the page's width, then put it back there
+        # once the resized image is in. _load_page() only clamps
+        # x_offset now, so this is what decides where a zoom lands.
+        center_frac = (self.x_offset + self.crop_width / 2) / max(1, self.img.width)
         self.zoom = new_zoom
         self._load_page()
+        self.x_offset = max(0, min(
+            self.img.width - self.crop_width,
+            round(center_frac * self.img.width - self.crop_width / 2),
+        ))
 
     def reset_view(self):
         self.zoom = 1.0
@@ -4138,8 +4156,8 @@ class Viewer:
         within_frac = max(0.0, min(1.0, doc_pos - (page - 1)))
         if page != self.page:
             # Skipped when it's the page already showing, so a click
-            # that only scrolls doesn't re-center the horizontal pan
-            # the way _load_page() otherwise would.
+            # that only scrolls within it doesn't reload and rescale
+            # the very same image for nothing.
             self.go_page(page, 0)
         self.scroll = max(0, min(self.scroll_max, round(within_frac * self.img.height)))
         self.refresh()
@@ -4200,7 +4218,7 @@ class Viewer:
 
     def _restore_position(self, page, scroll, x_offset):
         self.page = max(1, min(self.npages, page))
-        self._load_page()  # re-centers x_offset and recomputes scroll_max
+        self._load_page()  # loads the image and recomputes scroll_max
         self.scroll = max(0, min(self.scroll_max, scroll))
         max_x_offset = max(0, self.img.width - self.crop_width)
         self.x_offset = max(0, min(max_x_offset, x_offset))
