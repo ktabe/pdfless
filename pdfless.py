@@ -95,14 +95,25 @@ NEWLINE_MARKER_RESET = "\x1b[0m"
 # row (see Viewer._line_number_gutter_width()).
 LINE_NUMBER_COLOR = "\x1b[90m"  # gray
 LINE_NUMBER_RESET = "\x1b[0m"
+
+# The scrollbar's two kinds of cell, ready to write (see
+# Viewer._scrollbar_column()). The thumb is a reverse-video space
+# rather than a block in some fixed color: reverse video swaps whatever
+# foreground and background the terminal's theme is already using, so
+# it stands out against any of them - a fixed color eventually lands on
+# a theme that paints the background nearly the same shade.
+SCROLLBAR_TRACK = "\x1b[90m│\x1b[0m"  # a thin gray line
+SCROLLBAR_THUMB = "\x1b[7m \x1b[0m"  # a solid block
 CACHE_SIZE = 6
 
-# SGR mouse reporting (buttons + motion, extended coordinates): only
-# enabled while showing the page image, where a click can hit a PDF
-# hyperlink - never in text mode, where mouse tracking would swallow the
-# terminal's own click-drag text selection.
-MOUSE_ON = "\x1b[?1000h\x1b[?1006h"
-MOUSE_OFF = "\x1b[?1000l\x1b[?1006l"
+# SGR mouse reporting (extended coordinates), only enabled while showing
+# the page image - where a click can hit a PDF hyperlink or the
+# scrollbar - never in text mode, where mouse tracking would swallow the
+# terminal's own click-drag text selection. 1000 is buttons alone; 1002
+# adds motion, but only while a button is held (unlike 1003, which
+# reports every pointer move), which is all a scrollbar drag needs.
+MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1000l\x1b[?1002l\x1b[?1006l"
 
 # Alternate Scroll Mode: whenever the above button/motion reporting is
 # NOT active (i.e. in text mode) - and only then, terminals ignore this
@@ -216,12 +227,15 @@ Keys (mirroring less(1)):
   H / L / SHIFT-LEFT/RIGHT   jump to left / right edge (when zoomed in)
   K / U / SHIFT-UP        jump to top of the current page (same as g)
   J / D / SHIFT-DOWN      jump to bottom of the current page (same as G)
-  click                   (page image, not text mode) open a PDF
-                          hyperlink under the pointer - a URL in the
-                          system browser, an internal link by jumping
-                          to its target page/position
-  mouse wheel             scroll up / down - in the page image, one line
-                          at a time like e/y (--wheel-scroll-step to
+  click / drag            (page image, not text mode) on the scrollbar,
+                          jump to the position clicked - and keep
+                          following the pointer while dragging;
+                          otherwise open a PDF hyperlink under the
+                          pointer - a URL in the system browser, an
+                          internal link by jumping to its target
+                          page/position
+  mouse wheel             scroll up / down - in the page image, two
+                          lines at a time (--wheel-scroll-step to
                           change that); in text mode, the terminal turns
                           it into UP/DOWN key presses instead, so it
                           still works there without clashing with
@@ -245,8 +259,18 @@ Keys (mirroring less(1)):
                           start without it)
   # / -N                  (text mode) toggle a line-number gutter - off
                           by default (-N/--line-numbers to start with
-                          it on; -N is kept for less(1) compatibility,
-                          # is primary)
+                          it on)
+  C                       (text mode) clear the way for a select-and-
+                          copy: turn off the EOL markers, the border,
+                          the scrollbar and the line numbers at once,
+                          and put back whatever was on before on a
+                          second press
+  r                       toggle the scrollbar (a column on the
+                          terminal's right edge marking your position
+                          in the whole document, in both image and text
+                          mode) - on by default (--no-scrollbar to
+                          start it off); click or drag it in the page
+                          image to move around
   /<regex> ENTER          search the whole document for <regex>
                           (a Python regex; falls back to a literal
                           substring if it isn't valid regex syntax)
@@ -2514,11 +2538,13 @@ def decode_sgr_mouse(seq):
     """Parse an SGR mouse-reporting sequence body (after ESC [), e.g.
     "<0;42;17M" - a left-button press at column 42, row 17 (both
     1-based, in terminal cells). Returns (kind, col, row) where kind is
-    "MOUSE_CLICK", "MOUSE_WHEEL_UP"/"MOUSE_WHEEL_DOWN", or
-    "MOUSE_BACK"/"MOUSE_FORWARD" (a mouse's side buttons, where it has
-    them - button 8/9 in the xterm protocol). Returns None for anything
-    else (button release, drag, a button not covered above) - those
-    aren't a recognized action here, and are ignored."""
+    "MOUSE_CLICK", "MOUSE_DRAG"/"MOUSE_RELEASE" (left button held and
+    moved, then let go - see MOUSE_ON's 1002),
+    "MOUSE_WHEEL_UP"/"MOUSE_WHEEL_DOWN", or "MOUSE_BACK"/"MOUSE_FORWARD"
+    (a mouse's side buttons, where it has them - button 8/9 in the xterm
+    protocol). Returns None for anything else (a button other than the
+    left one, a malformed sequence) - not a recognized action here, so
+    ignored."""
     if not seq.startswith("<") or seq[-1] not in "Mm":
         return None
     body, final = seq[1:-1], seq[-1]
@@ -2550,10 +2576,14 @@ def decode_sgr_mouse(seq):
         if final != "M":
             return None
         return ("MOUSE_WHEEL_DOWN" if cb & 1 else "MOUSE_WHEEL_UP"), cx, cy
-    if final != "M" or (cb & 0x20) or (cb & 3) != 0:
-        # final "m" is a release, bit 5 (0x20) is drag/motion, and
-        # (cb & 3) != 0 is a button other than the left one.
-        return None
+    if (cb & 3) != 0:
+        return None  # a button other than the left one
+    if final == "m":
+        # A release ends a drag (see Viewer.end_scrollbar_drag()); the
+        # motion bit may or may not still be set on it, so don't look.
+        return "MOUSE_RELEASE", cx, cy
+    if cb & 0x20:
+        return "MOUSE_DRAG", cx, cy  # bit 5 (0x20) is drag/motion
     return "MOUSE_CLICK", cx, cy
 
 
@@ -2728,7 +2758,7 @@ class Viewer:
     def __init__(
         self, files, file_index, page, tmpdir, fd, fit="width",
         border=True, wrap=True, eol_mark=True, line_numbers=False,
-        wheel_scroll_step=1,
+        scrollbar=True, wheel_scroll_step=2,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False,
     ):
@@ -2812,6 +2842,18 @@ class Viewer:
         # _line_number_gutter_width(); no per-kind default (unlike
         # border/wrap/eol_mark) since there's no kind numbering wouldn't
         # make sense for
+        self._copy_mode_saved = None  # while "C" has the decorations
+        # off, what to put back on the next press - see toggle_copy_mode()
+        self._scrollbar_drag = False  # a press landed on the scrollbar
+        # and the button hasn't come back up yet - see handle_drag()
+        self._scrollbar_drag_row = None  # its latest position, not acted
+        # on until flush_scrollbar_drag()
+        self.scrollbar = scrollbar  # --no-scrollbar: a column on the
+        # terminal's right edge showing scroll position - in both image
+        # mode (_draw()) and text mode (_draw_text_wrapped()/
+        # _draw_text_unwrapped()); "r" toggles it either way (see
+        # toggle_scrollbar()), applying uniformly to both since it's
+        # handled at run_viewer()'s top level rather than per-mode
         self._last_viewport_w = 0
         self._last_viewport_h = 0
         self._last_viewport_set = False
@@ -2922,7 +2964,12 @@ class Viewer:
         cell_w = max(1, width_px // max(1, cols))
         self.rows = rows
         self.cols = cols
-        self.base_width_px = width_px
+        # One cell's width held back for the scrollbar (see _draw()),
+        # while it's on - crop_width/x_offset/pan bounds/click hit-
+        # testing are all derived from base_width_px (see _load_page()),
+        # so reserving it here is enough to keep the image itself out
+        # of that column everywhere else.
+        self.base_width_px = width_px - (cell_w if self.scrollbar else 0)
         self.cell_h_px = cell_h
         self.cell_w_px = cell_w
         self.avail_height_px = cell_h * max(1, rows - 1)
@@ -2943,7 +2990,15 @@ class Viewer:
             target_width = max(1, round(self.base_width_px * self.zoom))
             self.img = self.cache.get(self.page, target_width, fit="width")
         self.crop_width = min(self.img.width, self.base_width_px)
-        self.x_offset = max(0, (self.img.width - self.crop_width) // 2)
+        # Keep whatever horizontal position you panned to (h/l/H/L),
+        # only clamping it to the image that just got loaded. Turning a
+        # page mustn't move the view sideways: with -h on a wide
+        # document (a slide deck, say) every page is wider than the
+        # terminal, so re-centering here would undo an "H" the moment
+        # you pressed j - and j is a page turn there, since a
+        # height-fitted page has nothing left to scroll. Zoom anchors
+        # itself deliberately instead; see set_zoom().
+        self.x_offset = max(0, min(self.x_offset, self.img.width - self.crop_width))
         self.scroll_max = max(0, self.img.height - self.avail_height_px)
         self.scroll = min(self.scroll, self.scroll_max)
 
@@ -2951,8 +3006,18 @@ class Viewer:
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, new_zoom))
         if new_zoom == self.zoom:
             return
+        # Zoom around the middle of what's on screen, rather than around
+        # the image's left edge: remember where the viewport's center
+        # sits as a fraction of the page's width, then put it back there
+        # once the resized image is in. _load_page() only clamps
+        # x_offset now, so this is what decides where a zoom lands.
+        center_frac = (self.x_offset + self.crop_width / 2) / max(1, self.img.width)
         self.zoom = new_zoom
         self._load_page()
+        self.x_offset = max(0, min(
+            self.img.width - self.crop_width,
+            round(center_frac * self.img.width - self.crop_width / 2),
+        ))
 
     def reset_view(self):
         self.zoom = 1.0
@@ -2968,6 +3033,47 @@ class Viewer:
     def pan(self, dx):
         max_offset = max(0, self.img.width - self.crop_width)
         self.x_offset = max(0, min(max_offset, self.x_offset + dx))
+
+    def _relayout(self):
+        """Redo the layout after something on screen changed how much
+        room is left for the content itself (the scrollbar's column,
+        copy mode's four decorations) - everything a terminal resize
+        recomputes, except that it keeps you where you were reading.
+        refresh()'s resize path can't be reused for this: for a file
+        that starts in text mode it re-reads the whole file, which
+        starts you over at the top - fine when the terminal really did
+        change size, but not for a keystroke that just hid a column."""
+        # Read before the recompute, put back after it: a narrower or
+        # wider content area re-splits every wrapped line, so the row
+        # number text_scroll holds stops meaning the same place.
+        top_line = self._top_text_line() if self.text_mode else None
+        self._recompute_geometry()
+        self.resized = False
+        if self.text_mode:
+            self._scroll_to_text_line(top_line)
+        else:
+            self._load_page()
+
+    def _top_text_line(self):
+        """The raw text_lines index showing at the top of the screen:
+        text_scroll itself when text is unwrapped, and the line the top
+        display row belongs to when it's wrapped (text_scroll counts
+        display rows then - see _ensure_display_rows())."""
+        if not self.text_wrap:
+            return max(0, self.text_scroll)  # -1 is the border's own row
+        self._ensure_display_rows()
+        if not self._display_rows:
+            return 0
+        row = max(0, min(self.text_scroll, len(self._display_rows) - 1))
+        return self._display_rows[row][0]
+
+    def _scroll_to_text_line(self, line_idx):
+        """Put raw line `line_idx` back at the top of the screen, in
+        whichever unit the current mode scrolls in - the inverse of
+        _top_text_line(), so the pair of them carry a reading position
+        across anything that changes the layout underneath it."""
+        self.text_scroll = self._row_for_line(line_idx) if self.text_wrap else line_idx
+        self._clamp_text_scroll()
 
     def refresh(self):
         if self.resized:
@@ -3087,7 +3193,12 @@ class Viewer:
         return max(1, self.rows - 1)  # bottom row is the status bar
 
     def _text_avail_cols(self):
-        return self.cols
+        # One column held back for the scrollbar (see
+        # _scrollbar_column()) while it's on - regardless of whether the
+        # current file actually needs scrolling, so every other column
+        # reservation built on top of this (border, EOL marker, line
+        # numbers) never has to special-case it.
+        return max(1, self.cols - (1 if self.scrollbar else 0))
 
     def toggle_text_border(self):
         self.text_border = not self.text_border
@@ -3104,36 +3215,67 @@ class Viewer:
 
     def toggle_text_wrap(self):
         """Switches between soft-wrapping long lines and panning across
-        them (h/l/H/L) - the less(1)-style "-S" runtime toggle (see
-        run_viewer()'s dash_pending handling). Resets to the top of the
-        current page/document rather than trying to preserve the exact
-        scroll position across the toggle - wrapped and unwrapped text
-        use different addressing (display row vs. raw line), and a
-        precise mapping between them isn't worth the complexity."""
+        them (h/l/H/L) - "s", or the less(1)-style "-S" (see
+        run_viewer()'s dash_pending handling). Keeps your place across
+        the switch: the two modes scroll in different units (a display
+        row, once wrapping has split a line across several, vs. the raw
+        text_lines index), so what carries over is the line currently at
+        the top of the screen, translated into the other mode's terms.
+        Horizontal pan doesn't carry over - there's nothing to pan while
+        wrapped, so unwrapping starts back at the left edge."""
+        top_line = self._top_text_line()  # read in the mode being left...
         self.text_wrap = not self.text_wrap
-        self._display_rows = None
-        self.text_scroll = 0
+        self._display_rows = None  # rebuilt against the new mode's layout
         self.text_x_offset = 0
-        self._clamp_text_scroll()
+        self._scroll_to_text_line(top_line)  # ...written in the one entered
 
     def toggle_eol_mark(self):
         """Switches NEWLINE_MARKER on/off - bound to "e" (see
         handle_key_text()). text_max_line_width/_display_rows both
         reserve a column for the marker only while it's on, so both
-        need recomputing here."""
+        need recomputing here - and, since that re-splits every wrapped
+        line, so does the scroll position (_top_text_line())."""
+        top_line = self._top_text_line()
         self.eol_mark = not self.eol_mark
         self._display_rows = None
-        self._clamp_text_scroll()
+        self._scroll_to_text_line(top_line)
 
     def toggle_line_numbers(self):
         """Switches the -N/--line-numbers gutter on/off - "#" (see
         handle_key_text()), or "-N"/"-n" (less(1)-style, see
         run_viewer()'s dash_pending). Its width changes what's left for
-        content, so both scroll bounds (_clamp_text_scroll()) and
-        wrapped segments (_display_rows) need recomputing."""
+        content, so the wrapped segments (_display_rows), the scroll
+        bounds and the scroll position itself (_top_text_line()) all
+        need recomputing."""
+        top_line = self._top_text_line()
         self.line_numbers = not self.line_numbers
         self._display_rows = None
-        self._clamp_text_scroll()
+        self._scroll_to_text_line(top_line)
+
+    def toggle_copy_mode(self):
+        """Clear the way for a terminal select-and-copy, and put things
+        back on a second press - "C" (see handle_key_text()). Text mode
+        exists largely to copy text out of a document, and the EOL
+        markers, the border, the scrollbar and the line-number gutter
+        all sit in the way of that: a drag across the text sweeps them
+        up along with it. Rather than hunting down e/B/r/# one at a
+        time and remembering which of them were on to begin with, this
+        turns off all four at once and remembers that for you."""
+        if self._copy_mode_saved is not None:
+            (
+                self.eol_mark, self.text_border, self.scrollbar, self.line_numbers
+            ) = self._copy_mode_saved
+            self._copy_mode_saved = None
+        else:
+            self._copy_mode_saved = (
+                self.eol_mark, self.text_border, self.scrollbar, self.line_numbers
+            )
+            self.eol_mark = self.text_border = False
+            self.scrollbar = self.line_numbers = False
+        # Each of the four frees up (or takes back) room of its own -
+        # let _relayout() work out what that means rather than spelling
+        # out which widths moved here.
+        self._relayout()
 
     def _line_number_gutter_width(self):
         """Columns reserved for the -N gutter - 0 when it's off. Right-
@@ -3144,6 +3286,76 @@ class Viewer:
         if not self.line_numbers or not self.text_lines:
             return 0
         return len(str(len(self.text_lines))) + 1
+
+    def toggle_scrollbar(self):
+        """Switches the scrollbar on/off - "r" (see run_viewer(), which
+        handles it at the top level since it applies in both image mode
+        (_draw()) and text mode). Its column is reserved from
+        base_width_px (image mode - see _recompute_geometry()) or
+        _text_avail_cols() (text mode), so the whole layout has to be
+        redone around it - see _relayout()."""
+        self.scrollbar = not self.scrollbar
+        self._relayout()
+
+    def _scrollbar_fractions(self, start, avail_extent, total_extent, page, npages):
+        """(start_frac, visible_frac), both in [0, 1]: where the visible
+        window starts, and how much of it is visible, as a fraction of
+        the WHOLE document (all `npages` pages) - not just the current
+        page/screen. `start`/`avail_extent`/`total_extent` share any one
+        consistent unit (pixels in image mode, rows in text mode):
+        `start` is how far into the current page the window's top edge
+        sits, `total_extent` the page's own full size, `avail_extent`
+        how much of it fits on screen at once. A 10-page PDF, showing
+        the top half of page 1, is start_frac=0, visible_frac=0.5/10 -
+        the thumb sits in the top 5% of the track, not top-50%, which
+        was this method's whole reason for existing (see toggle_scrollbar()'s
+        callers) - a single-page view (page=npages=1) reduces exactly to
+        "this page/screen's own fraction", unaffected."""
+        total_extent = max(1, total_extent)
+        page_start_frac = max(0.0, min(1.0, start / total_extent))
+        page_visible_frac = max(0.0, min(1.0, avail_extent / total_extent))
+        npages = max(1, npages)
+        return (page - 1 + page_start_frac) / npages, page_visible_frac / npages
+
+    def _text_scrollbar_fractions(self, avail_rows):
+        """(start_frac, visible_frac) for the text-mode scrollbar - see
+        _scrollbar_fractions(). Only a PDF's text mode pages separately
+        (doc_handler.text_mode_is_paginated()) - anything else shows
+        the whole document in one continuous text_scroll range
+        already, so page/npages are fixed at 1/1 there (self.page/
+        self.npages might otherwise still reflect an unrelated slide/
+        page count from image mode - e.g. a multi-slide OfficeDocument
+        - that text mode's own single flowing view doesn't split on)."""
+        total_extent = avail_rows + (self.text_scroll_max - self.text_scroll_min)
+        start = self.text_scroll - self.text_scroll_min
+        if self.doc_handler.text_mode_is_paginated():
+            page, npages = self.page, self.npages
+        else:
+            page, npages = 1, 1
+        return self._scrollbar_fractions(start, avail_rows, total_extent, page, npages)
+
+    def _scrollbar_column(self, avail_rows, start_frac, visible_frac):
+        """One rendered cell (color + char) per screen row, top to
+        bottom, for the scrollbar column - the terminal's last column,
+        reserved (while self.scrollbar is on) from base_width_px in
+        image mode (see _draw()) or _text_avail_cols() in text mode
+        (see _draw_text_wrapped()/_draw_text_unwrapped()). `start_frac`/
+        `visible_frac` (see _scrollbar_fractions()) are already
+        normalized to the whole document, so this is just laying them
+        out over avail_rows screen cells. A file that fits on screen
+        entirely (visible_frac >= 1) shows a thumb spanning the whole
+        track, rather than an arbitrary track/thumb split that would
+        suggest otherwise."""
+        visible_frac = max(0.0, min(1.0, visible_frac))
+        if visible_frac >= 1.0:
+            return [SCROLLBAR_THUMB] * avail_rows
+        thumb_size = max(1, min(avail_rows, round(visible_frac * avail_rows)))
+        thumb_start = max(0, min(avail_rows - thumb_size, round(start_frac * avail_rows)))
+        return [
+            SCROLLBAR_THUMB if thumb_start <= i < thumb_start + thumb_size
+            else SCROLLBAR_TRACK
+            for i in range(avail_rows)
+        ]
 
     def _default_text_wrap(self):
         """Whether text mode should default to wrapping long lines for
@@ -3528,6 +3740,12 @@ class Viewer:
 
             out.append(f"\x1b[{screen_row};{gutter_width + 1}H{rendered}")
 
+        if self.scrollbar:
+            start_frac, visible_frac = self._text_scrollbar_fractions(avail_rows)
+            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
+            for i, cell in enumerate(cells):
+                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
+
         out.append(self.format_status())
         sys.stdout.write("".join(out))
         sys.stdout.flush()
@@ -3659,6 +3877,12 @@ class Viewer:
                 parts.append("│")
             start_col = (left_col if left_visible else content_start) + 1 + gutter_width
             out.append(f"\x1b[{screen_row};{start_col}H{''.join(parts)}")
+
+        if self.scrollbar:
+            start_frac, visible_frac = self._text_scrollbar_fractions(avail_rows)
+            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
+            for i, cell in enumerate(cells):
+                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
 
         out.append(self.format_status())
         sys.stdout.write("".join(out))
@@ -3795,6 +4019,22 @@ class Viewer:
             out.append(self._format_marker_at_bounds(*new_bounds))
         self._last_marker_bounds = new_bounds
 
+        if self.scrollbar:
+            # Same row count avail_height_px was computed from (see
+            # _recompute_geometry()) - the column itself was already
+            # held back from base_width_px, so the image never reaches
+            # into it regardless of zoom/pan. self.page/self.npages fold
+            # this page's own (self.scroll, avail_height_px, img.height)
+            # fraction into a whole-document position - see
+            # _scrollbar_fractions() - rather than just this page's own.
+            avail_rows = max(1, self.rows - 1)
+            start_frac, visible_frac = self._scrollbar_fractions(
+                self.scroll, self.avail_height_px, self.img.height, self.page, self.npages
+            )
+            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
+            for i, cell in enumerate(cells):
+                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
+
         out.append(self.format_status())
         sys.stdout.write("".join(out))
         sys.stdout.flush()
@@ -3899,12 +4139,20 @@ class Viewer:
                 ]
 
     def handle_click(self, col, row):
-        """A left-click at 1-based terminal cell (col, row): if it landed
-        on a PDF hyperlink in the currently displayed crop, follow it -
-        open a URL in the system browser, or jump to an internal link's
-        target page/position."""
+        """A left-click at 1-based terminal cell (col, row): on the
+        scrollbar, jump to the position it points at; otherwise, if it
+        landed on a PDF hyperlink in the currently displayed crop,
+        follow it - open a URL in the system browser, or jump to an
+        internal link's target page/position."""
         if self.text_mode or self.help_active or row >= self.rows:
             return  # row == self.rows is the status bar
+        # Any press starts a fresh gesture: one that lands on the
+        # scrollbar keeps following the pointer until the button comes
+        # back up (see handle_drag()), one anywhere else doesn't.
+        self._scrollbar_drag = bool(self.scrollbar and col == self.cols)
+        if self._scrollbar_drag:
+            self._jump_to_scrollbar_row(row)
+            return
         self._ensure_link_index()
         page_info = self._link_index[self.page - 1]
         if not page_info["links"] or not page_info["width_pt"] or not page_info["height_pt"]:
@@ -3939,6 +4187,57 @@ class Viewer:
                 best, best_area = link, area
         if best is not None:
             self._activate_link(best)
+
+    def handle_drag(self, row):
+        """Left-button motion, while a scrollbar drag is in progress -
+        i.e. the press that started it landed on the scrollbar (see
+        handle_click()); dragging anywhere else is left alone, so a
+        stray drag across the page image doesn't send it jumping.
+
+        Only records where the pointer is: acting on it costs a page
+        rasterize, and a drag arrives as a burst of motion events, so
+        flush_scrollbar_drag() applies the last one once the burst lets
+        up rather than walking every page in between. Returns whether
+        the drag was taken."""
+        if not self._scrollbar_drag or self.text_mode or self.help_active:
+            return False
+        self._scrollbar_drag_row = row
+        return True
+
+    def flush_scrollbar_drag(self):
+        """Act on the position handle_drag() last recorded, if any."""
+        if self._scrollbar_drag_row is None:
+            return
+        row = self._scrollbar_drag_row
+        self._scrollbar_drag_row = None
+        self._jump_to_scrollbar_row(row)
+
+    def end_scrollbar_drag(self):
+        """The button came back up - act on wherever it was let go."""
+        self.flush_scrollbar_drag()
+        self._scrollbar_drag = False
+
+    def _jump_to_scrollbar_row(self, row):
+        """Jump to wherever a click at `row` points on the scrollbar -
+        the clicked cell's own place in the track is read as where the
+        visible window should start, undoing what _scrollbar_fractions()
+        did to put the thumb there. Image mode only: mouse reporting
+        stays off in text mode so the terminal's own click-drag text
+        selection keeps working (see enter_text_mode())."""
+        avail_rows = max(1, self.rows - 1)
+        start_frac = max(0.0, min(1.0, (row - 1) / avail_rows))
+        # In "page units" - e.g. 3.5 is halfway down page 4 - so the
+        # page and the position within it fall out of the same number.
+        doc_pos = start_frac * max(1, self.npages)
+        page = max(1, min(self.npages, int(doc_pos) + 1))
+        within_frac = max(0.0, min(1.0, doc_pos - (page - 1)))
+        if page != self.page:
+            # Skipped when it's the page already showing, so a click
+            # that only scrolls within it doesn't reload and rescale
+            # the very same image for nothing.
+            self.go_page(page, 0)
+        self.scroll = max(0, min(self.scroll_max, round(within_frac * self.img.height)))
+        self.refresh()
 
     def handle_wheel(self, direction):
         """A scroll-wheel step: direction -1 (up) or +1 (down),
@@ -3996,7 +4295,7 @@ class Viewer:
 
     def _restore_position(self, page, scroll, x_offset):
         self.page = max(1, min(self.npages, page))
-        self._load_page()  # re-centers x_offset and recomputes scroll_max
+        self._load_page()  # loads the image and recomputes scroll_max
         self.scroll = max(0, min(self.scroll_max, scroll))
         max_x_offset = max(0, self.img.width - self.crop_width)
         self.x_offset = max(0, min(max_x_offset, x_offset))
@@ -4247,6 +4546,8 @@ class Viewer:
             # The primary way to toggle wrap - "-S" (see run_viewer()'s
             # dash_pending) is kept only for less(1) compatibility.
             self.toggle_text_wrap()
+        elif key == "C":
+            self.toggle_copy_mode()
         elif key == "#":
             # "N"/"n" are both already taken (next search match, next
             # page) - "-N"/"-n" (see run_viewer()'s dash_pending, kept
@@ -4348,8 +4649,8 @@ class Viewer:
 
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
-    border=True, wrap=True, eol_mark=True, line_numbers=False,
-    follow=False, wheel_scroll_step=1, keep=False,
+    border=True, wrap=True, eol_mark=True, line_numbers=False, scrollbar=True,
+    follow=False, wheel_scroll_step=2, keep=False,
     debug=False, office_render_scale=OFFICE_RENDER_SCALE,
     office_continuous=False,
 ):
@@ -4358,7 +4659,7 @@ def run_viewer(
     viewer = Viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
         border=border, wrap=wrap, eol_mark=eol_mark, line_numbers=line_numbers,
-        wheel_scroll_step=wheel_scroll_step,
+        scrollbar=scrollbar, wheel_scroll_step=wheel_scroll_step,
         debug=debug,
         office_render_scale=office_render_scale, office_continuous=office_continuous,
     )
@@ -4415,6 +4716,10 @@ def run_viewer(
             viewer.refresh()
             continue
         if not r:
+            # Nothing waiting - a good moment to act on a scrollbar drag
+            # whose motion events stopped without a release arriving
+            # (see the MOUSE_DRAG handling below); a no-op otherwise.
+            viewer.flush_scrollbar_drag()
             continue
         key = read_utf8_char(fd)
         if key is None:
@@ -4440,6 +4745,18 @@ def run_viewer(
                                     viewer.scroll_help(1)
                             elif kind == "MOUSE_CLICK":
                                 viewer.handle_click(mcol, mrow)
+                            elif kind == "MOUSE_DRAG":
+                                if viewer.handle_drag(mrow):
+                                    # A drag arrives as a burst of motion
+                                    # events, and acting on one costs a
+                                    # page rasterize - so let the burst
+                                    # drain first and only act on where
+                                    # the pointer actually ended up.
+                                    ready, _, _ = select.select([fd], [], [], 0)
+                                    if not ready:
+                                        viewer.flush_scrollbar_drag()
+                            elif kind == "MOUSE_RELEASE":
+                                viewer.end_scrollbar_drag()
                             elif kind == "MOUSE_WHEEL_UP":
                                 viewer.handle_wheel(-1)
                             elif kind == "MOUSE_WHEEL_DOWN":
@@ -4580,6 +4897,14 @@ def run_viewer(
             viewer.refresh()
             continue
 
+        if key == "r":
+            # Applies in both image and text mode (see
+            # Viewer.toggle_scrollbar()), so handled here at the top
+            # level rather than inside handle_key()/handle_key_text().
+            viewer.toggle_scrollbar()
+            viewer.refresh()
+            continue
+
         if key == "?":
             viewer.show_help()
             continue
@@ -4712,14 +5037,14 @@ def run_viewer(
         before = (
             viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
             viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers,
+            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers, viewer.scrollbar,
         )
         if not viewer.handle_key(key):
             break
         after = (
             viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
             viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers,
+            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers, viewer.scrollbar,
         )
         if after != before:
             viewer.refresh()
@@ -4825,6 +5150,15 @@ def main():
              "compatibility)",
     )
     parser.add_argument(
+        "--no-scrollbar",
+        action="store_false",
+        dest="scrollbar",
+        default=True,
+        help="don't show the scrollbar (a column on the terminal's "
+             "right edge marking your position) - shown by default, in "
+             "both image and text mode; toggle any time with r",
+    )
+    parser.add_argument(
         "-F", "--follow",
         action="store_true",
         help="watch the file and reload it if it changes on disk "
@@ -4832,9 +5166,9 @@ def main():
              "same page and in the same mode",
     )
     parser.add_argument(
-        "--wheel-scroll-step", type=positive_int, default=1, metavar="N",
+        "--wheel-scroll-step", type=positive_int, default=2, metavar="N",
         help="scroll N lines per mouse wheel step, in the page image "
-             "(default: 1)",
+             "(default: %(default)s)",
     )
     args = parser.parse_args()
 
@@ -4911,7 +5245,7 @@ def main():
                     files, 0, start_page, tmpdir, fd, rt.old,
                     fit=fit, border=args.border, wrap=not args.chop_long_lines,
                     eol_mark=args.eol_mark, line_numbers=args.line_numbers,
-                    follow=args.follow,
+                    scrollbar=args.scrollbar, follow=args.follow,
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
                     debug=args.debug,
                     office_render_scale=args.rendering_scale,

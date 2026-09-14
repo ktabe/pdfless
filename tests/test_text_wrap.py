@@ -105,17 +105,54 @@ def test_unwrapped_mode_keeps_one_row_per_line(tmp_path):
     assert viewer.text_x_offset_max > 0  # panning is available
 
 
-def test_toggle_wrap_resets_scroll_to_top(tmp_path):
-    path = tmp_path / "many_lines.txt"
-    path.write_text("\n".join(f"line {i}" for i in range(100)) + "\n")
+def test_toggle_wrap_keeps_the_line_you_were_reading(tmp_path):
+    """The line at the top of the screen survives the switch in both
+    directions, even though the two modes count scroll in different
+    units (a display row vs. a raw text_lines index)."""
+    path = tmp_path / "mixed.txt"
+    # Every other line is wide enough to wrap, so a display row and a
+    # raw line index are genuinely different numbers here - a file of
+    # short lines alone would pass even without any translation.
+    lines = []
+    for i in range(50):
+        lines.append(f"wide {i} " + make_long_words_line(20))
+        lines.append(f"short {i}")
+    path.write_text("\n".join(lines) + "\n")
     viewer = make_viewer(pdfless.TextDocument(str(path)), wrap=False, cols=40)
     viewer._load_text_page()
-    viewer.text_scroll_down(10)
-    assert viewer.text_scroll != viewer.text_scroll_min
+    viewer.text_scroll_down(20)
+    top_line = viewer.text_scroll
+    assert top_line == 20
 
     viewer.toggle_text_wrap()
     assert viewer.text_wrap is True
-    assert viewer.text_scroll == viewer.text_scroll_min
+    assert viewer._display_rows[viewer.text_scroll][0] == top_line
+    assert viewer.text_scroll > top_line  # the wrapped rows above it
+
+    viewer.toggle_text_wrap()
+    assert viewer.text_wrap is False
+    assert viewer.text_scroll == top_line
+
+
+def test_wrapped_scroll_position_survives_the_other_toggles(tmp_path):
+    """Anything that narrows or widens the content area re-splits every
+    wrapped line - the line at the top of the screen still has to stay
+    there (see Viewer._top_text_line())."""
+    path = tmp_path / "wide.txt"
+    path.write_text("\n".join(f"{i} " + make_long_words_line(20) for i in range(50)) + "\n")
+    viewer = make_viewer(pdfless.TextDocument(str(path)), wrap=True, cols=40)
+    viewer._load_text_page()
+    viewer.text_scroll_down(30)
+    top_line = viewer._top_text_line()
+    assert top_line > 0
+
+    for toggle in (
+        viewer.toggle_line_numbers, viewer.toggle_eol_mark, viewer.toggle_scrollbar,
+    ):
+        toggle()
+        assert viewer._top_text_line() == top_line, toggle.__name__
+        toggle()
+        assert viewer._top_text_line() == top_line, toggle.__name__
 
 
 def test_go_to_text_line_lands_on_correct_display_row_when_wrapped(tmp_path):
