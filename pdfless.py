@@ -3195,7 +3195,7 @@ class Viewer:
         # nothing falls at its current position.
         avail_rows = self._text_avail_rows()
         avail_cols = self._text_avail_cols()
-        if self.kind == "text":
+        if not self.doc_handler.text_mode_is_paginated():
             # No PDF page/bbox structure to reconcile against here - the
             # match tuple already is (line_idx, start, end), exactly
             # what a highlight needs, so use it directly.
@@ -3687,9 +3687,11 @@ class Viewer:
         if not query:
             return
         self.search_query = query
-        if self.kind == "text":
-            # No page/bbox structure for a plain text file - matches are
-            # just (line_idx, start, end) straight out of text_lines.
+        if not self.doc_handler.text_mode_is_paginated():
+            # No page/bbox structure for a non-paginated document
+            # (plain text/RTF, or an Office document currently in text
+            # mode) - matches are just (line_idx, start, end) straight
+            # out of text_lines, the whole document's text.
             self.search_matches = self._find_all_text_matches()
             if not self.search_matches:
                 self.search_pos = None
@@ -3740,7 +3742,7 @@ class Viewer:
     def _goto_search_match(self, idx):
         self.search_pos = idx
 
-        if self.kind == "text":
+        if not self.doc_handler.text_mode_is_paginated():
             line_idx, start, end = self.search_matches[idx]
             avail_rows = self._text_avail_rows()
             margin = avail_rows // 4
@@ -4178,11 +4180,16 @@ def run_viewer(
             continue
 
         if key == "/":
-            if not viewer.doc_handler.supports_search():
-                viewer.draw_status("search isn't available for this file type")
-            else:
+            # Search always works in text mode (there's always a flat
+            # list of lines to search, self.text_lines) regardless of
+            # what the underlying file kind otherwise supports in image
+            # mode (doc_handler.supports_search() - currently PDF only,
+            # via its own page/bbox index).
+            if viewer.text_mode or viewer.doc_handler.supports_search():
                 search_buf = ""
                 viewer.draw_search_prompt(search_buf)
+            else:
+                viewer.draw_status("search isn't available for this file type")
             continue
 
         if viewer.search_query is not None:

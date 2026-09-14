@@ -230,7 +230,10 @@ Zoom and pan:
 | `K` / `U` / `Shift-Up` | jump to top of the current page (same as `g`) |
 | `J` / `D` / `Shift-Down` | jump to bottom of the current page (same as `G`) |
 
-Search (PDFs and plain text files only, not images - a case-insensitive
+Search (PDFs and plain text files always; a Quick Look preview file -
+Word/Excel/PowerPoint/etc. - once switched into text mode with `t`,
+since there's no equivalent way to search its rendered page image; not
+available at all for a plain image - a case-insensitive
 [Python regex](https://docs.python.org/3/library/re.html) against the
 extracted/file text, across the whole document — not just the current
 page; falls back to a literal substring match if the pattern isn't
