@@ -1093,7 +1093,7 @@ class OfficeVariant:
 
 class ExcelWorkbook(OfficeVariant):
     """should_not_scale (Excel's tell - see OfficeDocument._render_office_pages()).
-    `sheet_tabs`, if non-empty (see OfficeDocument._parse_sheet_tabs()), means a
+    self.sheet_tabs, if non-empty (see _parse_sheet_tabs()), means a
     multi-sheet workbook: Office.qlgenerator renders every sheet up
     front as its own AttachmentN.html, with Preview.html itself being
     just a JS tab strip - each sheet is rendered as its own page here,
@@ -1105,9 +1105,35 @@ class ExcelWorkbook(OfficeVariant):
     selector is pinned to the bottom of the viewport regardless of
     window height, which would defeat that trick)."""
 
-    def __init__(self, chrome, html_path, width, height, tag, name, sheet_tabs):
+    def __init__(self, chrome, html_path, width, height, tag, name):
         super().__init__(chrome, html_path, width, height, tag, name)
-        self.sheet_tabs = sheet_tabs
+        self.sheet_tabs = self._parse_sheet_tabs(html_path)
+
+    @staticmethod
+    def _parse_sheet_tabs(html_path):
+        """For a multi-sheet Excel-like Quick Look preview, return an
+        ordered [(sheet_name, absolute_html_path), ...] - one per sheet
+        - by reading the tab strip out of `html_path`'s own content
+        (see _TAB_VIEW_ITEM_RE). A single-sheet workbook's Preview.html
+        *is* the sheet itself (no tab strip, no <iframe>) and this
+        returns []."""
+        try:
+            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            return []
+        base_dir = os.path.dirname(html_path)
+        tabs = []
+        for m in _TAB_VIEW_ITEM_RE.finditer(content):
+            href = m.group(2)
+            if _ABSOLUTE_SRC_RE.match(href):
+                continue  # http(s)/data/... - not a local sibling file
+            candidate = os.path.join(base_dir, href)
+            if not os.path.isfile(candidate):
+                continue
+            name = html.unescape(_TAG_RE.sub("", m.group(1))).strip()
+            tabs.append((name or f"Sheet {len(tabs) + 1}", candidate))
+        return tabs
 
     def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
         if self.sheet_tabs:
@@ -2036,32 +2062,6 @@ class OfficeDocument(DocumentHandler):
         return html_path, width, height, should_not_scale, page_element_xpath
 
     @staticmethod
-    def _parse_sheet_tabs(html_path):
-        """For a multi-sheet Excel-like Quick Look preview, return an
-        ordered [(sheet_name, absolute_html_path), ...] - one per sheet
-        - by reading the tab strip out of `html_path`'s own content
-        (see _TAB_VIEW_ITEM_RE). A single-sheet workbook's Preview.html
-        *is* the sheet itself (no tab strip, no <iframe>) and this
-        returns []."""
-        try:
-            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except OSError:
-            return []
-        base_dir = os.path.dirname(html_path)
-        tabs = []
-        for m in _TAB_VIEW_ITEM_RE.finditer(content):
-            href = m.group(2)
-            if _ABSOLUTE_SRC_RE.match(href):
-                continue  # http(s)/data/... - not a local sibling file
-            candidate = os.path.join(base_dir, href)
-            if not os.path.isfile(candidate):
-                continue
-            name = html.unescape(_TAG_RE.sub("", m.group(1))).strip()
-            tabs.append((name or f"Sheet {len(tabs) + 1}", candidate))
-        return tabs
-
-    @staticmethod
     def _probe_preview(path, tmpdir, debug=False):
         """Cheaply check whether `path` is something this Mac's Quick
         Look generators can preview at all (Word, Excel, PowerPoint,
@@ -2208,11 +2208,10 @@ class OfficeDocument(DocumentHandler):
                 # Office.qlgenerator renders every sheet up front as its
                 # own AttachmentN.html, with Preview.html itself being
                 # just a JS tab strip that swaps an <iframe> between
-                # them - _parse_sheet_tabs() reads that strip back out;
-                # empty for a single-sheet workbook, where Preview.html
-                # *is* the sheet.
-                sheet_tabs = self._parse_sheet_tabs(html_path)
-                variant = ExcelWorkbook(chrome, html_path, width, height, tag, name, sheet_tabs)
+                # them - ExcelWorkbook._parse_sheet_tabs() reads that
+                # strip back out; empty for a single-sheet workbook,
+                # where Preview.html *is* the sheet.
+                variant = ExcelWorkbook(chrome, html_path, width, height, tag, name)
             else:
                 progress.update(f"{name}: converting embedded images...")
                 on_img_progress = lambda done, total: progress.update(
