@@ -96,14 +96,14 @@ NEWLINE_MARKER_RESET = "\x1b[0m"
 LINE_NUMBER_COLOR = "\x1b[90m"  # gray
 LINE_NUMBER_RESET = "\x1b[0m"
 
-# Text mode's scrollbar (see Viewer._scrollbar_column()): one column,
-# always reserved at the terminal's last column (_text_avail_cols()),
-# whether or not the current file actually needs scrolling.
-SCROLLBAR_TRACK = "│"
-SCROLLBAR_TRACK_COLOR = "\x1b[90m"  # gray
-SCROLLBAR_THUMB = "█"
-SCROLLBAR_THUMB_COLOR = "\x1b[97m"  # bright white
-SCROLLBAR_RESET = "\x1b[0m"
+# The scrollbar's two kinds of cell, ready to write (see
+# Viewer._scrollbar_column()). The thumb is a reverse-video space
+# rather than a block in some fixed color: reverse video swaps whatever
+# foreground and background the terminal's theme is already using, so
+# it stands out against any of them - a fixed color eventually lands on
+# a theme that paints the background nearly the same shade.
+SCROLLBAR_TRACK = "\x1b[90m│\x1b[0m"  # a thin gray line
+SCROLLBAR_THUMB = "\x1b[7m \x1b[0m"  # a solid block
 CACHE_SIZE = 6
 
 # SGR mouse reporting (extended coordinates), only enabled while showing
@@ -3252,14 +3252,13 @@ class Viewer:
         track, rather than an arbitrary track/thumb split that would
         suggest otherwise."""
         visible_frac = max(0.0, min(1.0, visible_frac))
-        thumb = SCROLLBAR_THUMB_COLOR + SCROLLBAR_THUMB + SCROLLBAR_RESET
         if visible_frac >= 1.0:
-            return [thumb] * avail_rows
-        track = SCROLLBAR_TRACK_COLOR + SCROLLBAR_TRACK + SCROLLBAR_RESET
+            return [SCROLLBAR_THUMB] * avail_rows
         thumb_size = max(1, min(avail_rows, round(visible_frac * avail_rows)))
         thumb_start = max(0, min(avail_rows - thumb_size, round(start_frac * avail_rows)))
         return [
-            thumb if thumb_start <= i < thumb_start + thumb_size else track
+            SCROLLBAR_THUMB if thumb_start <= i < thumb_start + thumb_size
+            else SCROLLBAR_TRACK
             for i in range(avail_rows)
         ]
 
