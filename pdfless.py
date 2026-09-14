@@ -2006,6 +2006,14 @@ class DocumentHandler:
         textutil)."""
         return False
 
+    def default_text_frame(self, frame_default):
+        """Whether text mode's border should be on by default for this
+        handler - see Viewer._default_text_frame(). `frame_default` is
+        whatever --no-frame requested; overridden by TextDocument (and
+        so, by inheritance, RtfDocument), which have no real "page"
+        boundary worth framing at all, regardless of --no-frame."""
+        return frame_default
+
     def get_page_image(self, cache, page, target_px, fit):
         """Return `page`'s image (a PIL.Image), scaled so it's
         `target_px` wide (fit="width") or tall (fit="height") - used by
@@ -2177,6 +2185,11 @@ class TextDocument(DocumentHandler):
 
     def supports_search(self):
         return True
+
+    def default_text_frame(self, frame_default):
+        # No real "page" boundary in a plain text file worth framing,
+        # regardless of --no-frame.
+        return False
 
 
 class RtfDocument(TextDocument):
@@ -2555,38 +2568,17 @@ def _strip_leading_home(s):
     return s
 
 
-def _document_handler_for_kind(kind, path):
-    """Reconstruct the DocumentHandler for an already-classified file.
-    main()'s HANDLER_CLASSES dispatch (see UnusableFile and its
-    callers) already ran sniff() once per file to decide `kind` in the
-    first place, but only that string (plus path/npages) is kept in
-    Viewer.files - so this rebuilds the actual handler from `kind`,
-    with one cheap re-check where the string alone is ambiguous: both
-    "office" and "text" each cover two classes - an RTF file's own
-    handler (RtfOfficeDocument or, as a fallback, RtfDocument) vs the
-    plain OfficeDocument/TextDocument - which is_rtf_file() tells apart
-    without needing to re-run sniff()'s full validation again."""
-    if kind == "pdf":
-        return PdfDocument(path)
-    if kind == "image":
-        return ImageDocument(path)
-    if kind == "office":
-        return RtfOfficeDocument(path) if is_rtf_file(path) else OfficeDocument(path)
-    if kind == "text":
-        return RtfDocument(path) if is_rtf_file(path) else TextDocument(path)
-    return None
-
-
 class PageCache:
     """Caches rasterized/resized page images, keyed by (page, size) -
     the actual per-kind work (rasterize a PDF page at some DPI, resize
-    a pre-rendered image/office PNG) is delegated to a DocumentHandler
-    (see _document_handler_for_kind()), which reaches back into this cache's
+    a pre-rendered image/office PNG) is delegated to `handler` (the
+    same DocumentHandler instance Viewer itself uses - see
+    Viewer._set_current_file()), which reaches back into this cache's
     own bookkeeping (_cached()/_store(), and tmpdir/office_pages) since
     that bookkeeping - LRU eviction, the "loaded once natively" table -
-    is shared machinery than any one kind's own concern."""
+    is shared machinery rather than any one kind's own concern."""
 
-    def __init__(self, doc_path, tmpdir, kind, size=CACHE_SIZE, office_pages=None):
+    def __init__(self, doc_path, tmpdir, kind, handler, size=CACHE_SIZE, office_pages=None):
         self.doc_path = doc_path
         self.tmpdir = tmpdir
         self.kind = kind  # "pdf", "image", or "office"
@@ -2597,7 +2589,7 @@ class PageCache:
         # DocumentHandler._native_page_image(): for kind == "image"
         # there's only ever page 1, but kind == "office" has one source
         # file per pre-rendered page.
-        self.handler = _document_handler_for_kind(kind, doc_path)
+        self.handler = handler
 
     def clear(self):
         self._cache.clear()
@@ -2653,7 +2645,7 @@ class Viewer:
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False,
     ):
-        self.files = files  # [(path, kind, npages), ...] - one per CLI argument
+        self.files = files  # [(path, DocumentHandler), ...] - one per CLI argument
         self.file_index = file_index
         self.tmpdir = tmpdir
         # kind == "office" files' pre-rendered page PNGs (see
@@ -2736,17 +2728,24 @@ class Viewer:
         self.files[self.file_index] - just the file's identity, not the
         page/zoom/search/etc. state, which __init__ sets up once and
         go_to_file() resets explicitly on every later switch."""
-        path, kind, npages = self.files[self.file_index]
+        path, handler = self.files[self.file_index]
         self.pdf_path = path  # a plain image, text, or office file, when not a PDF
         self.pdf_name = os.path.basename(path)
-        self.kind = kind  # "pdf", "image", "text", or "office"
-        self.npages = npages
-        self.doc_handler = _document_handler_for_kind(kind, path)
+        self.doc_handler = handler
+        self.kind = handler.kind  # "pdf", "image", "text", or "office"
+        if handler.kind == "office" and path in self.office_pages_by_path:
+            # Already rendered on an earlier visit to this file (see
+            # _ensure_office_pages()) - handler.page_count() is always
+            # None (an OfficeDocument's page count isn't known until
+            # it's actually rendered), so the real count instead comes
+            # from that previous render's own result.
+            self.npages = len(self.office_pages_by_path[path])
+        else:
+            self.npages = handler.page_count()
         self._ensure_office_pages()  # a no-op unless kind == "office" and
-        # this file hasn't been rendered yet - may update self.npages and
-        # self.files[self.file_index] in place, see below
-        office_pages = self.office_pages_by_path.get(path) if kind == "office" else None
-        self.cache = PageCache(path, self.tmpdir, kind, office_pages=office_pages)
+        # this file hasn't been rendered yet - may update self.npages, see below
+        office_pages = self.office_pages_by_path.get(path) if handler.kind == "office" else None
+        self.cache = PageCache(path, self.tmpdir, handler.kind, handler, office_pages=office_pages)
 
     def _ensure_office_pages(self):
         """With multiple files on the command line, an office-kind one
@@ -2772,7 +2771,6 @@ class Viewer:
             )
         self.office_pages_by_path[self.pdf_path] = pages
         self.npages = len(pages)
-        self.files[self.file_index] = (self.pdf_path, self.kind, self.npages)
 
     @property
     def is_pdf(self):
@@ -2996,14 +2994,12 @@ class Viewer:
 
     def _default_text_frame(self):
         """Whether text mode's border should be on by default for the
-        current file - always off for a plain text file (kind=="text"),
-        regardless of --no-frame, since there's usually no real "page"
-        boundary in one worth framing; otherwise whatever --no-frame
-        asked for (self.frame_default), same as before - e.g. for a PDF
-        or a Quick Look preview file (Word/RTF/etc.), only relevant once
-        switched into text mode with 't'. The f key can still toggle
-        either way, on top of this default."""
-        return False if self.kind == "text" else self.frame_default
+        current file - delegated to doc_handler.default_text_frame()
+        (e.g. always off for a plain text file, regardless of
+        --no-frame, since there's usually no real "page" boundary in
+        one worth framing; otherwise whatever --no-frame asked for).
+        The f key can still toggle either way, on top of this default."""
+        return self.doc_handler.default_text_frame(self.frame_default)
 
     def _clamp_text_scroll(self):
         # The border sits at the page's actual edges - one row above the
@@ -4418,7 +4414,7 @@ def main():
 
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
     try:
-        files = []  # [(abs_path, kind, npages), ...], in the given order
+        files = []  # [(abs_path, DocumentHandler), ...], in the given order
         office_pages_by_path = {}  # kind=="office" files' page PNGs - see
         # build_office_pages() - keyed by absolute path
         for path in candidates:
@@ -4447,15 +4443,16 @@ def main():
                 )
                 continue
 
-            files.append((path, handler.kind, handler.page_count()))
+            files.append((path, handler))
 
         if not files:
             die("no valid PDF, image, text, or Quick-Look-previewable files given")
-        # files[0][2] (npages) is None for an office-kind first file -
-        # its real page count isn't known until Viewer.__init__ actually
-        # renders it, which also clamps self.page against it then; here
-        # just keep whatever page number was asked for (>= 1).
-        start_page = args.page if files[0][2] is None else min(files[0][2], args.page)
+        # A None page_count() (an office-kind first file) means its real
+        # page count isn't known until Viewer.__init__ actually renders
+        # it, which also clamps self.page against it then; here just
+        # keep whatever page number was asked for (>= 1).
+        first_npages = files[0][1].page_count()
+        start_page = args.page if first_npages is None else min(first_npages, args.page)
         start_page = max(1, start_page)
 
         if not sys.stdout.isatty() or not sys.stdin.isatty():
@@ -4466,7 +4463,7 @@ def main():
             # A text-kind first file starts straight in text mode (see
             # Viewer.__init__), where mouse reporting should be off, the
             # same as it would be for a PDF's `t` toggle.
-            initial_mouse = MOUSE_OFF if files[0][1] == "text" else MOUSE_ON
+            initial_mouse = MOUSE_OFF if files[0][1].kind == "text" else MOUSE_ON
             sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON)
             sys.stdout.flush()
             viewer = None

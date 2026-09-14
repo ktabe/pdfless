@@ -2,7 +2,8 @@ import pdfless
 
 
 def test_pdf_page_cache_returns_sized_image_and_hits_cache(sample_pdf, tmp_path):
-    cache = pdfless.PageCache(sample_pdf, str(tmp_path), "pdf")
+    handler = pdfless.PdfDocument(sample_pdf)
+    cache = pdfless.PageCache(sample_pdf, str(tmp_path), "pdf", handler)
     img = cache.get(1, 400, fit="width")
     assert img.width == 400
 
@@ -11,7 +12,8 @@ def test_pdf_page_cache_returns_sized_image_and_hits_cache(sample_pdf, tmp_path)
 
 
 def test_image_page_cache_returns_correctly_sized_image(sample_image, tmp_path):
-    cache = pdfless.PageCache(sample_image, str(tmp_path), "image")
+    handler = pdfless.ImageDocument(sample_image)
+    cache = pdfless.PageCache(sample_image, str(tmp_path), "image", handler)
     img = cache.get(1, 128, fit="width")
     # original is 64x48 (4:3) - scaled to 128 wide keeps that ratio
     assert img.width == 128
@@ -30,8 +32,9 @@ def test_office_page_cache_reads_from_cache_office_pages_live(tmp_path):
     Image.new("RGB", (100, 100), "red").save(page1)
     Image.new("RGB", (100, 100), "blue").save(page2)
 
+    handler = pdfless.OfficeDocument("/does/not/matter.pptx")
     cache = pdfless.PageCache(
-        "/does/not/matter.pptx", str(tmp_path), "office",
+        "/does/not/matter.pptx", str(tmp_path), "office", handler,
         office_pages=[str(page1)],
     )
     first = cache.get(1, 50, fit="width")
@@ -45,8 +48,10 @@ def test_office_page_cache_reads_from_cache_office_pages_live(tmp_path):
 
 
 def test_page_cache_kind_dispatches_to_matching_handler_type(sample_pdf, sample_image, tmp_path):
-    pdf_cache = pdfless.PageCache(sample_pdf, str(tmp_path), "pdf")
+    pdf_handler = pdfless.PdfDocument(sample_pdf)
+    pdf_cache = pdfless.PageCache(sample_pdf, str(tmp_path), "pdf", pdf_handler)
     assert isinstance(pdf_cache.handler, pdfless.PdfDocument)
 
-    image_cache = pdfless.PageCache(sample_image, str(tmp_path), "image")
+    image_handler = pdfless.ImageDocument(sample_image)
+    image_cache = pdfless.PageCache(sample_image, str(tmp_path), "image", image_handler)
     assert isinstance(image_cache.handler, pdfless.ImageDocument)

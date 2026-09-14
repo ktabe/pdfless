@@ -147,24 +147,3 @@ def test_rtf_office_document_capabilities_match_office_document(sample_rtf, tmp_
     )
 
 
-def test_document_handler_for_kind_matches_sniffed_type(
-    sample_pdf, sample_image, sample_text, tmp_path
-):
-    """_document_handler_for_kind() reconstructs the handler Viewer
-    reuses across page navigation/reload from just the "kind" string."""
-    for path, expected_cls in [
-        (sample_pdf, pdfless.PdfDocument),
-        (sample_image, pdfless.ImageDocument),
-        (sample_text, pdfless.TextDocument),
-    ]:
-        handler = classify(path, tmp_path)
-        rebuilt = pdfless._document_handler_for_kind(handler.kind, path)
-        assert type(rebuilt) is expected_cls
-
-
-def test_document_handler_for_kind_disambiguates_rtf(sample_rtf):
-    """Both "office" and "text" kinds cover an RTF-specific class in
-    addition to the plain one - is_rtf_file() tells them apart without
-    needing to re-run sniff()."""
-    assert type(pdfless._document_handler_for_kind("office", sample_rtf)) is pdfless.RtfOfficeDocument
-    assert type(pdfless._document_handler_for_kind("text", sample_rtf)) is pdfless.RtfDocument
