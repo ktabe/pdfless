@@ -1642,6 +1642,34 @@ def is_rtf_file(path):
         return False
 
 
+def _rtf_to_docx(path, tmpdir):
+    """Convert an RTF file to .docx via macOS's own `textutil`, so it
+    can be handled through the same Office/Quick Look + Chrome pipeline
+    as a native Word document (formatting - bold/italic/color/fonts,
+    verified by hand - survives the round trip reasonably well; a table
+    degrades to plain concatenated text, a known limitation left as-is).
+    This is needed because RTF's own Quick Look preview is just a
+    redirect back to the original file (a Preview.url), not an HTML
+    bundle - see is_rtf_file() and RtfOfficeDocument.
+
+    Returns the converted file's path, or None if textutil isn't
+    available or the conversion failed. Always reconverts (rather than
+    reusing a previous run's output) so a changed source file (e.g.
+    -F/--follow) can't leave a stale docx behind."""
+    if shutil.which("textutil") is None:
+        return None
+    tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    out_path = os.path.join(tmpdir, f"rtf-as-docx-{tag}.docx")
+    try:
+        subprocess.run(
+            ["textutil", "-convert", "docx", "-output", out_path, path],
+            capture_output=True, check=True, timeout=20,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    return out_path if os.path.isfile(out_path) else None
+
+
 def read_plain_text_lines(path, tab_width=8):
     """A plain text file's lines, as pdftotext -layout's output is for a
     PDF page: ready to hand straight to the existing text-mode renderer.
@@ -2225,12 +2253,58 @@ class OfficeDocument(DocumentHandler):
         return cache.office_pages[page - 1]
 
 
-# The order main()'s classification loop will eventually try these in
-# (a later stage of this refactor) - RtfDocument before TextDocument
-# since both would otherwise match the same file (RTF is plain ASCII
-# text), and OfficeDocument last since it's the only one that actually
-# shells out to qlmanage.
-HANDLER_CLASSES = [PdfDocument, ImageDocument, RtfDocument, TextDocument, OfficeDocument]
+class RtfOfficeDocument(OfficeDocument):
+    """An RTF file, rendered as an image the same way a Word document
+    is - by first converting it to .docx via textutil (_rtf_to_docx()),
+    since RTF's own Quick Look preview is just a redirect back to the
+    original file (a Preview.url), not an HTML bundle qlmanage/Chrome
+    could render directly (see is_rtf_file()). Once converted, it's
+    handled through the exact same build_office_pages() pipeline as any
+    other Word document (most often as a FlowingText OfficeVariant).
+
+    Tried before the plain-text-only RtfDocument fallback (see
+    HANDLER_CLASSES) - falls through to it if textutil isn't available
+    or qlmanage can't preview the converted .docx for some reason."""
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        if not is_rtf_file(path):
+            return None
+        docx_path = _rtf_to_docx(path, tmpdir)
+        if docx_path is None:
+            return None
+        if not _probe_office_preview(docx_path, tmpdir, debug=debug):
+            return None
+        return cls(path)
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        docx_path = _rtf_to_docx(self.path, tmpdir)
+        if docx_path is None:
+            return None
+        return build_office_pages(
+            docx_path, tmpdir, debug=debug, render_scale=render_scale,
+            progress=progress, continuous=continuous,
+        )
+
+    def extract_text(self, page):
+        # textutil already handles RTF directly for plain-text
+        # extraction (see extract_office_text()) - no need to go via
+        # the .docx conversion just for this.
+        return extract_office_text(self.path)
+
+
+# The order main()'s classification loop tries these in - RtfOfficeDocument
+# and RtfDocument (both RTF - the former tried first, see their own
+# docstrings) before the generic TextDocument, since all three would
+# otherwise match the same file (RTF is plain ASCII text); OfficeDocument
+# last since it's the most expensive check (shells out to qlmanage).
+HANDLER_CLASSES = [
+    PdfDocument, ImageDocument, RtfOfficeDocument, RtfDocument, TextDocument,
+    OfficeDocument,
+]
 
 
 class RawTerminal:
@@ -2481,16 +2555,17 @@ def _document_handler_for_kind(kind, path):
     callers) already ran sniff() once per file to decide `kind` in the
     first place, but only that string (plus path/npages) is kept in
     Viewer.files - so this rebuilds the actual handler from `kind`,
-    with one cheap re-check where the string alone is ambiguous:
-    kind=="text" covers both TextDocument and RtfDocument (see
-    RtfDocument), which is_rtf_file() tells apart without needing to
-    re-run sniff()'s full validation again."""
+    with one cheap re-check where the string alone is ambiguous: both
+    "office" and "text" each cover two classes - an RTF file's own
+    handler (RtfOfficeDocument or, as a fallback, RtfDocument) vs the
+    plain OfficeDocument/TextDocument - which is_rtf_file() tells apart
+    without needing to re-run sniff()'s full validation again."""
     if kind == "pdf":
         return PdfDocument(path)
     if kind == "image":
         return ImageDocument(path)
     if kind == "office":
-        return OfficeDocument(path)
+        return RtfOfficeDocument(path) if is_rtf_file(path) else OfficeDocument(path)
     if kind == "text":
         return RtfDocument(path) if is_rtf_file(path) else TextDocument(path)
     return None
@@ -2678,8 +2753,8 @@ class Viewer:
         file that's always been rendered up front would be)."""
         if self.kind != "office" or self.pdf_path in self.office_pages_by_path:
             return
-        pages = build_office_pages(
-            self.pdf_path, self.tmpdir, debug=self.debug,
+        pages = self.doc_handler.build_pages(
+            self.tmpdir, debug=self.debug,
             render_scale=self.office_render_scale, progress=_ViewerProgress(self),
             continuous=self.office_continuous,
         )
@@ -3583,8 +3658,8 @@ class Viewer:
             # generated on demand - those need regenerating too, not
             # just dropping from the cache, or a changed file would just
             # redisplay the same stale pages.
-            pages = build_office_pages(
-                self.pdf_path, self.tmpdir,
+            pages = self.doc_handler.build_pages(
+                self.tmpdir,
                 debug=self.debug, render_scale=self.office_render_scale,
                 progress=_ViewerProgress(self), continuous=self.office_continuous,
             )

@@ -35,7 +35,10 @@ Excel, PowerPoint, Keynote, Pages, and more — by rendering that Quick
 Look preview through a headless Chrome. A multi-page document (e.g.
 Word) is paged through with the same `n`/`p`/`g`/`G` keys as a PDF;
 a spreadsheet with more than one sheet is paged through the same way,
-one sheet per page.
+one sheet per page. An RTF file is rendered the same way too (via a
+macOS `textutil` conversion first, since Quick Look has no HTML
+preview of its own for RTF), rather than only ever being shown as
+plain text.
 
 Since it's just a terminal program, it works the same way over SSH — no
 X11 forwarding, and no need to copy the PDF to your local machine first.
@@ -247,7 +250,7 @@ Misc:
 | click | (page image, not text mode) open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
 | mouse wheel | scroll up / down - in the page image, one line at a time like `e`/`y` (`--wheel-scroll-step` to change that); in text mode, one line at a time |
 | `[` / `]` | back / forward, through the positions internal links have jumped from |
-| `t` | toggle a plain-text view (scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) - for a PDF, the current page's extracted text; for a Word-family Quick Look preview file (`.doc`/`.docx`/`.odt`/...), the whole document's text via macOS's `textutil` (not paginated - `n`/`p` do nothing in this view). On a plain image, a spreadsheet, or a slide deck, this just reports that there's no text to show (a plain text file - including `.rtf`, shown as its actual text via `textutil` rather than its raw markup - is already shown this way, with nothing to toggle) |
+| `t` | toggle a plain-text view (scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) - for a PDF, the current page's extracted text; for a Word-family Quick Look preview file (`.doc`/`.docx`/`.odt`/`.rtf`/...), the whole document's text via macOS's `textutil` (not paginated - `n`/`p` do nothing in this view). On a plain image, a spreadsheet, or a slide deck, this just reports that there's no text to show (a plain text file is already shown this way, with nothing to toggle; an `.rtf` file falls back to this too, shown as its actual text via `textutil` rather than its raw markup, only if Quick Look/Chrome rendering isn't available) |
 | `f` | (text mode) toggle a border around the page's edges - on by default (`--no-frame` to start with it off) |
 | `^L` | redraw the screen |
 | `?` | show a keybinding help box (`q` to close it) |

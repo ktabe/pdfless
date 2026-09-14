@@ -61,3 +61,14 @@ def test_image_file_refuses_text_mode_and_search(pty_session, sample_image):
 def test_docx_office_text_mode_toggle(pty_session, sample_docx):
     session = pty_session([sample_docx])
     assert_no_crash(session, [b"t", b"t", b"q"], wait=1.0, initial_wait=6)
+
+
+@requires_office_support
+def test_rtf_office_text_mode_toggle(pty_session, sample_rtf):
+    """An RTF file now renders as an image via RtfOfficeDocument (a
+    textutil-to-docx conversion feeding the same pipeline as a native
+    Word document) - make sure both the image view and 't' toggling
+    into/out of text mode work end-to-end, not just the plain-text
+    fallback path."""
+    session = pty_session([sample_rtf])
+    assert_no_crash(session, [b"t", b"t", b"q"], wait=1.0, initial_wait=6)

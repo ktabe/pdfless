@@ -1,5 +1,7 @@
 import pdfless
 
+from conftest import requires_office_support
+
 
 def classify(path, tmp_path, debug=False):
     """Mirror main()'s HANDLER_CLASSES dispatch loop: the first sniff()
@@ -34,16 +36,42 @@ def test_plain_text_classified_as_text(sample_text, tmp_path):
     assert handler.extract_text(1) == ["line one", "line two", "line three"]
 
 
-def test_rtf_classified_as_rtf_not_plain_text(sample_rtf, tmp_path):
+@requires_office_support
+def test_rtf_classified_as_rtf_office_document(sample_rtf, tmp_path):
+    """When qlmanage + Chrome are available, an RTF file is rendered as
+    an image via a textutil-to-docx conversion (RtfOfficeDocument, see
+    _rtf_to_docx()) - the same as any other Word document, rather than
+    only ever being shown as plain text."""
     handler = classify(sample_rtf, tmp_path)
-    assert isinstance(handler, pdfless.RtfDocument)
-    assert handler.kind == "text"  # same outward "kind" as TextDocument
+    assert isinstance(handler, pdfless.RtfOfficeDocument)
+    assert handler.kind == "office"
+
+    pages = handler.build_pages(str(tmp_path))
+    assert pages
+    assert len(pages) >= 1
+
     lines = handler.extract_text(1)
     assert lines is not None
     text = "\n".join(lines)
     assert "Hello from a test RTF file" in text
     # The raw RTF control words must NOT leak into what's shown.
     assert r"\rtf1" not in text
+
+
+def test_rtf_falls_back_to_plain_text_without_textutil(sample_rtf, tmp_path, monkeypatch):
+    """Without textutil (e.g. non-macOS), RtfOfficeDocument.sniff()
+    can't convert to .docx at all - HANDLER_CLASSES falls through to
+    the plain-text-only RtfDocument instead (see HANDLER_CLASSES'
+    ordering)."""
+    real_which = pdfless.shutil.which
+    monkeypatch.setattr(
+        pdfless.shutil, "which",
+        lambda name: None if name == "textutil" else real_which(name),
+    )
+    handler = classify(sample_rtf, tmp_path)
+    assert isinstance(handler, pdfless.RtfDocument)
+    assert not isinstance(handler, pdfless.RtfOfficeDocument)
+    assert handler.kind == "text"
 
 
 def test_corrupt_pdf_raises_unusable_file_not_silently_skipped(tmp_path):
@@ -78,12 +106,11 @@ def test_unrecognizable_binary_file_classifies_as_none(tmp_path):
 
 
 def test_capability_matrix_matches_expectations(
-    sample_pdf, sample_image, sample_text, sample_rtf, tmp_path
+    sample_pdf, sample_image, sample_text, tmp_path
 ):
     pdf = classify(sample_pdf, tmp_path)
     image = classify(sample_image, tmp_path)
     text = classify(sample_text, tmp_path)
-    rtf = classify(sample_rtf, tmp_path)
 
     assert (pdf.supports_text_mode(), pdf.supports_search(), pdf.text_mode_is_paginated()) == (
         True, True, True,
@@ -94,24 +121,34 @@ def test_capability_matrix_matches_expectations(
     assert (text.supports_text_mode(), text.supports_search(), text.text_mode_is_paginated()) == (
         True, True, False,
     )
+
+
+@requires_office_support
+def test_rtf_office_document_capabilities_match_office_document(sample_rtf, tmp_path):
+    rtf = classify(sample_rtf, tmp_path)
     assert (rtf.supports_text_mode(), rtf.supports_search(), rtf.text_mode_is_paginated()) == (
-        True, True, False,
+        True, False, False,
     )
 
 
 def test_document_handler_for_kind_matches_sniffed_type(
-    sample_pdf, sample_image, sample_text, sample_rtf, tmp_path
+    sample_pdf, sample_image, sample_text, tmp_path
 ):
     """_document_handler_for_kind() reconstructs the handler Viewer
-    reuses across page navigation/reload from just the "kind" string -
-    it must disambiguate RtfDocument vs TextDocument (both kind=="text")
-    the same way the original sniff() pass did."""
+    reuses across page navigation/reload from just the "kind" string."""
     for path, expected_cls in [
         (sample_pdf, pdfless.PdfDocument),
         (sample_image, pdfless.ImageDocument),
         (sample_text, pdfless.TextDocument),
-        (sample_rtf, pdfless.RtfDocument),
     ]:
         handler = classify(path, tmp_path)
         rebuilt = pdfless._document_handler_for_kind(handler.kind, path)
         assert type(rebuilt) is expected_cls
+
+
+def test_document_handler_for_kind_disambiguates_rtf(sample_rtf):
+    """Both "office" and "text" kinds cover an RTF-specific class in
+    addition to the plain one - is_rtf_file() tells them apart without
+    needing to re-run sniff()."""
+    assert type(pdfless._document_handler_for_kind("office", sample_rtf)) is pdfless.RtfOfficeDocument
+    assert type(pdfless._document_handler_for_kind("text", sample_rtf)) is pdfless.RtfDocument
