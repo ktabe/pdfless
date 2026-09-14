@@ -2284,9 +2284,15 @@ class RtfOfficeDocument(OfficeDocument):
         docx_path = _rtf_to_docx(self.path, tmpdir)
         if docx_path is None:
             return None
+        # Always continuous, regardless of the caller's -c/--continuous
+        # setting - a converted RTF's page-height pagination (the plist
+        # Width/Height textutil's own docx conversion reports) doesn't
+        # correspond to anything in the original RTF, so it's not worth
+        # trusting as a page boundary the way a native Word document's
+        # is.
         return build_office_pages(
             docx_path, tmpdir, debug=debug, render_scale=render_scale,
-            progress=progress, continuous=continuous,
+            progress=progress, continuous=True,
         )
 
     def extract_text(self, page):

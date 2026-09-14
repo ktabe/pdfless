@@ -48,7 +48,7 @@ def test_rtf_classified_as_rtf_office_document(sample_rtf, tmp_path):
 
     pages = handler.build_pages(str(tmp_path))
     assert pages
-    assert len(pages) >= 1
+    assert len(pages) == 1  # always continuous - see test below
 
     lines = handler.extract_text(1)
     assert lines is not None
@@ -56,6 +56,22 @@ def test_rtf_classified_as_rtf_office_document(sample_rtf, tmp_path):
     assert "Hello from a test RTF file" in text
     # The raw RTF control words must NOT leak into what's shown.
     assert r"\rtf1" not in text
+
+
+@requires_office_support
+def test_rtf_office_document_always_renders_continuous(sample_rtf, tmp_path):
+    """A converted RTF's page-height pagination doesn't correspond to
+    anything in the original RTF (it's just whatever page size
+    textutil's docx conversion happened to declare), so
+    RtfOfficeDocument.build_pages() always forces continuous=True,
+    ignoring whatever the caller (-c/--continuous) asked for."""
+    handler = classify(sample_rtf, tmp_path)
+    assert isinstance(handler, pdfless.RtfOfficeDocument)
+
+    for continuous_arg in (False, True):
+        pages = handler.build_pages(str(tmp_path), continuous=continuous_arg)
+        assert pages is not None
+        assert len(pages) == 1
 
 
 def test_rtf_falls_back_to_plain_text_without_textutil(sample_rtf, tmp_path, monkeypatch):
