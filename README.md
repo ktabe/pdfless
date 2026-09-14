@@ -142,8 +142,8 @@ python3 pdfless.py some.pdf
 ## Usage
 
 ```
-usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [--no-frame]
-               [-F] [--wheel-scroll-step N]
+usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [-B] [-S]
+               [-E] [-N] [-F] [--wheel-scroll-step N]
                file [file ...]
 
 positional arguments:
@@ -168,10 +168,22 @@ options:
                         instead of restoring the terminal screen
   -h, --fit-height      fit each page to the terminal's full height instead of
                         its full width (default: fit width)
-  --no-frame            don't draw a border around the page's edges in text
+  -B, --no-border       don't draw a border around the page's edges in text
                         mode (t); on by default (except for a plain text
                         file, where it's off by default regardless of
-                        this), toggle any time with f
+                        this), toggle any time with B
+  -S, --chop-long-lines
+                        in text mode, don't wrap long lines - pan across
+                        them instead with h/l/H/L, less(1)-style. Already
+                        the default for anything but a plain text file,
+                        which normally wraps; toggle any time by typing -S
+  -E, --no-eol-mark     don't mark a real end-of-line (↵) in text mode -
+                        shown by default (regardless of -S/--chop-long-
+                        lines) to tell a genuine line ending apart from
+                        where wrapping/panning simply ran out of room
+  -N, --line-numbers    show line numbers in text mode, less(1)-style -
+                        off by default; toggle any time with # (or -N,
+                        kept for less(1) compatibility)
   -F, --follow          watch the file and reload it if it changes on disk
                         (checked every 3s), staying on the same page and in
                         the same mode
@@ -270,7 +282,10 @@ Misc:
 | mouse wheel | scroll up / down - in the page image, one line at a time like `e`/`y` (`--wheel-scroll-step` to change that); in text mode, one line at a time |
 | `[` / `]` | back / forward, through the positions internal links have jumped from |
 | `t` | toggle a plain-text view (scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) - for a PDF, the current page's extracted text; for a Word-family Quick Look preview file (`.doc`/`.docx`/`.odt`/`.rtf`/...), the whole document's text via macOS's `textutil` (not paginated - `n`/`p` do nothing in this view). On a plain image, a spreadsheet, or a slide deck, this just reports that there's no text to show (a plain text file is already shown this way, with nothing to toggle; an `.rtf` file falls back to this too, shown as its actual text via `textutil` rather than its raw markup, only if Quick Look/Chrome rendering isn't available) |
-| `f` | (text mode) toggle a border around the page's edges - on by default (`--no-frame` to start with it off); a plain text file starts with it off regardless, since there's usually no real "page" boundary in one worth framing |
+| `B` | (text mode) toggle a border around the page's edges - on by default (`--no-border`/`-B` to start with it off); a plain text file starts with it off regardless, since there's usually no real "page" boundary in one worth bordering; no border while wrapped, regardless of `B` (`-S` to unwrap first) |
+| `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped); no border while wrapped, regardless of `B`. `s` is the primary key; `-S` (`less(1)`-style) is kept only for compatibility |
+| `e` | (text mode) toggle marking a real end-of-line (↵), whether wrapped or panned, as opposed to where the terminal width simply cut a long line off - on by default (`-E`/`--no-eol-mark` to start without it) |
+| `#` / `-N` | (text mode) toggle a right-aligned, gray line-number gutter - off by default (`-N`/`--line-numbers` to start with it on). `#` is the primary key; `-N` (`less(1)`-style) is kept only for compatibility |
 | `^L` | redraw the screen |
 | `?` | show a keybinding help box (`q` to close it) |
 | `q` / `^C` | quit |
