@@ -83,6 +83,13 @@ TEXT_HIGHLIGHT_RESET = "\x1b[0m"
 # background behind, just the underlying page image).
 SEARCH_MARKER_COLOR = "\x1b[93m"  # bright yellow
 SEARCH_MARKER_RESET = "\x1b[0m"
+
+# Wrap mode (_draw_text_wrapped()): marks a real newline (the last
+# display row of a raw line) with U+21B5 (↵), distinct from a row that's
+# just a soft-wrap continuation of the same line.
+NEWLINE_MARKER = "↵"
+NEWLINE_MARKER_COLOR = "\x1b[34m"  # blue
+NEWLINE_MARKER_RESET = "\x1b[0m"
 CACHE_SIZE = 6
 
 # SGR mouse reporting (buttons + motion, extended coordinates): only
@@ -220,9 +227,17 @@ Keys (mirroring less(1)):
   t                       toggle plain-text view of the current page
                           (page/line navigation and h/l/H/L pan for
                           lines wider than the terminal - no zoom/fit)
-  f                       (text mode) toggle a border around the page's
-                          edges - on by default (--no-frame to start
+  B                       (text mode) toggle a border around the page's
+                          edges - on by default (--no-border/-B to start
                           with it off).
+  s / -S                  (text mode) toggle wrapping long lines instead
+                          of panning across them - on by default for a
+                          plain text file, off otherwise (-S/
+                          --chop-long-lines to start unwrapped; -S is
+                          kept for less(1) compatibility, s is primary)
+  e                       (text mode) toggle marking a real end-of-line
+                          (↵) - on by default (-E/--no-eol-mark to
+                          start without it)
   /<regex> ENTER          search the whole document for <regex>
                           (a Python regex; falls back to a literal
                           substring if it isn't valid regex syntax)
@@ -1343,6 +1358,14 @@ def is_probably_text(path, sniff_bytes=8000):
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
+def _caret_notation(match):
+    """"^X" caret notation for one C0 control character or DEL (e.g.
+    "\\x0c" (^L) or "\\x1b" (^[)) - XORing the byte with 0x40 maps the
+    whole range (0x00-0x1f, plus 0x7f) to the right letter/symbol in one
+    step, the same trick a terminal's own ^-echoing uses."""
+    return "^" + chr(ord(match.group()) ^ 0x40)
+
+
 def is_rtf_file(path):
     """Sniff for RTF's own signature ("{\\rtf1" right at the start),
     the same way PdfDocument.is_pdf_file() sniffs "%PDF-" rather than trusting the
@@ -1364,8 +1387,9 @@ def read_plain_text_lines(path, tab_width=8):
     PDF page: ready to hand straight to the existing text-mode renderer.
     Tabs are expanded (there's no terminal-native tab stop handling in
     that renderer's column math) and stray control characters (e.g. a
-    raw ESC) are stripped, so odd file content can't corrupt the
-    terminal display the way passing it through raw would.
+    raw ESC, or a form feed/^L) are shown in caret notation (^[, ^L, ...)
+    - see _caret_notation() - rather than passed through raw, so odd
+    file content can't corrupt the terminal display the way that would.
 
     An RTF file (see is_rtf_file()) is its own special case: its "plain
     text" content is the raw RTF markup, not the document text a reader
@@ -1379,7 +1403,7 @@ def read_plain_text_lines(path, tab_width=8):
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     content = content.expandtabs(tab_width)
-    content = _CONTROL_CHAR_RE.sub("", content)
+    content = _CONTROL_CHAR_RE.sub(_caret_notation, content)
     return content.splitlines()
 
 
@@ -1481,13 +1505,26 @@ class DocumentHandler:
         mode via 't' (a PDF, or a Quick Look preview file)."""
         return False
 
-    def default_text_frame(self, frame_default):
+    def default_text_border(self, border_default):
         """Whether text mode's border should be on by default for this
-        handler - see Viewer._default_text_frame(). `frame_default` is
-        whatever --no-frame requested; overridden by TextDocument (and
+        handler - see Viewer._default_text_border(). `border_default` is
+        whatever --no-border requested; overridden by TextDocument (and
         so, by inheritance, RtfDocument), which have no real "page"
-        boundary worth framing at all, regardless of --no-frame."""
-        return frame_default
+        boundary worth bordering at all, regardless of --no-border."""
+        return border_default
+
+    def default_text_wrap(self, wrap_default):
+        """Whether text mode should default to soft-wrapping long lines
+        (off means panning across them instead, with h/l/H/L) - see
+        Viewer._default_text_wrap(). Off here regardless of
+        `wrap_default` (whatever -S/--chop-long-lines requested): a
+        PDF's per-page text or an Office document's whole-document text
+        (via textutil) is derived from something else, not the actual
+        file being paged through, so panning (the pre-existing behavior)
+        stays the default - overridden by TextDocument (and so, by
+        inheritance, RtfDocument), which default to `wrap_default`
+        itself, i.e. wrapped unless -S said otherwise."""
+        return False
 
     def get_page_image(self, cache, page, target_px, fit):
         """Return `page`'s image (a PIL.Image), scaled so it's
@@ -1914,10 +1951,17 @@ class TextDocument(DocumentHandler):
     def starts_in_text_mode(self):
         return True
 
-    def default_text_frame(self, frame_default):
-        # No real "page" boundary in a plain text file worth framing,
-        # regardless of --no-frame.
+    def default_text_border(self, border_default):
+        # No real "page" boundary in a plain text file worth bordering,
+        # regardless of --no-border.
         return False
+
+    def default_text_wrap(self, wrap_default):
+        # This *is* the actual file content being paged through (unlike
+        # a PDF's extracted text or an Office document's textutil
+        # dump), so it defaults to wrapping like less(1) itself does -
+        # unless -S/--chop-long-lines said otherwise.
+        return wrap_default
 
 
 class RtfDocument(TextDocument):
@@ -2674,7 +2718,7 @@ class EncodeCache:
 class Viewer:
     def __init__(
         self, files, file_index, page, tmpdir, fd, fit="width",
-        frame=True, wheel_scroll_step=1,
+        border=True, wrap=True, eol_mark=True, wheel_scroll_step=1,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False,
     ):
@@ -2686,6 +2730,9 @@ class Viewer:
         self.office_continuous = office_continuous  # -c/--continuous
         self.fd = fd
         self.fit = fit
+        self.eol_mark = eol_mark  # --no-eol-mark: mark a real end-of-line
+        # (NEWLINE_MARKER) in text mode - independent of text_wrap/-S, on
+        # by default either way (see _draw_text_wrapped()/_unwrapped())
         self.wheel_scroll_step = wheel_scroll_step
         # A real (not just placeholder-0) self.rows/cols before
         # _set_current_file() below is what lets its lazy office-preview
@@ -2735,11 +2782,21 @@ class Viewer:
         self.text_x_offset_min = 0
         self.text_x_offset_max = 0
         self.text_max_line_width = 0
-        self.frame_default = frame  # --no-frame, as given on the command line
-        self.text_frame = self._default_text_frame()  # border around the
+        self.border_default = border  # --no-border, as given on the command line
+        self.text_border = self._default_text_border()  # border around the
         # page's edges, in text mode; can be swept up along with the text
-        # if you select-and-copy it, so it's toggled off with --no-frame
-        # (or on/off any time with the f key) - see _default_text_frame()
+        # if you select-and-copy it, so it's toggled off with --no-border
+        # (or on/off any time with the B key) - see _default_text_border()
+        self.wrap_default = wrap  # -S/--chop-long-lines, as given on the
+        # command line (inverted - this is "should it wrap", not "should
+        # it chop")
+        self.text_wrap = self._default_text_wrap()  # soft-wrap long lines
+        # instead of panning across them (h/l/H/L) - see
+        # _default_text_wrap(); no border while wrapped (see
+        # _draw_text_wrapped()), regardless of text_border
+        self._display_rows = None  # lazily built by _ensure_display_rows(),
+        # only while text_wrap is on - [(line_idx, start, end), ...], one
+        # entry per on-screen row
         self._last_viewport_w = 0
         self._last_viewport_h = 0
         self._last_viewport_set = False
@@ -2822,7 +2879,9 @@ class Viewer:
         self._history_back = []
         self._history_forward = []
         self.text_mode = self.doc_handler.starts_in_text_mode()
-        self.text_frame = self._default_text_frame()
+        self.text_border = self._default_text_border()
+        self.text_wrap = self._default_text_wrap()
+        self._display_rows = None
         # Mouse reporting is only useful in the page image (clicking
         # hyperlinks, wheel scroll); off in any kind of text view, the
         # same as enter_text_mode()/exit_text_mode() do for a PDF's `t`
@@ -2857,6 +2916,8 @@ class Viewer:
         self._last_viewport_set = False
         self._last_char_h = 0
         self._last_marker_bounds = None
+        self._display_rows = None  # stale - self.cols may have changed,
+        # which is what wrapping is measured against
 
     def _load_page(self):
         self.encode_cache.clear()
@@ -2993,15 +3054,17 @@ class Viewer:
         # enough for that to matter (see enter_text_mode()/reload(),
         # the only other places that ask for this same text).
         self.text_lines = self.doc_handler.extract_text(self.page)
+        self._display_rows = None  # stale - built fresh from the new text_lines
         self.text_scroll = 0
         self.text_x_offset = 0
         self._clamp_text_scroll()
-        if self.text_frame:
+        if self.text_border and not self.text_wrap:
             # Default to showing the new page's top-left corner - and so
             # its border, since that's otherwise off past the default
             # (0, 0) position. go_to_page_text() below still overrides
             # this for scroll=None (continuous backward scroll wants the
-            # bottom of the page instead).
+            # bottom of the page instead). No border to reveal at all
+            # while wrapped - see _draw_text_wrapped().
             self.text_scroll = self.text_scroll_min
             self.text_x_offset = self.text_x_offset_min
 
@@ -3011,18 +3074,51 @@ class Viewer:
     def _text_avail_cols(self):
         return self.cols
 
-    def toggle_text_frame(self):
-        self.text_frame = not self.text_frame
+    def toggle_text_border(self):
+        self.text_border = not self.text_border
         self._clamp_text_scroll()
 
-    def _default_text_frame(self):
+    def _default_text_border(self):
         """Whether text mode's border should be on by default for the
-        current file - delegated to doc_handler.default_text_frame()
+        current file - delegated to doc_handler.default_text_border()
         (e.g. always off for a plain text file, regardless of
-        --no-frame, since there's usually no real "page" boundary in
-        one worth framing; otherwise whatever --no-frame asked for).
-        The f key can still toggle either way, on top of this default."""
-        return self.doc_handler.default_text_frame(self.frame_default)
+        --no-border, since there's usually no real "page" boundary in
+        one worth bordering; otherwise whatever --no-border asked for).
+        The B key can still toggle either way, on top of this default."""
+        return self.doc_handler.default_text_border(self.border_default)
+
+    def toggle_text_wrap(self):
+        """Switches between soft-wrapping long lines and panning across
+        them (h/l/H/L) - the less(1)-style "-S" runtime toggle (see
+        run_viewer()'s dash_pending handling). Resets to the top of the
+        current page/document rather than trying to preserve the exact
+        scroll position across the toggle - wrapped and unwrapped text
+        use different addressing (display row vs. raw line), and a
+        precise mapping between them isn't worth the complexity."""
+        self.text_wrap = not self.text_wrap
+        self._display_rows = None
+        self.text_scroll = 0
+        self.text_x_offset = 0
+        self._clamp_text_scroll()
+
+    def toggle_eol_mark(self):
+        """Switches NEWLINE_MARKER on/off - the less(1)-style "-E"
+        runtime toggle (see run_viewer()'s dash_pending handling), same
+        idea as "-S" for text_wrap. text_max_line_width/_display_rows
+        both reserve a column for the marker only while it's on, so
+        both need recomputing here."""
+        self.eol_mark = not self.eol_mark
+        self._display_rows = None
+        self._clamp_text_scroll()
+
+    def _default_text_wrap(self):
+        """Whether text mode should default to wrapping long lines for
+        the current file - delegated to doc_handler.default_text_wrap()
+        (on for a plain text file, unless -S/--chop-long-lines said
+        otherwise; off for a PDF/Office's own derived text view, which
+        pans instead, regardless of -S). The -S key sequence can still
+        toggle either way, on top of this default."""
+        return self.doc_handler.default_text_wrap(self.wrap_default)
 
     def _clamp_text_scroll(self):
         # The border sits at the page's actual edges - one row above the
@@ -3030,11 +3126,35 @@ class Viewer:
         # one right of the widest line - which is usually off-screen at
         # the default scroll/pan position. It only comes into view by
         # scrolling/panning one step past the content itself, so with the
-        # frame on, the scroll/pan range is widened by exactly that much;
+        # border on, the scroll/pan range is widened by exactly that much;
         # with it off, the range is exactly what it was before this
         # feature existed.
         avail_rows = self._text_avail_rows()
-        if self.text_frame:
+        if self.text_wrap:
+            # No border while wrapped (see _draw_text_wrapped()) - the
+            # scroll range is over display rows (self._display_rows,
+            # built fresh here since content_width may have changed),
+            # not raw text_lines, and there's no pan to speak of.
+            self._ensure_display_rows()
+            self.text_scroll_min = 0
+            self.text_scroll_max = max(0, len(self._display_rows) - avail_rows)
+            self.text_scroll = max(
+                self.text_scroll_min, min(self.text_scroll, self.text_scroll_max)
+            )
+            self.text_x_offset_min = 0
+            self.text_x_offset_max = 0
+            self.text_x_offset = 0
+            return
+
+        # The border sits at the page's actual edges - one row above the
+        # first line, one below the last; one column left of column 0,
+        # one right of the widest line - which is usually off-screen at
+        # the default scroll/pan position. It only comes into view by
+        # scrolling/panning one step past the content itself, so with the
+        # border on, the scroll/pan range is widened by exactly that much;
+        # with it off, the range is exactly what it was before this
+        # feature existed.
+        if self.text_border:
             self.text_scroll_min = -1
             self.text_scroll_max = max(-1, len(self.text_lines) - avail_rows + 1)
         else:
@@ -3048,7 +3168,14 @@ class Viewer:
         self.text_max_line_width = max(
             (display_width(l) for l in self.text_lines), default=0
         )
-        if self.text_frame:
+        if self.eol_mark:
+            # Otherwise the widest line's own marker (see
+            # _draw_text_unwrapped()) would have nowhere to go without
+            # overflowing past the border - this pretends the page is 1
+            # column wider than its content actually is, the same way
+            # _ensure_display_rows() reserves a column when wrapped.
+            self.text_max_line_width += 1
+        if self.text_border:
             self.text_x_offset_min = -1
             self.text_x_offset_max = max(-1, self.text_max_line_width - avail_cols + 1)
         else:
@@ -3158,32 +3285,39 @@ class Viewer:
         little below the top rather than jammed against the top edge -
         panning horizontally into view too, in case the terminal is too
         narrow for the line and it's off to the side of the truncated
-        view (the text-mode equivalent of _scroll_image_to_match())."""
+        view (the text-mode equivalent of _scroll_image_to_match()).
+        Wrapped text has no pan to speak of - _row_for_line() converts
+        the raw line position into a display-row scroll target instead."""
         avail_cols = self._text_avail_cols()
         highlight = self._text_highlight_for_match(match)
         if highlight:
             line_idx, start, end = highlight
-            line = self.text_lines[line_idx]
-            col_start = display_width(line[:start])
-            col_end = display_width(line[:end])
-            if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
-                self.text_x_offset = max(
-                    self.text_x_offset_min,
-                    min(
-                        self.text_x_offset_max,
-                        round((col_start + col_end) / 2 - avail_cols / 2),
-                    ),
-                )
+            if self.text_wrap:
+                target_row = self._row_for_line(line_idx)
+            else:
+                line = self.text_lines[line_idx]
+                col_start = display_width(line[:start])
+                col_end = display_width(line[:end])
+                if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
+                    self.text_x_offset = max(
+                        self.text_x_offset_min,
+                        min(
+                            self.text_x_offset_max,
+                            round((col_start + col_end) / 2 - avail_cols / 2),
+                        ),
+                    )
+                target_row = line_idx
         else:
             _, _xmin_pt, ymin_pt, _xmax_pt, _ymax_pt = match
             height_pt = self._search_index[self.page - 1]["height_pt"]
             line_idx = (
                 round((ymin_pt / height_pt) * len(self.text_lines)) if height_pt else 0
             )
+            target_row = self._row_for_line(line_idx) if self.text_wrap else line_idx
         avail_rows = self._text_avail_rows()
         margin = avail_rows // 4
         self.text_scroll = max(
-            self.text_scroll_min, min(self.text_scroll_max, line_idx - margin)
+            self.text_scroll_min, min(self.text_scroll_max, target_row - margin)
         )
 
     def go_to_page_text(self, page, scroll):
@@ -3205,10 +3339,12 @@ class Viewer:
         same as less(1)'s own <N>g, even if that leaves blank space
         below near the end of the page - unlike normal scrolling, which
         never scrolls past showing a full screen of content, in order
-        to guarantee the requested line is the one that ends up on top."""
-        self.text_scroll = max(
-            self.text_scroll_min, min(len(self.text_lines) - 1, n - 1)
-        )
+        to guarantee the requested line is the one that ends up on top.
+        While wrapped, "line n" still means the same raw line - it just
+        lands on whichever display row that line's wrapping starts at."""
+        target_line = max(0, min(len(self.text_lines) - 1, n - 1))
+        row = self._row_for_line(target_line) if self.text_wrap else target_line
+        self.text_scroll = max(self.text_scroll_min, row)
 
     def text_scroll_down(self, n):
         if self.text_scroll < self.text_scroll_max:
@@ -3222,8 +3358,130 @@ class Viewer:
         elif self.page > 1:
             self.go_to_page_text(self.page - 1, None)
 
+    def _row_for_line(self, line_idx):
+        """The first display-row index (into self._display_rows, see
+        _ensure_display_rows()) covering raw line `line_idx` - lets
+        anything that thinks in terms of a raw text_lines index (search
+        highlighting, <N>g) target the right scroll position once
+        wrapping has split that line across one or more screen rows."""
+        self._ensure_display_rows()
+        for row, (li, _start, _end) in enumerate(self._display_rows):
+            if li == line_idx:
+                return row
+        return max(0, len(self._display_rows) - 1)
+
+    @staticmethod
+    def _wrap_line_segments(line, width):
+        """Split `line` into consecutive (start, end) character-index
+        segments, each at most `width` display columns wide - the
+        wrap-mode equivalent of slice_by_width()'s single pan window,
+        but covering the whole line instead of just one panned slice of
+        it. An empty line still yields exactly one (empty) segment, so
+        it still occupies one display row, same as an unwrapped blank
+        line does."""
+        width = max(1, width)
+        if not line:
+            return [(0, 0)]
+        segments = []
+        start = 0
+        n = len(line)
+        while start < n:
+            piece = truncate_to_width(line[start:], width)
+            if not piece:
+                # a single character wider than the whole available
+                # width - it still has to go somewhere
+                piece = line[start:start + 1]
+            end = start + len(piece)
+            segments.append((start, end))
+            start = end
+        return segments
+
+    def _ensure_display_rows(self):
+        """Build self._display_rows - one (line_idx, start, end) entry
+        per on-screen row while wrapped - lazily, since it's invalidated
+        (set to None) whenever self.text_lines, text_wrap, or the
+        terminal width changes, and rebuilding it is O(total document
+        length)."""
+        if self._display_rows is not None:
+            return
+        # One column held back for the real-newline marker (see
+        # _draw_text_wrapped()), if it's on - reserved on every row, not
+        # just one that ends up actually drawing it, so the marker never
+        # has to compete with content for the same column.
+        width = self._text_avail_cols() - (1 if self.eol_mark else 0)
+        width = max(1, width)
+        rows = []
+        for i, line in enumerate(self.text_lines):
+            for start, end in self._wrap_line_segments(line, width):
+                rows.append((i, start, end))
+        self._display_rows = rows
+
     def _draw_text(self):
-        # The frame sits at the page's own edges in this same scrollable/
+        if self.text_wrap:
+            self._draw_text_wrapped()
+        else:
+            self._draw_text_unwrapped()
+
+    def _draw_text_wrapped(self):
+        """Wrap-mode rendering: self._display_rows (built by
+        _ensure_display_rows()) already breaks the document into
+        on-screen rows, each guaranteed to fit the terminal width - so,
+        unlike _draw_text_unwrapped(), there's no pan position to
+        account for. The border (text_border) isn't drawn here either,
+        regardless of its own on/off state: a border only makes sense
+        around a fixed page shape, and wrapped text has no edges of its
+        own to border - it just keeps flowing to fill the width."""
+        self._ensure_display_rows()
+        avail_rows = self._text_avail_rows()
+        if not self.doc_handler.text_mode_is_paginated():
+            highlight = (
+                self.search_matches[self.search_pos]
+                if self.search_pos is not None else None
+            )
+        else:
+            highlight = self._text_highlight_for_match(self._active_search_page_match())
+
+        out = [STATUS_COLOR_OFF, "\x1b[H\x1b[2J"]
+        n_rows = len(self._display_rows)
+
+        for i in range(avail_rows):
+            virtual_row = self.text_scroll + i
+            screen_row = i + 1
+            if not (0 <= virtual_row < n_rows):
+                continue  # above/below the document entirely
+
+            line_idx, start, end = self._display_rows[virtual_row]
+            rendered = self.text_lines[line_idx][start:end]
+
+            if highlight and highlight[0] == line_idx:
+                # start/end are character offsets into the raw line;
+                # clip them to this segment, then shift into the
+                # segment's own (rendered-relative) coordinates.
+                _, h_start, h_end = highlight
+                h_start, h_end = max(h_start, start) - start, min(h_end, end) - start
+                if h_start < len(rendered) and h_end > h_start:
+                    rendered = (
+                        rendered[:h_start]
+                        + TEXT_HIGHLIGHT_COLOR
+                        + rendered[h_start:h_end]
+                        + TEXT_HIGHLIGHT_RESET
+                        + rendered[h_end:]
+                    )
+
+            if self.eol_mark and end == len(self.text_lines[line_idx]):
+                # This segment reaches the actual end of the raw line -
+                # a real newline, not just where this row's wrapping
+                # happened to cut it - see NEWLINE_MARKER.
+                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
+
+            out.append(f"\x1b[{screen_row};1H{rendered}")
+
+        out.append(self.format_status())
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    def _draw_text_unwrapped(self):
+        # The border sits at the page's own edges in this same scrollable/
         # pannable space the text lines live in - virtual row -1 (top)
         # and row len(text_lines) (bottom), virtual column -1 (left) and
         # column text_max_line_width (right) - rather than around
@@ -3253,14 +3511,14 @@ class Viewer:
 
         left_col = -1 - self.text_x_offset
         right_col = self.text_max_line_width - self.text_x_offset
-        left_visible = self.text_frame and 0 <= left_col < avail_cols
-        right_visible = self.text_frame and 0 <= right_col < avail_cols
+        left_visible = self.text_border and 0 <= left_col < avail_cols
+        right_visible = self.text_border and 0 <= right_col < avail_cols
 
         for i in range(avail_rows):
             virtual_row = self.text_scroll + i
             screen_row = i + 1
 
-            if self.text_frame and virtual_row in (-1, len(self.text_lines)):
+            if self.text_border and virtual_row in (-1, len(self.text_lines)):
                 line_start = max(0, left_col)
                 line_end = min(avail_cols - 1, right_col)
                 if line_end < line_start:
@@ -3274,7 +3532,7 @@ class Viewer:
                 continue
 
             if not (0 <= virtual_row < len(self.text_lines)):
-                continue  # above/below the frame entirely - nothing there
+                continue  # above/below the border entirely - nothing there
 
             line = self.text_lines[virtual_row]
             content_start = (left_col + 1) if left_visible else 0
@@ -3283,14 +3541,16 @@ class Viewer:
             rendered, base = slice_by_width(
                 line, max(0, self.text_x_offset), content_width
             )
-            if right_visible:
-                # Without this, the right border would sit right after
-                # each line's own (usually shorter) content instead of
-                # lined up straight at the page's actual right edge -
-                # padded here, ahead of splicing in highlight color
-                # codes below, so display_width() isn't thrown off by
-                # those.
-                rendered = pad_to_width(rendered, content_width)
+            reaches_end = base + len(rendered) == len(line)
+            # Measured before any color codes (highlight, marker) are
+            # spliced in below - display_width() would miscount those
+            # escape bytes as visible columns otherwise. When bordered,
+            # text_max_line_width's own +1 (above) already guarantees
+            # room for the marker on every row (the widest line just
+            # uses all of it, up against the border); unbordered, there's
+            # no such guarantee, so only draw it if there's room to spare.
+            shown_width = display_width(rendered)
+            show_marker = self.eol_mark and reaches_end and shown_width < content_width
 
             if highlight and highlight[0] == virtual_row:
                 # start/end are character offsets into the original,
@@ -3310,6 +3570,21 @@ class Viewer:
                         + TEXT_HIGHLIGHT_RESET
                         + rendered[end:]
                     )
+
+            if show_marker:
+                # Right after the real content - i.e. at the actual
+                # newline position - not padded out to the border (see
+                # below), which would misleadingly suggest the line
+                # itself reaches all the way to the page edge.
+                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
+                shown_width += 1
+
+            if right_visible:
+                # Pad with plain spaces (not pad_to_width(), which would
+                # re-measure `rendered` and miscount the escape codes
+                # just spliced in) so the border still lines up straight
+                # at the page's actual right edge, same as before.
+                rendered += " " * max(0, content_width - shown_width)
 
             parts = []
             if left_visible:
@@ -3886,13 +4161,20 @@ class Viewer:
         horizontal pan (for lines too wide for the terminal) - no
         zoom/fit, since there's no image here to resize."""
         avail_rows = self._text_avail_rows()
-        if key == "f":
-            # Checked ahead of FORWARD_WINDOW_KEYS, which "f" is
-            # otherwise also a member of: the frame is opt-in precisely
-            # because its border characters would get swept up in a
-            # terminal select-and-copy, so it needs its own key rather
-            # than overloading one already used for something else here.
-            self.toggle_text_frame()
+        if key == "B":
+            # The border is opt-in precisely because its border
+            # characters would get swept up in a terminal select-and-
+            # copy, so it needs its own key - uppercase since lowercase
+            # "b" is already BACKWARD_WINDOW_KEYS.
+            self.toggle_text_border()
+        elif key == "e":
+            # Same idea as "B" above, overriding FORWARD_LINE_KEYS
+            # (still reachable via ^E/j/^N/Enter/Down).
+            self.toggle_eol_mark()
+        elif key == "s":
+            # The primary way to toggle wrap - "-S" (see run_viewer()'s
+            # dash_pending) is kept only for less(1) compatibility.
+            self.toggle_text_wrap()
         elif key in FORWARD_WINDOW_KEYS:
             self.text_scroll_down(avail_rows)
         elif key in BACKWARD_WINDOW_KEYS:
@@ -3988,7 +4270,7 @@ class Viewer:
 
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
-    frame=True, follow=False, wheel_scroll_step=1, keep=False,
+    border=True, wrap=True, eol_mark=True, follow=False, wheel_scroll_step=1, keep=False,
     debug=False, office_render_scale=OFFICE_RENDER_SCALE,
     office_continuous=False,
 ):
@@ -3996,7 +4278,7 @@ def run_viewer(
     caller can inspect its final geometry (e.g. to tidy up the screen)."""
     viewer = Viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
-        frame=frame, wheel_scroll_step=wheel_scroll_step,
+        border=border, wrap=wrap, eol_mark=eol_mark, wheel_scroll_step=wheel_scroll_step,
         debug=debug,
         office_render_scale=office_render_scale, office_continuous=office_continuous,
     )
@@ -4009,6 +4291,7 @@ def run_viewer(
     num_buf = ""
     search_buf = None  # None: not typing; otherwise the "/query" in progress
     colon_pending = False  # True right after ":", awaiting n/p (next/previous file)
+    dash_pending = False  # True right after "-" in text mode, awaiting "S"
 
     last_follow_path = viewer.path
     try:
@@ -4173,6 +4456,21 @@ def run_viewer(
                 viewer.draw_status()
             continue
 
+        if dash_pending:
+            # "-" was just pressed in text mode - less(1)'s own runtime
+            # "-<option-letter>" toggle syntax, kept only for
+            # -S/--chop-long-lines compatibility with less(1); "s" alone
+            # (see handle_key_text()) is the primary way to toggle wrap.
+            # eol-mark and the border have no dash-toggle of their own -
+            # just "e"/"B". Any other key cancels quietly.
+            dash_pending = False
+            if key in ("S", "s"):
+                viewer.toggle_text_wrap()
+                viewer.refresh()
+            else:
+                viewer.draw_status()
+            continue
+
         if key == "\x03":
             break
 
@@ -4205,6 +4503,14 @@ def run_viewer(
         if key == ":":
             colon_pending = True
             viewer.draw_status(":")
+            continue
+
+        if key == "-" and viewer.text_mode:
+            # In image mode, "-" already means zoom out (see
+            # Viewer.handle_key()) - only text mode gets the
+            # less(1)-style "-S" toggle.
+            dash_pending = True
+            viewer.draw_status("-")
             continue
 
         if key == "t":
@@ -4318,18 +4624,26 @@ def run_viewer(
             num_buf = ""
             viewer.draw_status()
 
+        border_before = viewer.text_border
         before = (
             viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
-            viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_frame,
+            viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
+            viewer.text_wrap, viewer.eol_mark,
         )
         if not viewer.handle_key(key):
             break
         after = (
             viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
-            viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_frame,
+            viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
+            viewer.text_wrap, viewer.eol_mark,
         )
         if after != before:
             viewer.refresh()
+            if viewer.text_border != border_before and viewer.text_wrap:
+                # "B" toggled text_border, but _draw_text_wrapped() never
+                # draws a border regardless of it - without this, B looks
+                # like it does nothing at all while wrapped.
+                viewer.draw_status("no border while wrapped - see -S/-s")
 
     return viewer
 
@@ -4392,14 +4706,32 @@ def main():
              "full width (default: fit width)",
     )
     parser.add_argument(
-        "--no-frame",
+        "-B", "--no-border",
         action="store_false",
-        dest="frame",
+        dest="border",
         default=True,
         help="don't draw a border around the page's edges in text mode "
              "(t); on by default (except for a plain text file, where "
              "it's off by default regardless of this), toggle any time "
-             "with f",
+             "with B",
+    )
+    parser.add_argument(
+        "-S", "--chop-long-lines",
+        action="store_true",
+        help="in text mode, don't wrap long lines - pan across them "
+             "instead with h/l/H/L, less(1)-style. Already the default "
+             "for anything but a plain text file, which normally wraps; "
+             "toggle any time by typing -S",
+    )
+    parser.add_argument(
+        "-E", "--no-eol-mark",
+        action="store_false",
+        dest="eol_mark",
+        default=True,
+        help="don't mark a real end-of-line (↵) in text mode - shown "
+             "by default (regardless of -S/--chop-long-lines) to tell a "
+             "genuine line ending apart from where wrapping/panning "
+             "simply ran out of room",
     )
     parser.add_argument(
         "-F", "--follow",
@@ -4486,7 +4818,8 @@ def main():
                 fit = "height" if args.fit_height else "width"
                 viewer = run_viewer(
                     files, 0, start_page, tmpdir, fd, rt.old,
-                    fit=fit, frame=args.frame, follow=args.follow,
+                    fit=fit, border=args.border, wrap=not args.chop_long_lines,
+                    eol_mark=args.eol_mark, follow=args.follow,
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
                     debug=args.debug,
                     office_render_scale=args.rendering_scale,
