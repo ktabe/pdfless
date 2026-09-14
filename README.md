@@ -193,7 +193,7 @@ options:
                         the same mode
   --wheel-scroll-step N
                         scroll N lines per mouse wheel step, in the page image
-                        (default: 1)
+                        (default: 2)
 ```
 
 `-F`/`--follow` is handy while editing/regenerating a PDF or image (e.g.
@@ -282,15 +282,15 @@ Misc:
 
 | Keys | Action |
 | --- | --- |
-| click | (page image, not text mode) open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
-| mouse wheel | scroll up / down - in the page image, one line at a time like `e`/`y` (`--wheel-scroll-step` to change that); in text mode, one line at a time |
+| click / drag | (page image, not text mode) on the scrollbar, jump to the position clicked - and keep following the pointer while you drag; otherwise open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
+| mouse wheel | scroll up / down - in the page image, two lines at a time (`--wheel-scroll-step` to change that); in text mode, one line at a time |
 | `[` / `]` | back / forward, through the positions internal links have jumped from |
 | `t` | toggle a plain-text view (scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) - for a PDF, the current page's extracted text; for a Word-family Quick Look preview file (`.doc`/`.docx`/`.odt`/`.rtf`/...), the whole document's text via macOS's `textutil` (not paginated - `n`/`p` do nothing in this view). On a plain image, a spreadsheet, or a slide deck, this just reports that there's no text to show (a plain text file is already shown this way, with nothing to toggle; an `.rtf` file falls back to this too, shown as its actual text via `textutil` rather than its raw markup, only if Quick Look/Chrome rendering isn't available) |
 | `B` | (text mode) toggle a border around the page's edges - on by default (`--no-border`/`-B` to start with it off); a plain text file starts with it off regardless, since there's usually no real "page" boundary in one worth bordering; no border while wrapped, regardless of `B` (`-S` to unwrap first) |
 | `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped); no border while wrapped, regardless of `B`. `s` is the primary key; `-S` (`less(1)`-style) is kept only for compatibility |
 | `e` | (text mode) toggle marking a real end-of-line (↵), whether wrapped or panned, as opposed to where the terminal width simply cut a long line off - on by default (`-E`/`--no-eol-mark` to start without it) |
 | `#` / `-N` | (text mode) toggle a right-aligned, gray line-number gutter - off by default (`-N`/`--line-numbers` to start with it on). `#` is the primary key; `-N` (`less(1)`-style) is kept only for compatibility |
-| `r` | toggle the scrollbar - a column on the terminal's right edge showing your position (image mode and text mode alike): a gray track, with a white block for the visible portion, spanning the whole column when the file already fits on one screen. Display only, not clickable - on by default (`--no-scrollbar` to start it off) |
+| `r` | toggle the scrollbar - a column on the terminal's right edge showing where you are in the whole document (image mode and text mode alike): a gray track, with a white block for the visible portion, spanning the whole column when the file already fits on one screen. In the page image you can click it to jump to that position, or drag it to move around; in text mode it's display only, so the terminal's own click-drag text selection keeps working. On by default (`--no-scrollbar` to start it off) |
 | `^L` | redraw the screen |
 | `?` | show a keybinding help box (`q` to close it) |
 | `q` / `^C` | quit |

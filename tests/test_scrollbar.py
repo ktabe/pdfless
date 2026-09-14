@@ -34,6 +34,22 @@ def make_viewer(handler, rows=10, cols=20, wrap=False, scrollbar=True):
     return viewer
 
 
+def make_image_viewer(handler, rows=22, cols=40, scrollbar=True):
+    """A Viewer left in image mode, rendering pages for real - unlike
+    make_viewer(), which stubs _load_page() out. _jump_to_scrollbar_row()
+    reads self.img/self.scroll_max, and only a real _load_page() sets
+    those."""
+    _master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, cols * 8, rows * 18))
+    tmpdir = tempfile.mkdtemp()
+    viewer = pdfless.Viewer(
+        [handler], 0, 1, tmpdir, slave, None, scrollbar=scrollbar,
+    )
+    viewer._draw = lambda: None
+    viewer.refresh()
+    return viewer
+
+
 def make_numbered_text(tmp_path, n_lines):
     path = tmp_path / "numbered.txt"
     path.write_text("\n".join(f"line {i}" for i in range(1, n_lines + 1)) + "\n")
@@ -180,6 +196,110 @@ def test_image_mode_base_width_px_reserves_one_cell_for_scrollbar(sample_pdf):
     with_scrollbar = make_viewer(pdfless.PdfDocument(sample_pdf), cols=40, scrollbar=True)
     without_scrollbar = make_viewer(pdfless.PdfDocument(sample_pdf), cols=40, scrollbar=False)
     assert with_scrollbar.base_width_px == without_scrollbar.base_width_px - with_scrollbar.cell_w_px
+
+
+def test_scrollbar_click_jumps_to_that_position_in_the_document(sample_pdf):
+    """Clicking the track jumps to wherever the click points, across
+    the whole document - image mode only (mouse reporting is off in
+    text mode, see enter_text_mode())."""
+    viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), rows=22, cols=40)
+    assert viewer.npages == 7
+    avail_rows = viewer.rows - 1  # 21, the status line isn't part of the track
+
+    viewer.handle_click(viewer.cols, avail_rows)  # the very bottom
+    assert viewer.page == viewer.npages
+
+    viewer.handle_click(viewer.cols, 1)  # the very top
+    assert viewer.page == 1
+    assert viewer.scroll == 0
+
+    viewer.handle_click(viewer.cols, 11)  # 10/21 of the way in -> page 4 of 7
+    assert viewer.page == 4
+
+
+def test_scrollbar_click_is_ignored_when_the_scrollbar_is_off(sample_pdf):
+    viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), scrollbar=False)
+    viewer.handle_click(viewer.cols, viewer.rows - 1)
+    assert viewer.page == 1  # the click fell through to link handling, not a jump
+
+
+def test_a_click_outside_the_scrollbar_column_does_not_jump(sample_pdf):
+    viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf))
+    viewer.handle_click(viewer.cols - 1, viewer.rows - 1)
+    assert viewer.page == 1
+
+
+def test_scrollbar_click_lands_within_the_clicked_page(sample_pdf):
+    """A click inside one page's own slice of the track scrolls within
+    that page rather than jumping to a neighbouring one."""
+    viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), rows=22, cols=40)
+    viewer.set_zoom(4.0)  # tall enough that one page no longer fits
+    assert viewer.scroll_max > 0
+    # Rows 1-3 are page 1's own slice (21 rows / 7 pages).
+    viewer.handle_click(viewer.cols, 1)
+    assert (viewer.page, viewer.scroll) == (1, 0)
+    viewer.handle_click(viewer.cols, 3)
+    assert viewer.page == 1
+    assert viewer.scroll > 0  # further down the same page
+    viewer.handle_click(viewer.cols, 4)
+    assert viewer.page == 2  # the next page's slice starts here
+
+
+def test_sgr_mouse_decodes_drag_and_release():
+    """Motion while the left button is held (bit 5, i.e. cb 32) and the
+    release that ends it - see MOUSE_ON's 1002."""
+    assert pdfless.decode_sgr_mouse("<0;40;7M") == ("MOUSE_CLICK", 40, 7)
+    assert pdfless.decode_sgr_mouse("<32;40;9M") == ("MOUSE_DRAG", 40, 9)
+    assert pdfless.decode_sgr_mouse("<0;40;9m") == ("MOUSE_RELEASE", 40, 9)
+    # Motion with no button held (cb 35, only sent under 1003) and the
+    # other buttons stay ignored.
+    assert pdfless.decode_sgr_mouse("<35;40;9M") is None
+    assert pdfless.decode_sgr_mouse("<1;40;9M") is None
+
+
+def test_drag_only_follows_a_press_that_started_on_the_scrollbar(sample_pdf):
+    viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), rows=22, cols=40)
+
+    # A press on the page image, then a drag across it: left alone, so
+    # it can't send the view jumping.
+    viewer.handle_click(5, 5)
+    assert viewer.handle_drag(20) is False
+    assert viewer.page == 1
+
+    # A press on the scrollbar starts following the pointer.
+    viewer.handle_click(viewer.cols, 1)
+    assert viewer.handle_drag(20) is True
+
+
+def test_drag_acts_only_on_where_the_pointer_ended_up(sample_pdf):
+    """handle_drag() just records - the page only changes when the burst
+    of motion events is flushed, so a drag doesn't rasterize every page
+    it passes over."""
+    viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), rows=22, cols=40)
+    viewer.handle_click(viewer.cols, 1)
+    assert viewer.page == 1
+
+    for row in range(2, 20):  # a burst, as a real drag arrives
+        assert viewer.handle_drag(row) is True
+    assert viewer.page == 1  # nothing acted on yet
+
+    viewer.flush_scrollbar_drag()
+    assert viewer.page == 7  # row 19 of 21 -> the last page of seven
+
+
+def test_release_flushes_the_drag_and_ends_it(sample_pdf):
+    viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), rows=22, cols=40)
+    viewer.handle_click(viewer.cols, 1)
+    viewer.handle_drag(11)
+    viewer.end_scrollbar_drag()
+    assert viewer.page == 4  # the position it was let go at
+    assert viewer.handle_drag(20) is False  # no longer following
+
+
+def test_flush_without_a_drag_is_a_no_op(sample_pdf):
+    viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf))
+    viewer.flush_scrollbar_drag()
+    assert viewer.page == 1
 
 
 def test_office_text_mode_ignores_its_image_mode_page_count(tmp_path):

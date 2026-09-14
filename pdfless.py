@@ -106,12 +106,14 @@ SCROLLBAR_THUMB_COLOR = "\x1b[97m"  # bright white
 SCROLLBAR_RESET = "\x1b[0m"
 CACHE_SIZE = 6
 
-# SGR mouse reporting (buttons + motion, extended coordinates): only
-# enabled while showing the page image, where a click can hit a PDF
-# hyperlink - never in text mode, where mouse tracking would swallow the
-# terminal's own click-drag text selection.
-MOUSE_ON = "\x1b[?1000h\x1b[?1006h"
-MOUSE_OFF = "\x1b[?1000l\x1b[?1006l"
+# SGR mouse reporting (extended coordinates), only enabled while showing
+# the page image - where a click can hit a PDF hyperlink or the
+# scrollbar - never in text mode, where mouse tracking would swallow the
+# terminal's own click-drag text selection. 1000 is buttons alone; 1002
+# adds motion, but only while a button is held (unlike 1003, which
+# reports every pointer move), which is all a scrollbar drag needs.
+MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1000l\x1b[?1002l\x1b[?1006l"
 
 # Alternate Scroll Mode: whenever the above button/motion reporting is
 # NOT active (i.e. in text mode) - and only then, terminals ignore this
@@ -225,12 +227,15 @@ Keys (mirroring less(1)):
   H / L / SHIFT-LEFT/RIGHT   jump to left / right edge (when zoomed in)
   K / U / SHIFT-UP        jump to top of the current page (same as g)
   J / D / SHIFT-DOWN      jump to bottom of the current page (same as G)
-  click                   (page image, not text mode) open a PDF
-                          hyperlink under the pointer - a URL in the
-                          system browser, an internal link by jumping
-                          to its target page/position
-  mouse wheel             scroll up / down - in the page image, one line
-                          at a time like e/y (--wheel-scroll-step to
+  click / drag            (page image, not text mode) on the scrollbar,
+                          jump to the position clicked - and keep
+                          following the pointer while dragging;
+                          otherwise open a PDF hyperlink under the
+                          pointer - a URL in the system browser, an
+                          internal link by jumping to its target
+                          page/position
+  mouse wheel             scroll up / down - in the page image, two
+                          lines at a time (--wheel-scroll-step to
                           change that); in text mode, the terminal turns
                           it into UP/DOWN key presses instead, so it
                           still works there without clashing with
@@ -257,9 +262,11 @@ Keys (mirroring less(1)):
                           it on; -N is kept for less(1) compatibility,
                           # is primary)
   r                       toggle the scrollbar (a column on the
-                          terminal's right edge marking your position,
-                          in both image and text mode) - on by default
-                          (--no-scrollbar to start it off)
+                          terminal's right edge marking your position
+                          in the whole document, in both image and text
+                          mode) - on by default (--no-scrollbar to
+                          start it off); click or drag it in the page
+                          image to move around
   /<regex> ENTER          search the whole document for <regex>
                           (a Python regex; falls back to a literal
                           substring if it isn't valid regex syntax)
@@ -2527,11 +2534,13 @@ def decode_sgr_mouse(seq):
     """Parse an SGR mouse-reporting sequence body (after ESC [), e.g.
     "<0;42;17M" - a left-button press at column 42, row 17 (both
     1-based, in terminal cells). Returns (kind, col, row) where kind is
-    "MOUSE_CLICK", "MOUSE_WHEEL_UP"/"MOUSE_WHEEL_DOWN", or
-    "MOUSE_BACK"/"MOUSE_FORWARD" (a mouse's side buttons, where it has
-    them - button 8/9 in the xterm protocol). Returns None for anything
-    else (button release, drag, a button not covered above) - those
-    aren't a recognized action here, and are ignored."""
+    "MOUSE_CLICK", "MOUSE_DRAG"/"MOUSE_RELEASE" (left button held and
+    moved, then let go - see MOUSE_ON's 1002),
+    "MOUSE_WHEEL_UP"/"MOUSE_WHEEL_DOWN", or "MOUSE_BACK"/"MOUSE_FORWARD"
+    (a mouse's side buttons, where it has them - button 8/9 in the xterm
+    protocol). Returns None for anything else (a button other than the
+    left one, a malformed sequence) - not a recognized action here, so
+    ignored."""
     if not seq.startswith("<") or seq[-1] not in "Mm":
         return None
     body, final = seq[1:-1], seq[-1]
@@ -2563,10 +2572,14 @@ def decode_sgr_mouse(seq):
         if final != "M":
             return None
         return ("MOUSE_WHEEL_DOWN" if cb & 1 else "MOUSE_WHEEL_UP"), cx, cy
-    if final != "M" or (cb & 0x20) or (cb & 3) != 0:
-        # final "m" is a release, bit 5 (0x20) is drag/motion, and
-        # (cb & 3) != 0 is a button other than the left one.
-        return None
+    if (cb & 3) != 0:
+        return None  # a button other than the left one
+    if final == "m":
+        # A release ends a drag (see Viewer.end_scrollbar_drag()); the
+        # motion bit may or may not still be set on it, so don't look.
+        return "MOUSE_RELEASE", cx, cy
+    if cb & 0x20:
+        return "MOUSE_DRAG", cx, cy  # bit 5 (0x20) is drag/motion
     return "MOUSE_CLICK", cx, cy
 
 
@@ -2741,7 +2754,7 @@ class Viewer:
     def __init__(
         self, files, file_index, page, tmpdir, fd, fit="width",
         border=True, wrap=True, eol_mark=True, line_numbers=False,
-        scrollbar=True, wheel_scroll_step=1,
+        scrollbar=True, wheel_scroll_step=2,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False,
     ):
@@ -2825,6 +2838,10 @@ class Viewer:
         # _line_number_gutter_width(); no per-kind default (unlike
         # border/wrap/eol_mark) since there's no kind numbering wouldn't
         # make sense for
+        self._scrollbar_drag = False  # a press landed on the scrollbar
+        # and the button hasn't come back up yet - see handle_drag()
+        self._scrollbar_drag_row = None  # its latest position, not acted
+        # on until flush_scrollbar_drag()
         self.scrollbar = scrollbar  # --no-scrollbar: a column on the
         # terminal's right edge showing scroll position - in both image
         # mode (_draw()) and text mode (_draw_text_wrapped()/
@@ -4028,12 +4045,20 @@ class Viewer:
                 ]
 
     def handle_click(self, col, row):
-        """A left-click at 1-based terminal cell (col, row): if it landed
-        on a PDF hyperlink in the currently displayed crop, follow it -
-        open a URL in the system browser, or jump to an internal link's
-        target page/position."""
+        """A left-click at 1-based terminal cell (col, row): on the
+        scrollbar, jump to the position it points at; otherwise, if it
+        landed on a PDF hyperlink in the currently displayed crop,
+        follow it - open a URL in the system browser, or jump to an
+        internal link's target page/position."""
         if self.text_mode or self.help_active or row >= self.rows:
             return  # row == self.rows is the status bar
+        # Any press starts a fresh gesture: one that lands on the
+        # scrollbar keeps following the pointer until the button comes
+        # back up (see handle_drag()), one anywhere else doesn't.
+        self._scrollbar_drag = bool(self.scrollbar and col == self.cols)
+        if self._scrollbar_drag:
+            self._jump_to_scrollbar_row(row)
+            return
         self._ensure_link_index()
         page_info = self._link_index[self.page - 1]
         if not page_info["links"] or not page_info["width_pt"] or not page_info["height_pt"]:
@@ -4068,6 +4093,57 @@ class Viewer:
                 best, best_area = link, area
         if best is not None:
             self._activate_link(best)
+
+    def handle_drag(self, row):
+        """Left-button motion, while a scrollbar drag is in progress -
+        i.e. the press that started it landed on the scrollbar (see
+        handle_click()); dragging anywhere else is left alone, so a
+        stray drag across the page image doesn't send it jumping.
+
+        Only records where the pointer is: acting on it costs a page
+        rasterize, and a drag arrives as a burst of motion events, so
+        flush_scrollbar_drag() applies the last one once the burst lets
+        up rather than walking every page in between. Returns whether
+        the drag was taken."""
+        if not self._scrollbar_drag or self.text_mode or self.help_active:
+            return False
+        self._scrollbar_drag_row = row
+        return True
+
+    def flush_scrollbar_drag(self):
+        """Act on the position handle_drag() last recorded, if any."""
+        if self._scrollbar_drag_row is None:
+            return
+        row = self._scrollbar_drag_row
+        self._scrollbar_drag_row = None
+        self._jump_to_scrollbar_row(row)
+
+    def end_scrollbar_drag(self):
+        """The button came back up - act on wherever it was let go."""
+        self.flush_scrollbar_drag()
+        self._scrollbar_drag = False
+
+    def _jump_to_scrollbar_row(self, row):
+        """Jump to wherever a click at `row` points on the scrollbar -
+        the clicked cell's own place in the track is read as where the
+        visible window should start, undoing what _scrollbar_fractions()
+        did to put the thumb there. Image mode only: mouse reporting
+        stays off in text mode so the terminal's own click-drag text
+        selection keeps working (see enter_text_mode())."""
+        avail_rows = max(1, self.rows - 1)
+        start_frac = max(0.0, min(1.0, (row - 1) / avail_rows))
+        # In "page units" - e.g. 3.5 is halfway down page 4 - so the
+        # page and the position within it fall out of the same number.
+        doc_pos = start_frac * max(1, self.npages)
+        page = max(1, min(self.npages, int(doc_pos) + 1))
+        within_frac = max(0.0, min(1.0, doc_pos - (page - 1)))
+        if page != self.page:
+            # Skipped when it's the page already showing, so a click
+            # that only scrolls doesn't re-center the horizontal pan
+            # the way _load_page() otherwise would.
+            self.go_page(page, 0)
+        self.scroll = max(0, min(self.scroll_max, round(within_frac * self.img.height)))
+        self.refresh()
 
     def handle_wheel(self, direction):
         """A scroll-wheel step: direction -1 (up) or +1 (down),
@@ -4478,7 +4554,7 @@ class Viewer:
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
     border=True, wrap=True, eol_mark=True, line_numbers=False, scrollbar=True,
-    follow=False, wheel_scroll_step=1, keep=False,
+    follow=False, wheel_scroll_step=2, keep=False,
     debug=False, office_render_scale=OFFICE_RENDER_SCALE,
     office_continuous=False,
 ):
@@ -4544,6 +4620,10 @@ def run_viewer(
             viewer.refresh()
             continue
         if not r:
+            # Nothing waiting - a good moment to act on a scrollbar drag
+            # whose motion events stopped without a release arriving
+            # (see the MOUSE_DRAG handling below); a no-op otherwise.
+            viewer.flush_scrollbar_drag()
             continue
         key = read_utf8_char(fd)
         if key is None:
@@ -4569,6 +4649,18 @@ def run_viewer(
                                     viewer.scroll_help(1)
                             elif kind == "MOUSE_CLICK":
                                 viewer.handle_click(mcol, mrow)
+                            elif kind == "MOUSE_DRAG":
+                                if viewer.handle_drag(mrow):
+                                    # A drag arrives as a burst of motion
+                                    # events, and acting on one costs a
+                                    # page rasterize - so let the burst
+                                    # drain first and only act on where
+                                    # the pointer actually ended up.
+                                    ready, _, _ = select.select([fd], [], [], 0)
+                                    if not ready:
+                                        viewer.flush_scrollbar_drag()
+                            elif kind == "MOUSE_RELEASE":
+                                viewer.end_scrollbar_drag()
                             elif kind == "MOUSE_WHEEL_UP":
                                 viewer.handle_wheel(-1)
                             elif kind == "MOUSE_WHEEL_DOWN":
@@ -4978,9 +5070,9 @@ def main():
              "same page and in the same mode",
     )
     parser.add_argument(
-        "--wheel-scroll-step", type=positive_int, default=1, metavar="N",
+        "--wheel-scroll-step", type=positive_int, default=2, metavar="N",
         help="scroll N lines per mouse wheel step, in the page image "
-             "(default: 1)",
+             "(default: %(default)s)",
     )
     args = parser.parse_args()
 
