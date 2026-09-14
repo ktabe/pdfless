@@ -30,15 +30,9 @@ and switch between them with `:n`/`:p`, `less(1)`-style.
 that same text mode and searchable the same way as a PDF's.)
 
 On macOS, with a local Chrome/Chromium install, `pdfless` can also open
-anything your Mac's Quick Look generators know how to preview — Word,
-Excel, PowerPoint, Keynote, Pages, and more — by rendering that Quick
-Look preview through a headless Chrome. A multi-page document (e.g.
-Word) is paged through with the same `n`/`p`/`g`/`G` keys as a PDF;
-a spreadsheet with more than one sheet is paged through the same way,
-one sheet per page. An RTF file is rendered the same way too (via a
-macOS `textutil` conversion first, since Quick Look has no HTML
-preview of its own for RTF), rather than only ever being shown as
-plain text.
+Word/Excel/PowerPoint/Keynote/Pages/RTF files and more — see
+[Office Document Support (Experimental)](#office-document-support-experimental)
+below.
 
 Since it's just a terminal program, it works the same way over SSH — no
 X11 forwarding, and no need to copy the PDF to your local machine first.
@@ -200,6 +194,35 @@ from a build script, a LaTeX watch loop, or a script re-rendering a PNG) —
 `pdfless` picks up each rebuild automatically, without losing your place.
 With multiple files open, it only watches whichever one is currently
 displayed, switching what it watches along with `:n`/`:p`.
+
+## Office Document Support (Experimental)
+
+On macOS, with a local Chrome/Chromium install, `pdfless` can also open
+anything your Mac's Quick Look generators know how to preview — Word,
+Excel, PowerPoint, Keynote, Pages, RTF, and more — by rendering that
+Quick Look preview through a headless Chrome instead of poppler/pypdf.
+This is experimental: unlike the PDF/image/text-file support above, it
+depends entirely on what each app's own Quick Look generator exposes,
+and that varies a lot from one format to the next — most noticeably in
+whether a multi-page/multi-sheet/multi-slide document can actually be
+paged through, or only ever shown as one long continuously-scrollable
+image (the same as a plain image file, and the same as `-c`/`--continuous`
+forces for any of these).
+
+| Format | Extensions | Paging | Notes |
+| --- | --- | --- | --- |
+| Word | `.doc`, `.docx` | Always continuous | No page-boundary marker in Word's Quick Look preview |
+| Excel | `.xls`, `.xlsx` | One page per sheet | |
+| PowerPoint | `.ppt`, `.pptx` | One page per slide | The most reliably paginated of any format here |
+| RTF | `.rtf` | Always continuous | Converted to `.docx` via macOS's own `textutil` first (Quick Look has no HTML preview of its own for RTF), then rendered the same way as Word |
+| Pages | `.pages` | Always continuous | Same limitation as Word - no page-boundary marker |
+| Numbers | `.numbers` | Only the first sheet is shown | Numbers' Quick Look tab strip is marked up differently from Excel's and isn't recognized yet - a known gap, not a deliberate design choice |
+| Keynote | `.key` | Always continuous | Unlike PowerPoint, Keynote's Quick Look preview exposes no slide-boundary marker at all - a known gap |
+
+A file in any of these formats is skipped with a warning if `qlmanage`
+or a local Chrome/Chromium isn't available. `-s`/`--rendering-scale`
+controls how sharp the rendered pages look when zoomed in; see
+[Usage](#usage) for both options.
 
 ## Keys
 
