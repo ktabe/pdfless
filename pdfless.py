@@ -4385,21 +4385,13 @@ def main():
         "-s", "--rendering-scale", type=float, default=OFFICE_RENDER_SCALE, metavar="N",
         help="device-pixel-ratio to render Quick Look preview files "
              "(Word/Excel/PowerPoint/etc., macOS only) at - higher looks "
-             "sharper when zoomed in but is slower to render, especially "
-             "for a document with many pages/slides (default: %(default)s)",
+             "sharper when zoomed in but is slower to render (default: %(default)s)",
     )
     parser.add_argument(
         "-c", "--continuous",
         action="store_true",
-        help="for a Quick Look preview file (Word/Excel/PowerPoint/etc., "
-             "macOS only), always scroll through it continuously instead "
-             "of splitting it into pages/slides, the same as a plain "
-             "image file. By default this already happens automatically "
-             "whenever the page/slide boundary can't be determined with "
-             "confidence (most reliable for PowerPoint; other formats "
-             "vary); this forces it even for a file that would otherwise "
-             "paginate, at the cost of not being able to jump straight "
-             "to page/slide N",
+        help="for a Quick Look preview file (macOS only), force continuous "
+             "scrolling instead of paginating",
     )
     parser.add_argument(
         "-k", "--keep",

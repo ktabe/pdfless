@@ -160,12 +160,10 @@ options:
   -s, --rendering-scale N
                         device-pixel-ratio to render Quick Look preview files
                         (Word/Excel/PowerPoint/etc., macOS only) at - higher
-                        looks sharper when zoomed in but is slower to render,
-                        especially for a document with many pages/slides
+                        looks sharper when zoomed in but is slower to render
                         (default: 1)
   -c, --continuous      for a Quick Look preview file (macOS only), force
-                        continuous scrolling instead of paginating - see
-                        Office Document Support (Experimental) below
+                        continuous scrolling instead of paginating
   -k, --keep            leave the last page on screen when quitting (q or ^C)
                         instead of restoring the terminal screen
   -h, --fit-height      fit each page to the terminal's full height instead of
