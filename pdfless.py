@@ -2713,10 +2713,11 @@ class Viewer:
         self.text_x_offset_min = 0
         self.text_x_offset_max = 0
         self.text_max_line_width = 0
-        self.text_frame = frame  # border around the page's edges, in
-        # text mode; can be swept up along with the text if you
-        # select-and-copy it, so it's toggled off with --no-frame or
-        # the f key
+        self.frame_default = frame  # --no-frame, as given on the command line
+        self.text_frame = self._default_text_frame()  # border around the
+        # page's edges, in text mode; can be swept up along with the text
+        # if you select-and-copy it, so it's toggled off with --no-frame
+        # (or on/off any time with the f key) - see _default_text_frame()
         self._last_viewport_w = 0
         self._last_viewport_h = 0
         self._last_viewport_set = False
@@ -2800,6 +2801,7 @@ class Viewer:
         self._history_back = []
         self._history_forward = []
         self.text_mode = self.kind == "text"
+        self.text_frame = self._default_text_frame()
         # Mouse reporting is only useful in the page image (clicking
         # hyperlinks, wheel scroll); off in any kind of text view, the
         # same as enter_text_mode()/exit_text_mode() do for a PDF's `t`
@@ -2991,6 +2993,17 @@ class Viewer:
     def toggle_text_frame(self):
         self.text_frame = not self.text_frame
         self._clamp_text_scroll()
+
+    def _default_text_frame(self):
+        """Whether text mode's border should be on by default for the
+        current file - always off for a plain text file (kind=="text"),
+        regardless of --no-frame, since there's usually no real "page"
+        boundary in one worth framing; otherwise whatever --no-frame
+        asked for (self.frame_default), same as before - e.g. for a PDF
+        or a Quick Look preview file (Word/RTF/etc.), only relevant once
+        switched into text mode with 't'. The f key can still toggle
+        either way, on top of this default."""
+        return False if self.kind == "text" else self.frame_default
 
     def _clamp_text_scroll(self):
         # The border sits at the page's actual edges - one row above the
@@ -4371,7 +4384,9 @@ def main():
         dest="frame",
         default=True,
         help="don't draw a border around the page's edges in text mode "
-             "(t); on by default, toggle any time with f",
+             "(t); on by default (except for a plain text file, where "
+             "it's off by default regardless of this), toggle any time "
+             "with f",
     )
     parser.add_argument(
         "-F", "--follow",
