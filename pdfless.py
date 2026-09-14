@@ -517,76 +517,6 @@ def find_chrome():
     return None
 
 
-def generate_ql_preview(path, tmpdir, debug=False):
-    """Ask Quick Look for an HTML preview of `path` via `qlmanage -p`.
-    Returns (html_path, width, height, should_not_scale,
-    page_element_xpath) - width/height are None if the plist didn't
-    have them, page_element_xpath is None if it has no
-    "PageElementXPath" (meaning this document has no distinct
-    page/slide elements to speak of - e.g. Word's continuously-flowing
-    text) - or None if qlmanage isn't available, has no generator for
-    this file, or produced nothing.
-
-    With debug=True (-d/--debug), a `qlmanage` that crashed or exited
-    non-zero is reported to stderr - this isn't rare: buggy third-party
-    (or even Apple's own) Quick Look generators can crash qlmanage
-    outright (e.g. an uncaught NSException, seen in the wild for some
-    .odt files) rather than just fail to produce a preview, and without
-    this it's indistinguishable from "no generator for this file at
-    all", which looks identical from here (no Preview.html either way)."""
-    if shutil.which("qlmanage") is None:
-        return None
-    outdir = tempfile.mkdtemp(dir=tmpdir, prefix="qlpreview-")
-    name = os.path.basename(path)
-    try:
-        result = subprocess.run(
-            ["qlmanage", "-o", outdir, "-p", path],
-            capture_output=True, timeout=30,
-        )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        if debug:
-            print(
-                f"pdfless: [debug] {name}: qlmanage failed to run: {e}",
-                file=sys.stderr, end="\r\n",
-            )
-        return None
-    bundle = os.path.join(outdir, f"{os.path.basename(path)}.qlpreview")
-    html_path = os.path.join(bundle, "Preview.html")
-    if not os.path.isfile(html_path):
-        if debug and result.returncode != 0:
-            # A negative code means killed by that signal (e.g. -6/SIGABRT
-            # for an uncaught Objective-C exception) - qlmanage itself
-            # crashed, not just "no generator for this file".
-            how = (
-                f"crashed (signal {-result.returncode})"
-                if result.returncode < 0
-                else f"exited with status {result.returncode}"
-            )
-            stderr_lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
-            detail = f" - {stderr_lines[0]}" if stderr_lines else ""
-            print(
-                f"pdfless: [debug] {name}: qlmanage {how}{detail}",
-                file=sys.stderr, end="\r\n",
-            )
-        return None
-
-    width = height = page_element_xpath = None
-    should_not_scale = False
-    plist_path = os.path.join(bundle, "PreviewProperties.plist")
-    try:
-        with open(plist_path, "rb") as f:
-            props = plistlib.load(f)
-        raw_width, raw_height = props.get("Width"), props.get("Height")
-        # Chrome's --window-size silently falls back to a default size if
-        # given a float (e.g. "637.0,792.0") rather than plain integers -
-        # the plist's numbers are often floats, so round them here.
-        width = round(raw_width) if raw_width else None
-        height = round(raw_height) if raw_height else None
-        should_not_scale = bool(props.get("ShouldNotScale"))
-        page_element_xpath = props.get("PageElementXPath") or None
-    except (OSError, ValueError):
-        pass
-    return html_path, width, height, should_not_scale, page_element_xpath
 
 
 _IMG_SRC_RE = re.compile(r'(<img\b[^>]*\bsrc=")([^"]+)(")', re.IGNORECASE)
@@ -956,7 +886,7 @@ def _trim_trailing_blank_rows(img, bg_color):
 
 
 def _build_slide_measure_script(page_element_xpath):
-    """The plist's own "PageElementXPath" (see generate_ql_preview()) is
+    """The plist's own "PageElementXPath" (see OfficeDocument._generate_ql_preview()) is
     exactly what selects each page/slide's top-level element for this
     particular generator - Office.qlgenerator (Word/PowerPoint) says
     "/html/body/div", iWork.qlgenerator (Keynote) says
@@ -1043,7 +973,7 @@ def _detect_fallback_page_xpath(content):
 
 def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
     """For a document whose Quick Look preview has distinct page/slide
-    elements (see generate_ql_preview()'s page_element_xpath - Word's
+    elements (see OfficeDocument._generate_ql_preview()'s page_element_xpath - Word's
     continuously-flowing text has none, so this is never called for
     that), ask Chrome for the exact pixel boundary between each one, via
     a small script injected into a scratch copy of the HTML and read
@@ -1472,34 +1402,6 @@ def is_rtf_file(path):
             return f.read(6) == b"{\\rtf1"
     except OSError:
         return False
-
-
-def _rtf_to_docx(path, tmpdir):
-    """Convert an RTF file to .docx via macOS's own `textutil`, so it
-    can be handled through the same Office/Quick Look + Chrome pipeline
-    as a native Word document (formatting - bold/italic/color/fonts,
-    verified by hand - survives the round trip reasonably well; a table
-    degrades to plain concatenated text, a known limitation left as-is).
-    This is needed because RTF's own Quick Look preview is just a
-    redirect back to the original file (a Preview.url), not an HTML
-    bundle - see is_rtf_file() and RtfOfficeDocument.
-
-    Returns the converted file's path, or None if textutil isn't
-    available or the conversion failed. Always reconverts (rather than
-    reusing a previous run's output) so a changed source file (e.g.
-    -F/--follow) can't leave a stale docx behind."""
-    if shutil.which("textutil") is None:
-        return None
-    tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
-    out_path = os.path.join(tmpdir, f"rtf-as-docx-{tag}.docx")
-    try:
-        subprocess.run(
-            ["textutil", "-convert", "docx", "-output", out_path, path],
-            capture_output=True, check=True, timeout=20,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-        return None
-    return out_path if os.path.isfile(out_path) else None
 
 
 def read_plain_text_lines(path, tab_width=8):
@@ -2085,6 +1987,84 @@ class OfficeDocument(DocumentHandler):
         return cls(path) if cls._probe_preview(path, tmpdir, debug=debug) else None
 
     @staticmethod
+    def _generate_ql_preview(path, tmpdir, debug=False):
+        """Ask Quick Look for an HTML preview of `path` via
+        `qlmanage -p`. Returns (html_path, width, height,
+        should_not_scale, page_element_xpath) - width/height are None
+        if the plist didn't have them, page_element_xpath is None if it
+        has no "PageElementXPath" (meaning this document has no
+        distinct page/slide elements to speak of - e.g. Word's
+        continuously-flowing text) - or None if qlmanage isn't
+        available, has no generator for this file, or produced
+        nothing. `path` isn't necessarily self.path (see
+        RtfOfficeDocument, which previews a converted .docx instead),
+        so this is a staticmethod rather than reading self.path.
+
+        With debug=True (-d/--debug), a `qlmanage` that crashed or
+        exited non-zero is reported to stderr - this isn't rare: buggy
+        third-party (or even Apple's own) Quick Look generators can
+        crash qlmanage outright (e.g. an uncaught NSException, seen in
+        the wild for some .odt files) rather than just fail to produce
+        a preview, and without this it's indistinguishable from "no
+        generator for this file at all", which looks identical from
+        here (no Preview.html either way)."""
+        if shutil.which("qlmanage") is None:
+            return None
+        outdir = tempfile.mkdtemp(dir=tmpdir, prefix="qlpreview-")
+        name = os.path.basename(path)
+        try:
+            result = subprocess.run(
+                ["qlmanage", "-o", outdir, "-p", path],
+                capture_output=True, timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            if debug:
+                print(
+                    f"pdfless: [debug] {name}: qlmanage failed to run: {e}",
+                    file=sys.stderr, end="\r\n",
+                )
+            return None
+        bundle = os.path.join(outdir, f"{os.path.basename(path)}.qlpreview")
+        html_path = os.path.join(bundle, "Preview.html")
+        if not os.path.isfile(html_path):
+            if debug and result.returncode != 0:
+                # A negative code means killed by that signal (e.g.
+                # -6/SIGABRT for an uncaught Objective-C exception) -
+                # qlmanage itself crashed, not just "no generator for
+                # this file".
+                how = (
+                    f"crashed (signal {-result.returncode})"
+                    if result.returncode < 0
+                    else f"exited with status {result.returncode}"
+                )
+                stderr_lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
+                detail = f" - {stderr_lines[0]}" if stderr_lines else ""
+                print(
+                    f"pdfless: [debug] {name}: qlmanage {how}{detail}",
+                    file=sys.stderr, end="\r\n",
+                )
+            return None
+
+        width = height = page_element_xpath = None
+        should_not_scale = False
+        plist_path = os.path.join(bundle, "PreviewProperties.plist")
+        try:
+            with open(plist_path, "rb") as f:
+                props = plistlib.load(f)
+            raw_width, raw_height = props.get("Width"), props.get("Height")
+            # Chrome's --window-size silently falls back to a default
+            # size if given a float (e.g. "637.0,792.0") rather than
+            # plain integers - the plist's numbers are often floats, so
+            # round them here.
+            width = round(raw_width) if raw_width else None
+            height = round(raw_height) if raw_height else None
+            should_not_scale = bool(props.get("ShouldNotScale"))
+            page_element_xpath = props.get("PageElementXPath") or None
+        except (OSError, ValueError):
+            pass
+        return html_path, width, height, should_not_scale, page_element_xpath
+
+    @staticmethod
     def _probe_preview(path, tmpdir, debug=False):
         """Cheaply check whether `path` is something this Mac's Quick
         Look generators can preview at all (Word, Excel, PowerPoint,
@@ -2098,10 +2078,10 @@ class OfficeDocument(DocumentHandler):
         this can't be a normal instance method.
 
         debug=True (-d/--debug) reports a crashed/failing qlmanage -
-        see generate_ql_preview()."""
+        see _generate_ql_preview()."""
         if find_chrome() is None:
             return False
-        return generate_ql_preview(path, tmpdir, debug=debug) is not None
+        return OfficeDocument._generate_ql_preview(path, tmpdir, debug=debug) is not None
 
     def _render_error_placeholder(self, tmpdir, message):
         """A single-page fallback for when _render_office_pages()
@@ -2207,7 +2187,7 @@ class OfficeDocument(DocumentHandler):
 
             progress.update(f"{name}: reading Quick Look preview...")
             with _DebugTimer(debug, f"{name}: qlmanage preview"):
-                preview = generate_ql_preview(path, tmpdir, debug=debug)
+                preview = self._generate_ql_preview(path, tmpdir, debug=debug)
             if preview is None:
                 return None
             html_path, width, height, should_not_scale, page_element_xpath = preview
@@ -2322,11 +2302,39 @@ class RtfOfficeDocument(OfficeDocument):
     HANDLER_CLASSES) - falls through to it if textutil isn't available
     or qlmanage can't preview the converted .docx for some reason."""
 
+    @staticmethod
+    def _rtf_to_docx(path, tmpdir):
+        """Convert an RTF file to .docx via macOS's own `textutil`, so
+        it can be handled through the same Office/Quick Look + Chrome
+        pipeline as a native Word document (formatting - bold/italic/
+        color/fonts, verified by hand - survives the round trip
+        reasonably well; a table degrades to plain concatenated text, a
+        known limitation left as-is). `path` isn't necessarily
+        self.path (sniff() converts before an instance even exists), so
+        this is a staticmethod.
+
+        Returns the converted file's path, or None if textutil isn't
+        available or the conversion failed. Always reconverts (rather
+        than reusing a previous run's output) so a changed source file
+        (e.g. -F/--follow) can't leave a stale docx behind."""
+        if shutil.which("textutil") is None:
+            return None
+        tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        out_path = os.path.join(tmpdir, f"rtf-as-docx-{tag}.docx")
+        try:
+            subprocess.run(
+                ["textutil", "-convert", "docx", "-output", out_path, path],
+                capture_output=True, check=True, timeout=20,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return None
+        return out_path if os.path.isfile(out_path) else None
+
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
         if not is_rtf_file(path):
             return None
-        docx_path = _rtf_to_docx(path, tmpdir)
+        docx_path = cls._rtf_to_docx(path, tmpdir)
         if docx_path is None:
             return None
         if not cls._probe_preview(docx_path, tmpdir, debug=debug):
@@ -2337,7 +2345,7 @@ class RtfOfficeDocument(OfficeDocument):
         self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
         progress=None, continuous=False,
     ):
-        docx_path = _rtf_to_docx(self.path, tmpdir)
+        docx_path = self._rtf_to_docx(self.path, tmpdir)
         if docx_path is None:
             return None
         # Always continuous, regardless of the caller's -c/--continuous
