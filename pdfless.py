@@ -1144,47 +1144,6 @@ def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
         return None
 
 
-def _probe_office_preview(path, tmpdir, debug=False):
-    """Cheaply check whether `path` is something this Mac's Quick Look
-    generators can preview at all (Word, Excel, PowerPoint, Keynote,
-    Pages, ...) - i.e. whether OfficeDocument._render_office_pages() has any chance of
-    working - without doing that function's expensive part (the actual
-    Chrome rendering). Used to decide whether to accept the file at all
-    (main()) without paying for a render that may never be looked at:
-    with multiple files given on the command line, each office-kind one
-    is only actually rendered once it's displayed - see
-    Viewer._ensure_office_pages().
-
-    debug=True (-d/--debug) reports a crashed/failing qlmanage - see
-    generate_ql_preview()."""
-    if find_chrome() is None:
-        return False
-    return generate_ql_preview(path, tmpdir, debug=debug) is not None
-
-
-def _render_office_error_placeholder(path, tmpdir, message):
-    """A single-page fallback for when OfficeDocument._render_office_pages() succeeds
-    at _probe_office_preview() time (qlmanage has a generator for this
-    file) but then fails for real later (e.g. Chrome crashes or times
-    out on this particular render) - rendering happening lazily, on
-    first display rather than upfront, means a failure here can't just
-    fall back to skipping the file the way main() does for one that
-    never looked previewable in the first place. Returns a one-item
-    list of PNG paths, the same shape OfficeDocument._render_office_pages() itself
-    returns on success, so callers don't need to special-case this."""
-    from PIL import ImageDraw
-
-    img = Image.new("RGB", (900, 200), "white")
-    draw = ImageDraw.Draw(img)
-    draw.text((20, 20), f"could not render {os.path.basename(path)}", fill="black")
-    draw.text((20, 50), message, fill="black")
-    out_path = os.path.join(
-        tmpdir, f"office-error-{hashlib.md5(path.encode('utf-8', 'surrogateescape')).hexdigest()[:12]}.png"
-    )
-    img.save(out_path)
-    return [out_path]
-
-
 def _slice_and_save_pages(trimmed, bounds, tmpdir, tag):
     """Crop `trimmed` at each consecutive pair in `bounds` (a list of Y
     pixel offsets, first always 0, last always trimmed.height) and save
@@ -2123,7 +2082,50 @@ class OfficeDocument(DocumentHandler):
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
-        return cls(path) if _probe_office_preview(path, tmpdir, debug=debug) else None
+        return cls(path) if cls._probe_preview(path, tmpdir, debug=debug) else None
+
+    @staticmethod
+    def _probe_preview(path, tmpdir, debug=False):
+        """Cheaply check whether `path` is something this Mac's Quick
+        Look generators can preview at all (Word, Excel, PowerPoint,
+        Keynote, Pages, ...) - i.e. whether _render_office_pages() has
+        any chance of working - without doing that method's expensive
+        part (the actual Chrome rendering). Used by sniff() (main()'s
+        classification, so a file that will never be looked at doesn't
+        pay for a render - see Viewer._ensure_office_pages()) - `path`
+        isn't necessarily what self.path will end up being (see
+        RtfOfficeDocument.sniff(), which probes a converted .docx), so
+        this can't be a normal instance method.
+
+        debug=True (-d/--debug) reports a crashed/failing qlmanage -
+        see generate_ql_preview()."""
+        if find_chrome() is None:
+            return False
+        return generate_ql_preview(path, tmpdir, debug=debug) is not None
+
+    def _render_error_placeholder(self, tmpdir, message):
+        """A single-page fallback for when _render_office_pages()
+        succeeds at sniff()/_probe_preview() time (qlmanage has a
+        generator for this file) but then fails for real later (e.g.
+        Chrome crashes or times out on this particular render) -
+        rendering happening lazily, on first display rather than
+        upfront, means a failure here can't just fall back to skipping
+        the file the way main() does for one that never looked
+        previewable in the first place. Returns a one-item list of PNG
+        paths, the same shape _render_office_pages() itself returns on
+        success, so callers don't need to special-case this."""
+        from PIL import ImageDraw
+
+        img = Image.new("RGB", (900, 200), "white")
+        draw = ImageDraw.Draw(img)
+        draw.text((20, 20), f"could not render {os.path.basename(self.path)}", fill="black")
+        draw.text((20, 50), message, fill="black")
+        out_path = os.path.join(
+            tmpdir,
+            f"office-error-{hashlib.md5(self.path.encode('utf-8', 'surrogateescape')).hexdigest()[:12]}.png",
+        )
+        img.save(out_path)
+        return [out_path]
 
     def page_count(self):
         return None
@@ -2327,7 +2329,7 @@ class RtfOfficeDocument(OfficeDocument):
         docx_path = _rtf_to_docx(path, tmpdir)
         if docx_path is None:
             return None
-        if not _probe_office_preview(docx_path, tmpdir, debug=debug):
+        if not cls._probe_preview(docx_path, tmpdir, debug=debug):
             return None
         return cls(path)
 
@@ -2797,9 +2799,8 @@ class Viewer:
             continuous=self.office_continuous,
         )
         if not pages:
-            pages = _render_office_error_placeholder(
-                self.pdf_path, self.tmpdir,
-                "Quick Look rendering failed - see -d/--debug for details",
+            pages = self.doc_handler._render_error_placeholder(
+                self.tmpdir, "Quick Look rendering failed - see -d/--debug for details",
             )
             self.doc_handler.pages = pages  # remember the placeholder too - don't retry every revisit
         self.npages = len(pages)
