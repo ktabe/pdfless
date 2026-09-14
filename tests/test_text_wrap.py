@@ -133,3 +133,49 @@ def test_go_to_text_line_lands_on_correct_display_row_when_wrapped(tmp_path):
 
 def make_long_words_line(n_words):
     return " ".join(f"word{i}" for i in range(n_words))
+
+
+def test_search_match_scrolls_to_correct_display_row_when_wrapped(tmp_path):
+    """Regression check: _goto_search_match() (N/P, and start_search()'s
+    own initial jump) must convert a raw line index into a display-row
+    scroll target the same way _scroll_text_to_match() already does -
+    not use the raw line index directly as text_scroll, which means
+    something different once wrapped (a _display_rows index). Many
+    long, heavily-wrapped lines before the match push its display row
+    far enough past its raw line index that the two can't
+    coincidentally agree after clamping - a short terminal (fewer rows
+    than the wrapped document) is needed too, or the whole thing fits
+    on screen at once and any target scroll clamps down to the same 0."""
+    path = tmp_path / "mixed.txt"
+    lines = [make_long_words_line(30) for _ in range(20)] + ["needle here"]
+    path.write_text("\n".join(lines) + "\n")
+    _master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 15, 40, 320, 240))
+    tmpdir = tempfile.mkdtemp()
+    viewer = pdfless.Viewer(
+        [pdfless.TextDocument(str(path))], 0, 1, tmpdir, slave, None, wrap=True,
+    )
+    viewer._load_page = lambda: None
+    viewer._draw = lambda: None
+    viewer.refresh()
+    viewer._ensure_display_rows()
+    match_line_idx = 20
+    assert viewer._row_for_line(match_line_idx) > match_line_idx + 10  # wrapping
+    # really did push the display row well past the raw line index here
+    assert viewer.text_scroll_max > 10  # the document doesn't fit on
+    # screen at once, so a wrong vs. right scroll target can actually differ
+
+    viewer.start_search("needle")
+    assert viewer.search_matches == [(match_line_idx, 0, 6)]
+
+    expected_row = viewer._row_for_line(match_line_idx)
+    margin = viewer._text_avail_rows() // 4
+    expected_scroll = max(
+        viewer.text_scroll_min, min(viewer.text_scroll_max, expected_row - margin)
+    )
+    wrong_scroll_using_raw_line_idx = max(
+        viewer.text_scroll_min, min(viewer.text_scroll_max, match_line_idx - margin)
+    )
+    assert expected_scroll != wrong_scroll_using_raw_line_idx  # a real regression
+    # would actually go undetected below
+    assert viewer.text_scroll == expected_scroll

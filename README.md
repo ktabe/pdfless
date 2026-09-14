@@ -143,7 +143,7 @@ python3 pdfless.py some.pdf
 
 ```
 usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [-B] [-S]
-               [-E] [-F] [--wheel-scroll-step N]
+               [-E] [-N] [-F] [--wheel-scroll-step N]
                file [file ...]
 
 positional arguments:
@@ -181,6 +181,9 @@ options:
                         shown by default (regardless of -S/--chop-long-
                         lines) to tell a genuine line ending apart from
                         where wrapping/panning simply ran out of room
+  -N, --line-numbers    show line numbers in text mode, less(1)-style -
+                        off by default; toggle any time with # (or -N,
+                        kept for less(1) compatibility)
   -F, --follow          watch the file and reload it if it changes on disk
                         (checked every 3s), staying on the same page and in
                         the same mode
@@ -282,6 +285,7 @@ Misc:
 | `B` | (text mode) toggle a border around the page's edges - on by default (`--no-border`/`-B` to start with it off); a plain text file starts with it off regardless, since there's usually no real "page" boundary in one worth bordering; no border while wrapped, regardless of `B` (`-S` to unwrap first) |
 | `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped); no border while wrapped, regardless of `B`. `s` is the primary key; `-S` (`less(1)`-style) is kept only for compatibility |
 | `e` | (text mode) toggle marking a real end-of-line (↵), whether wrapped or panned, as opposed to where the terminal width simply cut a long line off - on by default (`-E`/`--no-eol-mark` to start without it) |
+| `#` / `-N` | (text mode) toggle a right-aligned, gray line-number gutter - off by default (`-N`/`--line-numbers` to start with it on). `#` is the primary key; `-N` (`less(1)`-style) is kept only for compatibility |
 | `^L` | redraw the screen |
 | `?` | show a keybinding help box (`q` to close it) |
 | `q` / `^C` | quit |

@@ -90,6 +90,11 @@ SEARCH_MARKER_RESET = "\x1b[0m"
 NEWLINE_MARKER = "↵"
 NEWLINE_MARKER_COLOR = "\x1b[34m"  # blue
 NEWLINE_MARKER_RESET = "\x1b[0m"
+
+# -N/--line-numbers: a right-aligned gutter at the start of each text-mode
+# row (see Viewer._line_number_gutter_width()).
+LINE_NUMBER_COLOR = "\x1b[90m"  # gray
+LINE_NUMBER_RESET = "\x1b[0m"
 CACHE_SIZE = 6
 
 # SGR mouse reporting (buttons + motion, extended coordinates): only
@@ -238,6 +243,10 @@ Keys (mirroring less(1)):
   e                       (text mode) toggle marking a real end-of-line
                           (↵) - on by default (-E/--no-eol-mark to
                           start without it)
+  # / -N                  (text mode) toggle a line-number gutter - off
+                          by default (-N/--line-numbers to start with
+                          it on; -N is kept for less(1) compatibility,
+                          # is primary)
   /<regex> ENTER          search the whole document for <regex>
                           (a Python regex; falls back to a literal
                           substring if it isn't valid regex syntax)
@@ -2718,7 +2727,8 @@ class EncodeCache:
 class Viewer:
     def __init__(
         self, files, file_index, page, tmpdir, fd, fit="width",
-        border=True, wrap=True, eol_mark=True, wheel_scroll_step=1,
+        border=True, wrap=True, eol_mark=True, line_numbers=False,
+        wheel_scroll_step=1,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False,
     ):
@@ -2797,6 +2807,11 @@ class Viewer:
         self._display_rows = None  # lazily built by _ensure_display_rows(),
         # only while text_wrap is on - [(line_idx, start, end), ...], one
         # entry per on-screen row
+        self.line_numbers = line_numbers  # -N/--line-numbers: right-
+        # aligned gutter at the start of each row - see
+        # _line_number_gutter_width(); no per-kind default (unlike
+        # border/wrap/eol_mark) since there's no kind numbering wouldn't
+        # make sense for
         self._last_viewport_w = 0
         self._last_viewport_h = 0
         self._last_viewport_set = False
@@ -3102,14 +3117,33 @@ class Viewer:
         self._clamp_text_scroll()
 
     def toggle_eol_mark(self):
-        """Switches NEWLINE_MARKER on/off - the less(1)-style "-E"
-        runtime toggle (see run_viewer()'s dash_pending handling), same
-        idea as "-S" for text_wrap. text_max_line_width/_display_rows
-        both reserve a column for the marker only while it's on, so
-        both need recomputing here."""
+        """Switches NEWLINE_MARKER on/off - bound to "e" (see
+        handle_key_text()). text_max_line_width/_display_rows both
+        reserve a column for the marker only while it's on, so both
+        need recomputing here."""
         self.eol_mark = not self.eol_mark
         self._display_rows = None
         self._clamp_text_scroll()
+
+    def toggle_line_numbers(self):
+        """Switches the -N/--line-numbers gutter on/off - "#" (see
+        handle_key_text()), or "-N"/"-n" (less(1)-style, see
+        run_viewer()'s dash_pending). Its width changes what's left for
+        content, so both scroll bounds (_clamp_text_scroll()) and
+        wrapped segments (_display_rows) need recomputing."""
+        self.line_numbers = not self.line_numbers
+        self._display_rows = None
+        self._clamp_text_scroll()
+
+    def _line_number_gutter_width(self):
+        """Columns reserved for the -N gutter - 0 when it's off. Right-
+        aligned digits sized to the largest line number currently in
+        self.text_lines (a PDF's per-page text, or the whole document
+        for anything else - see _load_text_page()), plus one separator
+        column."""
+        if not self.line_numbers or not self.text_lines:
+            return 0
+        return len(str(len(self.text_lines))) + 1
 
     def _default_text_wrap(self):
         """Whether text mode should default to wrapping long lines for
@@ -3164,7 +3198,9 @@ class Viewer:
             self.text_scroll_min, min(self.text_scroll, self.text_scroll_max)
         )
 
-        avail_cols = self._text_avail_cols()
+        # The -N gutter (if on) lives outside this space entirely - see
+        # _draw_text_unwrapped() - so the "page" is narrower by that much.
+        avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
         self.text_max_line_width = max(
             (display_width(l) for l in self.text_lines), default=0
         )
@@ -3288,7 +3324,7 @@ class Viewer:
         view (the text-mode equivalent of _scroll_image_to_match()).
         Wrapped text has no pan to speak of - _row_for_line() converts
         the raw line position into a display-row scroll target instead."""
-        avail_cols = self._text_avail_cols()
+        avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
         highlight = self._text_highlight_for_match(match)
         if highlight:
             line_idx, start, end = highlight
@@ -3407,8 +3443,13 @@ class Viewer:
         # One column held back for the real-newline marker (see
         # _draw_text_wrapped()), if it's on - reserved on every row, not
         # just one that ends up actually drawing it, so the marker never
-        # has to compete with content for the same column.
-        width = self._text_avail_cols() - (1 if self.eol_mark else 0)
+        # has to compete with content for the same column. The -N gutter
+        # (if on) is held back the same way, drawn outside this width.
+        width = (
+            self._text_avail_cols()
+            - (1 if self.eol_mark else 0)
+            - self._line_number_gutter_width()
+        )
         width = max(1, width)
         rows = []
         for i, line in enumerate(self.text_lines):
@@ -3443,6 +3484,7 @@ class Viewer:
 
         out = [STATUS_COLOR_OFF, "\x1b[H\x1b[2J"]
         n_rows = len(self._display_rows)
+        gutter_width = self._line_number_gutter_width()
 
         for i in range(avail_rows):
             virtual_row = self.text_scroll + i
@@ -3452,6 +3494,16 @@ class Viewer:
 
             line_idx, start, end = self._display_rows[virtual_row]
             rendered = self.text_lines[line_idx][start:end]
+
+            if gutter_width:
+                # Only the line's first display row gets a number - a
+                # wrapped continuation row (start != 0) stays blank.
+                if start == 0:
+                    num = str(line_idx + 1).rjust(gutter_width - 1)
+                    gutter_text = LINE_NUMBER_COLOR + num + " " + LINE_NUMBER_RESET
+                else:
+                    gutter_text = " " * gutter_width
+                out.append(f"\x1b[{screen_row};1H{gutter_text}")
 
             if highlight and highlight[0] == line_idx:
                 # start/end are character offsets into the raw line;
@@ -3474,7 +3526,7 @@ class Viewer:
                 # happened to cut it - see NEWLINE_MARKER.
                 rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
 
-            out.append(f"\x1b[{screen_row};1H{rendered}")
+            out.append(f"\x1b[{screen_row};{gutter_width + 1}H{rendered}")
 
         out.append(self.format_status())
         sys.stdout.write("".join(out))
@@ -3490,7 +3542,12 @@ class Viewer:
         # row below independently figures out which of border/content/
         # nothing falls at its current position.
         avail_rows = self._text_avail_rows()
-        avail_cols = self._text_avail_cols()
+        # The -N gutter (if on) lives outside this whole border/pan
+        # space, in columns of its own - the "page" here is simply
+        # narrower by that much, same as the border/content geometry
+        # below never needs to know it exists.
+        gutter_width = self._line_number_gutter_width()
+        avail_cols = max(1, self._text_avail_cols() - gutter_width)
         if not self.doc_handler.text_mode_is_paginated():
             # No PDF page/bbox structure to reconcile against here - the
             # match tuple already is (line_idx, start, end), exactly
@@ -3518,6 +3575,14 @@ class Viewer:
             virtual_row = self.text_scroll + i
             screen_row = i + 1
 
+            if gutter_width:
+                if 0 <= virtual_row < len(self.text_lines):
+                    num = str(virtual_row + 1).rjust(gutter_width - 1)
+                    gutter_text = LINE_NUMBER_COLOR + num + " " + LINE_NUMBER_RESET
+                else:
+                    gutter_text = " " * gutter_width  # border row, or off the page
+                out.append(f"\x1b[{screen_row};1H{gutter_text}")
+
             if self.text_border and virtual_row in (-1, len(self.text_lines)):
                 line_start = max(0, left_col)
                 line_end = min(avail_cols - 1, right_col)
@@ -3528,7 +3593,7 @@ class Viewer:
                     chars[0] = "┌" if virtual_row == -1 else "└"
                 if right_visible:
                     chars[-1] = "┐" if virtual_row == -1 else "┘"
-                out.append(f"\x1b[{screen_row};{line_start + 1}H{''.join(chars)}")
+                out.append(f"\x1b[{screen_row};{line_start + 1 + gutter_width}H{''.join(chars)}")
                 continue
 
             if not (0 <= virtual_row < len(self.text_lines)):
@@ -3592,7 +3657,7 @@ class Viewer:
             parts.append(rendered)
             if right_visible:
                 parts.append("│")
-            start_col = (left_col if left_visible else content_start) + 1
+            start_col = (left_col if left_visible else content_start) + 1 + gutter_width
             out.append(f"\x1b[{screen_row};{start_col}H{''.join(parts)}")
 
         out.append(self.format_status())
@@ -4059,23 +4124,30 @@ class Viewer:
 
         if not self.doc_handler.text_mode_is_paginated():
             line_idx, start, end = self.search_matches[idx]
+            if self.text_wrap:
+                # No pan to speak of while wrapped - _row_for_line()
+                # converts the raw line position into a display-row
+                # scroll target instead (same as _scroll_text_to_match()).
+                target_row = self._row_for_line(line_idx)
+            else:
+                avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
+                line = self.text_lines[line_idx]
+                col_start = display_width(line[:start])
+                col_end = display_width(line[:end])
+                if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
+                    self.text_x_offset = max(
+                        self.text_x_offset_min,
+                        min(
+                            self.text_x_offset_max,
+                            round((col_start + col_end) / 2 - avail_cols / 2),
+                        ),
+                    )
+                target_row = line_idx
             avail_rows = self._text_avail_rows()
             margin = avail_rows // 4
             self.text_scroll = max(
-                self.text_scroll_min, min(self.text_scroll_max, line_idx - margin)
+                self.text_scroll_min, min(self.text_scroll_max, target_row - margin)
             )
-            avail_cols = self._text_avail_cols()
-            line = self.text_lines[line_idx]
-            col_start = display_width(line[:start])
-            col_end = display_width(line[:end])
-            if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
-                self.text_x_offset = max(
-                    self.text_x_offset_min,
-                    min(
-                        self.text_x_offset_max,
-                        round((col_start + col_end) / 2 - avail_cols / 2),
-                    ),
-                )
             self.refresh()
             self.draw_status(
                 f'"{self.search_query}" match {idx + 1}/{len(self.search_matches)}'
@@ -4175,6 +4247,12 @@ class Viewer:
             # The primary way to toggle wrap - "-S" (see run_viewer()'s
             # dash_pending) is kept only for less(1) compatibility.
             self.toggle_text_wrap()
+        elif key == "#":
+            # "N"/"n" are both already taken (next search match, next
+            # page) - "-N"/"-n" (see run_viewer()'s dash_pending, kept
+            # for less(1) compatibility) still work, but "#" is the
+            # primary key for this one.
+            self.toggle_line_numbers()
         elif key in FORWARD_WINDOW_KEYS:
             self.text_scroll_down(avail_rows)
         elif key in BACKWARD_WINDOW_KEYS:
@@ -4270,7 +4348,8 @@ class Viewer:
 
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
-    border=True, wrap=True, eol_mark=True, follow=False, wheel_scroll_step=1, keep=False,
+    border=True, wrap=True, eol_mark=True, line_numbers=False,
+    follow=False, wheel_scroll_step=1, keep=False,
     debug=False, office_render_scale=OFFICE_RENDER_SCALE,
     office_continuous=False,
 ):
@@ -4278,7 +4357,8 @@ def run_viewer(
     caller can inspect its final geometry (e.g. to tidy up the screen)."""
     viewer = Viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
-        border=border, wrap=wrap, eol_mark=eol_mark, wheel_scroll_step=wheel_scroll_step,
+        border=border, wrap=wrap, eol_mark=eol_mark, line_numbers=line_numbers,
+        wheel_scroll_step=wheel_scroll_step,
         debug=debug,
         office_render_scale=office_render_scale, office_continuous=office_continuous,
     )
@@ -4459,13 +4539,17 @@ def run_viewer(
         if dash_pending:
             # "-" was just pressed in text mode - less(1)'s own runtime
             # "-<option-letter>" toggle syntax, kept only for
-            # -S/--chop-long-lines compatibility with less(1); "s" alone
-            # (see handle_key_text()) is the primary way to toggle wrap.
-            # eol-mark and the border have no dash-toggle of their own -
-            # just "e"/"B". Any other key cancels quietly.
+            # -S/--chop-long-lines and -N/--line-numbers compatibility
+            # with less(1); "s"/"#" alone (see handle_key_text()) are the
+            # primary ways to toggle wrap/line-numbers. eol-mark and the
+            # border have no dash-toggle of their own - just "e"/"B".
+            # Any other key cancels quietly.
             dash_pending = False
             if key in ("S", "s"):
                 viewer.toggle_text_wrap()
+                viewer.refresh()
+            elif key in ("N", "n"):
+                viewer.toggle_line_numbers()
                 viewer.refresh()
             else:
                 viewer.draw_status()
@@ -4628,14 +4712,14 @@ def run_viewer(
         before = (
             viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
             viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark,
+            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers,
         )
         if not viewer.handle_key(key):
             break
         after = (
             viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
             viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark,
+            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers,
         )
         if after != before:
             viewer.refresh()
@@ -4734,6 +4818,13 @@ def main():
              "simply ran out of room",
     )
     parser.add_argument(
+        "-N", "--line-numbers",
+        action="store_true",
+        help="show line numbers in text mode, less(1)-style - off by "
+             "default; toggle any time with # (or -N, kept for less(1) "
+             "compatibility)",
+    )
+    parser.add_argument(
         "-F", "--follow",
         action="store_true",
         help="watch the file and reload it if it changes on disk "
@@ -4819,7 +4910,8 @@ def main():
                 viewer = run_viewer(
                     files, 0, start_page, tmpdir, fd, rt.old,
                     fit=fit, border=args.border, wrap=not args.chop_long_lines,
-                    eol_mark=args.eol_mark, follow=args.follow,
+                    eol_mark=args.eol_mark, line_numbers=args.line_numbers,
+                    follow=args.follow,
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
                     debug=args.debug,
                     office_render_scale=args.rendering_scale,
