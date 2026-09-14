@@ -201,82 +201,65 @@ PAN_STEP_CELLS = 8
 FOLLOW_INTERVAL = 3.0  # seconds between checks, under -F/--follow
 
 KEY_TABLE = """\
-Keys (mirroring less(1)):
+Keys:
+                                <MOVING>
   e ^E j ^N CR DOWN       forward  one line
   y ^Y k ^K ^P UP         backward one line
-  f ^F ^V SPACE           forward  one window
-  b ^B ESC-v              backward one window
+  f ^F ^V SPACE PAGEDOWN  forward  one window
+  b ^B ESC-v PAGEUP       backward one window
   d ^D                    forward  half window
   u ^U                    backward half window
-  g / G                   jump to top / bottom of the current page
+  h l LEFT RIGHT          pan left / right (when zoomed in)
+  H L SHIFT-LEFT/RIGHT    jump to left / right edge (when zoomed in)
+  K U SHIFT-UP            jump to top of the current page (same as g)
+  J D SHIFT-DOWN          jump to bottom of the current page (same as G)
+  g G                     jump to top / bottom of the current page
                           (text mode: type a number first to jump to
                           that line instead, e.g. 10g -> line 10)
-  < / > / HOME / END      jump to the first / last page of the document
+  n p                     next / previous page (match while searching)
+  < > HOME END            jump to the first / last page of the document
                           (type a number first to jump to that page
                           instead, e.g. 10< -> page 10)
-  n / p                   next / previous page (match while searching)
-  x / X                   jump to the first / last file in the list
-  <N> x                   jump straight to file N
-  :n / :p                 next / previous file, when more than one was
+                              <SEARCHING>
+  /<regex> ENTER          search the whole document for <regex>,
+                          landing on the first match from here on
+                          (a Python regex; falls back to a literal
+                          substring if it isn't valid regex syntax)
+  ?<regex> ENTER          the same search, landing on the last match
+                          before here instead
+  N P                     jump to next / previous search match
+                            <CHANGING FILES>
+  :n :p                   next / previous file, when more than one was
                           given on the command line
-  PAGEUP / PAGEDOWN       backward / forward one window
-  + / -                   zoom in / out
+  x X                     jump to the first / last file in the list
+  <N> x                   jump straight to file N
+                               <ZOOMING>
+  + -                     zoom in / out
   0                       reset zoom and pan
-  m / M                   fit page to terminal height / width
-  h / l / LEFT / RIGHT    pan left / right (when zoomed in)
-  H / L / SHIFT-LEFT/RIGHT   jump to left / right edge (when zoomed in)
-  K / U / SHIFT-UP        jump to top of the current page (same as g)
-  J / D / SHIFT-DOWN      jump to bottom of the current page (same as G)
-  click / drag            (page image, not text mode) on the scrollbar,
-                          jump to the position clicked - and keep
-                          following the pointer while dragging;
-                          otherwise open a PDF hyperlink under the
-                          pointer - a URL in the system browser, an
-                          internal link by jumping to its target
-                          page/position
-  mouse wheel             scroll up / down - in the page image, two
-                          lines at a time (--wheel-scroll-step to
-                          change that); in text mode, the terminal turns
-                          it into UP/DOWN key presses instead, so it
-                          still works there without clashing with
-                          click-drag text selection
-  [ / ]                   back / forward, through the positions internal
-                          links have jumped from (a mouse's back/forward
-                          side buttons, where it has them, do the same)
-  t                       toggle plain-text view of the current page
-                          (page/line navigation and h/l/H/L pan for
-                          lines wider than the terminal - no zoom/fit)
-  B                       (text mode) toggle a border around the page's
-                          edges - on by default (--no-border/-B to start
-                          with it off).
-  s / -S                  (text mode) toggle wrapping long lines instead
-                          of panning across them - on by default for a
-                          plain text file, off otherwise (-S/
-                          --chop-long-lines to start unwrapped; -S is
-                          kept for less(1) compatibility, s is primary)
-  e                       (text mode) toggle marking a real end-of-line
-                          (↵) - on by default (-E/--no-eol-mark to
-                          start without it)
-  # / -N                  (text mode) toggle a line-number gutter - off
-                          by default (-N/--line-numbers to start with
-                          it on)
+  m M                     fit page to terminal height / width
+                           <MOUSE OPERATIONS>
+  mouse click             (page image, not text mode) on the scrollbar,
+                          jump to the position clicked; otherwise open
+                          a PDF hyperlink under the pointer
+  mouse wheel             scroll up / down
+                                <LINKS>
+  [ ]                     back / forward, through the positions internal
+                          links have jumped from (PDF only)
+                               <TOGGLES>
+  t                       toggle plain-text view
+  B                       (text mode) toggle a border around the page
+  s -S                    (text mode) toggle wrapping long lines
+  E                       (text mode) toggle marking an end-of-line (↵)
+  # -N                    (text mode) toggle a line-number gutter
   C                       (text mode) clear the way for a select-and-
                           copy: turn off the EOL markers, the border,
                           the scrollbar and the line numbers at once,
                           and put back whatever was on before on a
                           second press
-  r                       toggle the scrollbar (a column on the
-                          terminal's right edge marking your position
-                          in the whole document, in both image and text
-                          mode) - on by default (--no-scrollbar to
-                          start it off); click or drag it in the page
-                          image to move around
-  /<regex> ENTER          search the whole document for <regex>
-                          (a Python regex; falls back to a literal
-                          substring if it isn't valid regex syntax)
-  N / P                   jump to next / previous search match
+  r                       toggle the scrollbar
+                        <MISCELLANEOUS COMMANDS>
   ^L                      redraw the screen
-  ?                       show this help (q to close it)
+  F1 :h                   show this help (q to close it)
   q                       quit\
 """
 
@@ -2491,7 +2474,10 @@ CSI_TILDE_CODES = {
     "4": "END", "8": "END",
     "5": "PAGEUP",
     "6": "PAGEDOWN",
+    "11": "F1",  # terminals that send F1 as a CSI; see SS3_FINAL_LETTERS
+    # for the ESC O P form most of them use instead
 }
+SS3_FINAL_LETTERS = {"P": "F1"}
 
 
 def read_csi_sequence(fd, timeout=0.15):
@@ -2513,6 +2499,22 @@ def read_csi_sequence(fd, timeout=0.15):
         buf += b
         if 0x40 <= b[0] <= 0x7E:
             return buf.decode("ascii", errors="ignore")
+
+
+def read_ss3_key(fd, timeout=0.15):
+    """Read the single byte following ESC O (SS3) and turn it into a
+    symbolic key name - F1 is the only one pdfless has any use for, and
+    most terminals send it as ESC O P. Returns None on timeout/EOF, or
+    for anything not in SS3_FINAL_LETTERS (the other function keys, and
+    the arrows as a terminal in application-cursor mode sends them -
+    pdfless never turns that mode on, so its arrows arrive as CSI)."""
+    r, _, _ = select.select([fd], [], [], timeout)
+    if not r:
+        return None
+    b = os.read(fd, 1)
+    if not b:
+        return None
+    return SS3_FINAL_LETTERS.get(b.decode("ascii", errors="ignore"))
 
 
 def decode_csi_key(seq):
@@ -3020,8 +3022,13 @@ class Viewer:
         ))
 
     def reset_view(self):
+        """"0": back to the untouched view of this page - zoom 1 and the
+        left edge. The pan has to be put back by hand: _load_page() only
+        clamps x_offset these days, and at zoom 1 a -h page can still be
+        wider than the terminal, so there'd be nothing to clamp it to."""
         self.zoom = 1.0
         self._load_page()
+        self.x_offset = 0
 
     def set_fit(self, fit):
         self.fit = fit
@@ -3230,7 +3237,7 @@ class Viewer:
         self._scroll_to_text_line(top_line)  # ...written in the one entered
 
     def toggle_eol_mark(self):
-        """Switches NEWLINE_MARKER on/off - bound to "e" (see
+        """Switches NEWLINE_MARKER on/off - bound to "E" (see
         handle_key_text()). text_max_line_width/_display_rows both
         reserve a column for the marker only while it's on, so both
         need recomputing here - and, since that re-splits every wrapped
@@ -3258,7 +3265,7 @@ class Viewer:
         exists largely to copy text out of a document, and the EOL
         markers, the border, the scrollbar and the line-number gutter
         all sit in the way of that: a drag across the text sweeps them
-        up along with it. Rather than hunting down e/B/r/# one at a
+        up along with it. Rather than hunting down E/B/r/# one at a
         time and remembering which of them were on to begin with, this
         turns off all four at once and remembers that for you."""
         if self._copy_mode_saved is not None:
@@ -4065,7 +4072,7 @@ class Viewer:
             (f" page {self.page}/{self.npages} ", STATUS_COLOR_PAGE),
             (f" {pct}% ", STATUS_COLOR_LOC),
             (mode_field, STATUS_COLOR_ZOOM),
-            (" ? help ", STATUS_COLOR_HELP),
+            (" F1 or :h for help ", STATUS_COLOR_HELP),
         ]
         return segments
 
@@ -4103,7 +4110,10 @@ class Viewer:
         sys.stdout.write(self.format_status(text))
         sys.stdout.flush()
 
-    def draw_search_prompt(self, buf):
+    def draw_search_prompt(self, buf, backward=False):
+        """The search pattern being typed, echoed on the status line
+        behind the prompt character it was opened with - "/" forward,
+        "?" backward, the same as less(1) shows them."""
         # Unlike draw_status(), this doesn't pad the line out to the full
         # terminal width: padding leaves the cursor sitting at the far
         # right edge (in autowrap's "pending wrap" state), which is past
@@ -4115,7 +4125,7 @@ class Viewer:
         # filled) with the status color first, via \x1b[2K, and the color
         # is left active (not reset) so text typed via IME composition
         # picks it up too; draw_status() resets it on the next full redraw.
-        text = truncate_to_width(f"/{buf}", self.cols)
+        text = truncate_to_width(f"{'?' if backward else '/'}{buf}", self.cols)
         sys.stdout.write(f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K{text}")
         sys.stdout.flush()
 
@@ -4362,7 +4372,36 @@ class Viewer:
         self.search_matches = []
         self.search_pos = None
 
-    def start_search(self, query):
+    @staticmethod
+    def _match_index_from(positions, here, backward):
+        """Which of the matches a search should land on, given where it
+        started from. `positions` is every match's position in ascending
+        order, in whatever unit `here` is in (a page number, or a raw
+        text_lines index); the answer is an index into it.
+
+        Forward ("/"), that's the first match at or after `here`;
+        backward ("?"), the last one strictly before it - so "?" can
+        never move you forward, while "/" can leave you where you are if
+        a match is already on screen. Either way it wraps around the
+        ends of the document less(1)-style: a backward search from
+        before the first match lands on the last one, a forward search
+        from past the last one lands on the first."""
+        if backward:
+            for i in range(len(positions) - 1, -1, -1):
+                if positions[i] < here:
+                    return i
+            return len(positions) - 1
+        for i, pos in enumerate(positions):
+            if pos >= here:
+                return i
+        return 0
+
+    def start_search(self, query, backward=False):
+        """Search the whole document for `query` and jump to one match -
+        which one depends on where you are now and on `backward`, i.e.
+        on whether the prompt was opened with "?" rather than "/" (see
+        _match_index_from()). N/P walk every match from there on,
+        regardless of the direction this started in."""
         if not query:
             return
         self.search_query = query
@@ -4376,12 +4415,12 @@ class Viewer:
                 self.search_pos = None
                 self.draw_status(f'"{query}" not found')
                 return
-            idx = 0
-            for i, (line_idx, _start, _end) in enumerate(self.search_matches):
-                if line_idx >= self.text_scroll:
-                    idx = i
-                    break
-            self._goto_search_match(idx)
+            # Positions are raw line indices, so "here" has to be one
+            # too - text_scroll itself counts display rows while the
+            # text is wrapped (see _top_text_line()).
+            self._goto_search_match(self._match_index_from(
+                [m[0] for m in self.search_matches], self._top_text_line(), backward,
+            ))
             return
 
         if self._search_index is None:
@@ -4392,15 +4431,12 @@ class Viewer:
             self.search_pos = None
             self.draw_status(f'"{query}" not found')
             return
-        # Jump to the first match at or after the current page, wrapping
-        # around to the very first match if the pattern doesn't appear
-        # again before the end of the document.
-        idx = 0
-        for i, match in enumerate(self.search_matches):
-            if match[0] >= self.page:
-                idx = i
-                break
-        self._goto_search_match(idx)
+        # A paginated document's matches are only ordered down to the
+        # page they're on, so that's the unit the starting point is
+        # measured in too.
+        self._goto_search_match(self._match_index_from(
+            [m[0] for m in self.search_matches], self.page, backward,
+        ))
 
     def repeat_search(self, forward):
         if not self.search_matches:
@@ -4538,9 +4574,9 @@ class Viewer:
             # copy, so it needs its own key - uppercase since lowercase
             # "b" is already BACKWARD_WINDOW_KEYS.
             self.toggle_text_border()
-        elif key == "e":
-            # Same idea as "B" above, overriding FORWARD_LINE_KEYS
-            # (still reachable via ^E/j/^N/Enter/Down).
+        elif key == "E":
+            # Same idea as "B" above - uppercase, since lowercase "e"
+            # is already FORWARD_LINE_KEYS (and stays that way here).
             self.toggle_eol_mark()
         elif key == "s":
             # The primary way to toggle wrap - "-S" (see run_viewer()'s
@@ -4670,8 +4706,9 @@ def run_viewer(
     signal.signal(signal.SIGWINCH, on_winch)
 
     num_buf = ""
-    search_buf = None  # None: not typing; otherwise the "/query" in progress
-    colon_pending = False  # True right after ":", awaiting n/p (next/previous file)
+    search_buf = None  # None: not typing; otherwise the query in progress
+    search_backward = False  # whether that query was opened with "?" (not "/")
+    colon_pending = False  # True right after ":", awaiting n/p/h
     dash_pending = False  # True right after "-" in text mode, awaiting "S"
 
     last_follow_path = viewer.path
@@ -4725,13 +4762,16 @@ def run_viewer(
         if key is None:
             break
         if key == "\x1b":
-            # Possibly ESC-v (Meta-v, "backward one window") or a CSI
-            # sequence (arrow/Home/End/PageUp/PageDown, plain or Shift-ed).
+            # Possibly ESC-v (Meta-v, "backward one window"), an SS3
+            # sequence (F1), or a CSI one (arrow/Home/End/PageUp/
+            # PageDown, plain or Shift-ed; F1 on some terminals).
             r2, _, _ = select.select([fd], [], [], 0.1)
             if r2:
                 nxt = os.read(fd, 1)
                 if nxt == b"v":
                     key = "ESC-v"
+                elif nxt == b"O":
+                    key = read_ss3_key(fd) or ""
                 elif nxt == b"[":
                     seq = read_csi_sequence(fd)
                     mouse = decode_sgr_mouse(seq) if seq else None
@@ -4812,16 +4852,16 @@ def run_viewer(
             continue
 
         if search_buf is not None:
-            # Typing a search pattern after "/": collect characters until
-            # Enter confirms it, Esc/^C cancels, backspace edits it (or
-            # also cancels, if the pattern is already empty). Every other
-            # key is swallowed so it can't leak through as a page command
-            # while the prompt is up.
+            # Typing a search pattern after "/" or "?": collect
+            # characters until Enter confirms it, Esc/^C cancels,
+            # backspace edits it (or also cancels, if the pattern is
+            # already empty). Every other key is swallowed so it can't
+            # leak through as a page command while the prompt is up.
             if key in ("\r", "\n"):
                 query = search_buf
                 search_buf = None
                 if query:
-                    viewer.start_search(query)
+                    viewer.start_search(query, backward=search_backward)
                 else:
                     viewer.draw_status()
             elif key in ("\x1b", "\x03"):
@@ -4830,25 +4870,28 @@ def run_viewer(
             elif key in ("\x7f", "\x08"):
                 if search_buf:
                     search_buf = search_buf[:-1]
-                    viewer.draw_search_prompt(search_buf)
+                    viewer.draw_search_prompt(search_buf, backward=search_backward)
                 else:
                     search_buf = None
                     viewer.draw_status()
             elif len(key) == 1 and key.isprintable():
                 search_buf += key
-                viewer.draw_search_prompt(search_buf)
+                viewer.draw_search_prompt(search_buf, backward=search_backward)
             continue
 
         if colon_pending:
             # ":" was just pressed - less(1)'s :n/:p, next/previous file
             # (only meaningful with more than one file on the command
             # line; harmless otherwise, since go_to_file() just reports
-            # there's nowhere to go). Any other key cancels quietly.
+            # there's nowhere to go), plus pdfless's own ":h" for the
+            # help screen. Any other key cancels quietly.
             colon_pending = False
             if key == "n":
                 viewer.next_file()
             elif key == "p":
                 viewer.previous_file()
+            elif key == "h":
+                viewer.show_help()  # the spelt-out way in; F1 is primary
             else:
                 viewer.draw_status()
             continue
@@ -4859,7 +4902,7 @@ def run_viewer(
             # -S/--chop-long-lines and -N/--line-numbers compatibility
             # with less(1); "s"/"#" alone (see handle_key_text()) are the
             # primary ways to toggle wrap/line-numbers. eol-mark and the
-            # border have no dash-toggle of their own - just "e"/"B".
+            # border have no dash-toggle of their own - just "E"/"B".
             # Any other key cancels quietly.
             dash_pending = False
             if key in ("S", "s"):
@@ -4876,11 +4919,11 @@ def run_viewer(
             break
 
         if viewer.help_active:
-            # While the help screen is up, only "q" and the scroll keys
-            # (for when KEY_TABLE is taller than the box) do anything.
-            # Everything else is swallowed so page keys can't leak
-            # through underneath it.
-            if key == "q":
+            # While the help screen is up, only "q"/F1 and the scroll
+            # keys (for when KEY_TABLE is taller than the box) do
+            # anything. Everything else is swallowed so page keys can't
+            # leak through underneath it.
+            if key in ("q", "F1"):
                 viewer.hide_help()
             elif key in FORWARD_LINE_KEYS:
                 viewer.scroll_help(1)
@@ -4905,7 +4948,12 @@ def run_viewer(
             viewer.refresh()
             continue
 
-        if key == "?":
+        if key == "F1":
+            # less(1) puts its help on "h"/"H", which pdfless can't -
+            # both are panning keys here (less has nothing to pan). "?"
+            # isn't free either, being less's backward search, so help
+            # lives on F1, with ":h" as a second way in for terminals
+            # that send something unexpected for F1.
             viewer.show_help()
             continue
 
@@ -4934,7 +4982,13 @@ def run_viewer(
                 viewer.draw_status("text mode isn't available for this file type")
             continue
 
-        if key == "/":
+        if key in ("/", "?"):
+            # less(1)'s pair: "/" searches forward from here, "?"
+            # backward. Either way the whole document is searched and
+            # N/P then walk every match - the direction only decides
+            # which match this search lands on first (see
+            # Viewer._match_index_from()).
+            #
             # Search always works in text mode (there's always a flat
             # list of lines to search, self.text_lines) regardless of
             # what the underlying file kind otherwise supports in image
@@ -4942,7 +4996,8 @@ def run_viewer(
             # via its own page/bbox index).
             if viewer.text_mode or viewer.doc_handler.supports_search():
                 search_buf = ""
-                viewer.draw_search_prompt(search_buf)
+                search_backward = key == "?"
+                viewer.draw_search_prompt(search_buf, backward=search_backward)
             else:
                 viewer.draw_status("search isn't available for this file type")
             continue

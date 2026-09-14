@@ -72,3 +72,34 @@ def test_rtf_office_text_mode_toggle(pty_session, sample_rtf):
     fallback path."""
     session = pty_session([sample_rtf])
     assert_no_crash(session, [b"t", b"t", b"q"], wait=1.0, initial_wait=6)
+
+
+def test_f1_and_colon_h_both_open_the_help(pty_session, sample_text):
+    """less(1)'s "?" is a backward search, so help moved to F1 - sent
+    as ESC O P by most terminals and ESC [ 1 1 ~ by the rest - with
+    ":h" as a second way in."""
+    session = pty_session([sample_text])
+    time.sleep(3)
+    session.read_all(0.5)  # drop the startup paint
+
+    for keys in (b"\x1bOP", b"\x1b[11~", b":h"):
+        session.send(keys)
+        out = session.read_all(0.5).decode(errors="replace")
+        assert "q to close help" in out, keys  # the help box's own status line
+        session.send(b"q")  # close it again
+    session.send(b"q")
+    assert "Traceback" not in session.read_all().decode(errors="replace")
+
+
+def test_question_mark_opens_a_backward_search_prompt(pty_session, sample_text):
+    session = pty_session([sample_text])
+    time.sleep(3)
+    session.read_all(0.5)
+
+    session.send(b"?")
+    out = session.read_all(0.5).decode(errors="replace")
+    assert "q to close help" not in out  # no longer the help key
+    assert out.rstrip().endswith("?")  # the prompt, echoed with its own "?"
+
+    session.send(b"line\r")
+    assert_no_crash(session, [b"q"], initial_wait=0)

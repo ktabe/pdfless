@@ -274,7 +274,8 @@ view, boxed on a PDF page image or highlighted in text:
 
 | Keys | Action |
 | --- | --- |
-| `/<regex>` `Enter` | search the whole document for `<regex>` |
+| `/<regex>` `Enter` | search the whole document for `<regex>`, landing on the first match from here on |
+| `?<regex>` `Enter` | the same search, landing on the last match before here instead - `less(1)`'s backward search |
 | `N` / `P` | jump to the next / previous match |
 | `n` / `p` | while a search is active, the same as `N` / `P` above (otherwise next / previous page) |
 
@@ -288,12 +289,12 @@ Misc:
 | `t` | toggle a plain-text view (scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) - for a PDF, the current page's extracted text; for a Word-family Quick Look preview file (`.doc`/`.docx`/`.odt`/`.rtf`/...), the whole document's text via macOS's `textutil` (not paginated - `n`/`p` do nothing in this view). On a plain image, a spreadsheet, or a slide deck, this just reports that there's no text to show (a plain text file is already shown this way, with nothing to toggle; an `.rtf` file falls back to this too, shown as its actual text via `textutil` rather than its raw markup, only if Quick Look/Chrome rendering isn't available) |
 | `B` | (text mode) toggle a border around the page's edges - on by default (`--no-border`/`-B` to start with it off); a plain text file starts with it off regardless, since there's usually no real "page" boundary in one worth bordering; no border while wrapped, regardless of `B` (`-S` to unwrap first) |
 | `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped); no border while wrapped, regardless of `B`. `s` is the primary key; `-S` (`less(1)`-style) is kept only for compatibility |
-| `e` | (text mode) toggle marking a real end-of-line (↵) - on by default (`-E`/`--no-eol-mark` to start without it) |
+| `E` | (text mode) toggle marking a real end-of-line (↵) - on by default (`-E`/`--no-eol-mark` to start without it); uppercase, since lowercase `e` already scrolls forward one line |
 | `#` / `-N` | (text mode) toggle a right-aligned, gray line-number gutter - off by default (`-N`/`--line-numbers` to start with it on) |
 | `C` | (text mode) clear the way for a select-and-copy: turn off the EOL markers, the border, the scrollbar and the line numbers in one go, so a drag across the text picks up the text alone. A second press puts back whatever was on before - anything you'd already switched off stays off |
 | `r` | toggle the scrollbar - a column on the terminal's right edge showing where you are in the whole document (image mode and text mode alike). In the page image you can click it to jump to that position, or drag it to move around; in text mode it's display only, so the terminal's own click-drag text selection keeps working. On by default (`--no-scrollbar` to start it off) |
 | `^L` | redraw the screen |
-| `?` | show a keybinding help box (`q` to close it) |
+| `F1` / `:h` | show a keybinding help box (`q` to close it). `less(1)` puts this on `h`/`H`, which are panning keys here, and `?` is its backward search - hence `F1`, with `:h` as a second way in |
 | `q` / `^C` | quit |
 
 ## Testing
