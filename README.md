@@ -143,7 +143,7 @@ python3 pdfless.py some.pdf
 
 ```
 usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [-B] [-S]
-               [-E] [-N] [-F] [--wheel-scroll-step N]
+               [-E] [-N] [--no-scrollbar] [-F] [--wheel-scroll-step N]
                file [file ...]
 
 positional arguments:
@@ -184,6 +184,10 @@ options:
   -N, --line-numbers    show line numbers in text mode, less(1)-style -
                         off by default; toggle any time with # (or -N,
                         kept for less(1) compatibility)
+  --no-scrollbar        don't show the scrollbar (a column on the
+                        terminal's right edge marking your position) -
+                        shown by default, in both image and text mode;
+                        toggle any time with r
   -F, --follow          watch the file and reload it if it changes on disk
                         (checked every 3s), staying on the same page and in
                         the same mode
@@ -286,6 +290,7 @@ Misc:
 | `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped); no border while wrapped, regardless of `B`. `s` is the primary key; `-S` (`less(1)`-style) is kept only for compatibility |
 | `e` | (text mode) toggle marking a real end-of-line (↵), whether wrapped or panned, as opposed to where the terminal width simply cut a long line off - on by default (`-E`/`--no-eol-mark` to start without it) |
 | `#` / `-N` | (text mode) toggle a right-aligned, gray line-number gutter - off by default (`-N`/`--line-numbers` to start with it on). `#` is the primary key; `-N` (`less(1)`-style) is kept only for compatibility |
+| `r` | toggle the scrollbar - a column on the terminal's right edge showing your position (image mode and text mode alike): a gray track, with a white block for the visible portion, spanning the whole column when the file already fits on one screen. Display only, not clickable - on by default (`--no-scrollbar` to start it off) |
 | `^L` | redraw the screen |
 | `?` | show a keybinding help box (`q` to close it) |
 | `q` / `^C` | quit |

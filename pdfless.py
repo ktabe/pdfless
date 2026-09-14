@@ -95,6 +95,15 @@ NEWLINE_MARKER_RESET = "\x1b[0m"
 # row (see Viewer._line_number_gutter_width()).
 LINE_NUMBER_COLOR = "\x1b[90m"  # gray
 LINE_NUMBER_RESET = "\x1b[0m"
+
+# Text mode's scrollbar (see Viewer._scrollbar_column()): one column,
+# always reserved at the terminal's last column (_text_avail_cols()),
+# whether or not the current file actually needs scrolling.
+SCROLLBAR_TRACK = "│"
+SCROLLBAR_TRACK_COLOR = "\x1b[90m"  # gray
+SCROLLBAR_THUMB = "█"
+SCROLLBAR_THUMB_COLOR = "\x1b[97m"  # bright white
+SCROLLBAR_RESET = "\x1b[0m"
 CACHE_SIZE = 6
 
 # SGR mouse reporting (buttons + motion, extended coordinates): only
@@ -247,6 +256,10 @@ Keys (mirroring less(1)):
                           by default (-N/--line-numbers to start with
                           it on; -N is kept for less(1) compatibility,
                           # is primary)
+  r                       toggle the scrollbar (a column on the
+                          terminal's right edge marking your position,
+                          in both image and text mode) - on by default
+                          (--no-scrollbar to start it off)
   /<regex> ENTER          search the whole document for <regex>
                           (a Python regex; falls back to a literal
                           substring if it isn't valid regex syntax)
@@ -2728,7 +2741,7 @@ class Viewer:
     def __init__(
         self, files, file_index, page, tmpdir, fd, fit="width",
         border=True, wrap=True, eol_mark=True, line_numbers=False,
-        wheel_scroll_step=1,
+        scrollbar=True, wheel_scroll_step=1,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False,
     ):
@@ -2812,6 +2825,12 @@ class Viewer:
         # _line_number_gutter_width(); no per-kind default (unlike
         # border/wrap/eol_mark) since there's no kind numbering wouldn't
         # make sense for
+        self.scrollbar = scrollbar  # --no-scrollbar: a column on the
+        # terminal's right edge showing scroll position - in both image
+        # mode (_draw()) and text mode (_draw_text_wrapped()/
+        # _draw_text_unwrapped()); "r" toggles it either way (see
+        # toggle_scrollbar()), applying uniformly to both since it's
+        # handled at run_viewer()'s top level rather than per-mode
         self._last_viewport_w = 0
         self._last_viewport_h = 0
         self._last_viewport_set = False
@@ -2922,7 +2941,12 @@ class Viewer:
         cell_w = max(1, width_px // max(1, cols))
         self.rows = rows
         self.cols = cols
-        self.base_width_px = width_px
+        # One cell's width held back for the scrollbar (see _draw()),
+        # while it's on - crop_width/x_offset/pan bounds/click hit-
+        # testing are all derived from base_width_px (see _load_page()),
+        # so reserving it here is enough to keep the image itself out
+        # of that column everywhere else.
+        self.base_width_px = width_px - (cell_w if self.scrollbar else 0)
         self.cell_h_px = cell_h
         self.cell_w_px = cell_w
         self.avail_height_px = cell_h * max(1, rows - 1)
@@ -3087,7 +3111,12 @@ class Viewer:
         return max(1, self.rows - 1)  # bottom row is the status bar
 
     def _text_avail_cols(self):
-        return self.cols
+        # One column held back for the scrollbar (see
+        # _scrollbar_column()) while it's on - regardless of whether the
+        # current file actually needs scrolling, so every other column
+        # reservation built on top of this (border, EOL marker, line
+        # numbers) never has to special-case it.
+        return max(1, self.cols - (1 if self.scrollbar else 0))
 
     def toggle_text_border(self):
         self.text_border = not self.text_border
@@ -3144,6 +3173,78 @@ class Viewer:
         if not self.line_numbers or not self.text_lines:
             return 0
         return len(str(len(self.text_lines))) + 1
+
+    def toggle_scrollbar(self):
+        """Switches the scrollbar on/off - "r" (see run_viewer(), which
+        handles it at the top level since it applies in both image mode
+        (_draw()) and text mode). Its column is reserved from
+        base_width_px (image mode - see _recompute_geometry()) or
+        _text_avail_cols() (text mode), so this needs the same recompute
+        a real terminal resize would trigger - simplest to just request
+        one instead of duplicating that logic here."""
+        self.scrollbar = not self.scrollbar
+        self.resized = True
+
+    def _scrollbar_fractions(self, start, avail_extent, total_extent, page, npages):
+        """(start_frac, visible_frac), both in [0, 1]: where the visible
+        window starts, and how much of it is visible, as a fraction of
+        the WHOLE document (all `npages` pages) - not just the current
+        page/screen. `start`/`avail_extent`/`total_extent` share any one
+        consistent unit (pixels in image mode, rows in text mode):
+        `start` is how far into the current page the window's top edge
+        sits, `total_extent` the page's own full size, `avail_extent`
+        how much of it fits on screen at once. A 10-page PDF, showing
+        the top half of page 1, is start_frac=0, visible_frac=0.5/10 -
+        the thumb sits in the top 5% of the track, not top-50%, which
+        was this method's whole reason for existing (see toggle_scrollbar()'s
+        callers) - a single-page view (page=npages=1) reduces exactly to
+        "this page/screen's own fraction", unaffected."""
+        total_extent = max(1, total_extent)
+        page_start_frac = max(0.0, min(1.0, start / total_extent))
+        page_visible_frac = max(0.0, min(1.0, avail_extent / total_extent))
+        npages = max(1, npages)
+        return (page - 1 + page_start_frac) / npages, page_visible_frac / npages
+
+    def _text_scrollbar_fractions(self, avail_rows):
+        """(start_frac, visible_frac) for the text-mode scrollbar - see
+        _scrollbar_fractions(). Only a PDF's text mode pages separately
+        (doc_handler.text_mode_is_paginated()) - anything else shows
+        the whole document in one continuous text_scroll range
+        already, so page/npages are fixed at 1/1 there (self.page/
+        self.npages might otherwise still reflect an unrelated slide/
+        page count from image mode - e.g. a multi-slide OfficeDocument
+        - that text mode's own single flowing view doesn't split on)."""
+        total_extent = avail_rows + (self.text_scroll_max - self.text_scroll_min)
+        start = self.text_scroll - self.text_scroll_min
+        if self.doc_handler.text_mode_is_paginated():
+            page, npages = self.page, self.npages
+        else:
+            page, npages = 1, 1
+        return self._scrollbar_fractions(start, avail_rows, total_extent, page, npages)
+
+    def _scrollbar_column(self, avail_rows, start_frac, visible_frac):
+        """One rendered cell (color + char) per screen row, top to
+        bottom, for the scrollbar column - the terminal's last column,
+        reserved (while self.scrollbar is on) from base_width_px in
+        image mode (see _draw()) or _text_avail_cols() in text mode
+        (see _draw_text_wrapped()/_draw_text_unwrapped()). `start_frac`/
+        `visible_frac` (see _scrollbar_fractions()) are already
+        normalized to the whole document, so this is just laying them
+        out over avail_rows screen cells. A file that fits on screen
+        entirely (visible_frac >= 1) shows a thumb spanning the whole
+        track, rather than an arbitrary track/thumb split that would
+        suggest otherwise."""
+        visible_frac = max(0.0, min(1.0, visible_frac))
+        thumb = SCROLLBAR_THUMB_COLOR + SCROLLBAR_THUMB + SCROLLBAR_RESET
+        if visible_frac >= 1.0:
+            return [thumb] * avail_rows
+        track = SCROLLBAR_TRACK_COLOR + SCROLLBAR_TRACK + SCROLLBAR_RESET
+        thumb_size = max(1, min(avail_rows, round(visible_frac * avail_rows)))
+        thumb_start = max(0, min(avail_rows - thumb_size, round(start_frac * avail_rows)))
+        return [
+            thumb if thumb_start <= i < thumb_start + thumb_size else track
+            for i in range(avail_rows)
+        ]
 
     def _default_text_wrap(self):
         """Whether text mode should default to wrapping long lines for
@@ -3528,6 +3629,12 @@ class Viewer:
 
             out.append(f"\x1b[{screen_row};{gutter_width + 1}H{rendered}")
 
+        if self.scrollbar:
+            start_frac, visible_frac = self._text_scrollbar_fractions(avail_rows)
+            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
+            for i, cell in enumerate(cells):
+                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
+
         out.append(self.format_status())
         sys.stdout.write("".join(out))
         sys.stdout.flush()
@@ -3659,6 +3766,12 @@ class Viewer:
                 parts.append("│")
             start_col = (left_col if left_visible else content_start) + 1 + gutter_width
             out.append(f"\x1b[{screen_row};{start_col}H{''.join(parts)}")
+
+        if self.scrollbar:
+            start_frac, visible_frac = self._text_scrollbar_fractions(avail_rows)
+            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
+            for i, cell in enumerate(cells):
+                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
 
         out.append(self.format_status())
         sys.stdout.write("".join(out))
@@ -3794,6 +3907,22 @@ class Viewer:
         if new_bounds:
             out.append(self._format_marker_at_bounds(*new_bounds))
         self._last_marker_bounds = new_bounds
+
+        if self.scrollbar:
+            # Same row count avail_height_px was computed from (see
+            # _recompute_geometry()) - the column itself was already
+            # held back from base_width_px, so the image never reaches
+            # into it regardless of zoom/pan. self.page/self.npages fold
+            # this page's own (self.scroll, avail_height_px, img.height)
+            # fraction into a whole-document position - see
+            # _scrollbar_fractions() - rather than just this page's own.
+            avail_rows = max(1, self.rows - 1)
+            start_frac, visible_frac = self._scrollbar_fractions(
+                self.scroll, self.avail_height_px, self.img.height, self.page, self.npages
+            )
+            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
+            for i, cell in enumerate(cells):
+                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
 
         out.append(self.format_status())
         sys.stdout.write("".join(out))
@@ -4348,7 +4477,7 @@ class Viewer:
 
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
-    border=True, wrap=True, eol_mark=True, line_numbers=False,
+    border=True, wrap=True, eol_mark=True, line_numbers=False, scrollbar=True,
     follow=False, wheel_scroll_step=1, keep=False,
     debug=False, office_render_scale=OFFICE_RENDER_SCALE,
     office_continuous=False,
@@ -4358,7 +4487,7 @@ def run_viewer(
     viewer = Viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
         border=border, wrap=wrap, eol_mark=eol_mark, line_numbers=line_numbers,
-        wheel_scroll_step=wheel_scroll_step,
+        scrollbar=scrollbar, wheel_scroll_step=wheel_scroll_step,
         debug=debug,
         office_render_scale=office_render_scale, office_continuous=office_continuous,
     )
@@ -4577,6 +4706,14 @@ def run_viewer(
 
         if key == "\x0c":  # ^L: repaint the screen (e.g. after other
             # output has garbled it), without otherwise changing anything
+            viewer.refresh()
+            continue
+
+        if key == "r":
+            # Applies in both image and text mode (see
+            # Viewer.toggle_scrollbar()), so handled here at the top
+            # level rather than inside handle_key()/handle_key_text().
+            viewer.toggle_scrollbar()
             viewer.refresh()
             continue
 
@@ -4825,6 +4962,15 @@ def main():
              "compatibility)",
     )
     parser.add_argument(
+        "--no-scrollbar",
+        action="store_false",
+        dest="scrollbar",
+        default=True,
+        help="don't show the scrollbar (a column on the terminal's "
+             "right edge marking your position) - shown by default, in "
+             "both image and text mode; toggle any time with r",
+    )
+    parser.add_argument(
         "-F", "--follow",
         action="store_true",
         help="watch the file and reload it if it changes on disk "
@@ -4911,7 +5057,7 @@ def main():
                     files, 0, start_page, tmpdir, fd, rt.old,
                     fit=fit, border=args.border, wrap=not args.chop_long_lines,
                     eol_mark=args.eol_mark, line_numbers=args.line_numbers,
-                    follow=args.follow,
+                    scrollbar=args.scrollbar, follow=args.follow,
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
                     debug=args.debug,
                     office_render_scale=args.rendering_scale,
