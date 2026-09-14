@@ -94,3 +94,54 @@ def test_image_document_never_supports_search(sample_image):
     # Mirrors the '/' key handler's gating condition directly, since an
     # ImageDocument can never reach text_mode at all.
     assert not (viewer.text_mode or viewer.doc_handler.supports_search())
+
+def test_match_index_from_picks_the_nearest_one_in_each_direction():
+    """"/" takes the first match from here on, "?" the last one before
+    here - the whole difference between the two prompts (see
+    Viewer.start_search())."""
+    positions = [2, 5, 5, 9]  # e.g. page numbers, two matches on page 5
+    pick = pdfless.Viewer._match_index_from
+
+    assert pick(positions, 5, False) == 1  # first match on page 5...
+    assert pick(positions, 5, True) == 0  # ...vs. the last one before it
+    assert pick(positions, 6, False) == 3
+    assert pick(positions, 6, True) == 2
+
+
+def test_match_index_from_wraps_around_the_ends():
+    positions = [2, 5, 9]
+    pick = pdfless.Viewer._match_index_from
+
+    assert pick(positions, 10, False) == 0  # past the last match -> the first
+    assert pick(positions, 1, True) == 2  # before the first -> the last
+
+
+def test_backward_search_lands_on_the_match_above_you(tmp_path):
+    path = tmp_path / "hits.txt"
+    path.write_text("".join(
+        ("hit\n" if i in (3, 17, 40) else f"line {i}\n") for i in range(60)
+    ))
+    viewer = make_viewer(pdfless.TextDocument(str(path)))
+    viewer.text_scroll = 30
+
+    viewer.start_search("hit", backward=True)
+    assert viewer.search_matches[viewer.search_pos][0] == 17
+    # ...where a forward search from the same spot goes the other way
+    # (that first search scrolled us, so put us back first).
+    viewer.text_scroll = 30
+    viewer.start_search("hit")
+    assert viewer.search_matches[viewer.search_pos][0] == 40
+
+
+def test_backward_search_in_a_pdf_works_by_page(sample_pdf):
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    viewer.start_search("Lorem")  # from page 1: the first match forward
+    first = viewer.search_pos
+    pages = [m[0] for m in viewer.search_matches]
+    assert len(set(pages)) > 1  # matches on more than one page, or this
+    # says nothing
+
+    viewer.page = pages[-1]
+    viewer.start_search("Lorem", backward=True)
+    assert viewer.search_pos != first
+    assert pages[viewer.search_pos] < viewer.npages
