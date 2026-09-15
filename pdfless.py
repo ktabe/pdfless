@@ -227,6 +227,7 @@ Keys:
                           substring if it isn't valid regex syntax)
   ?<regex> ENTER          the same search, landing on the last match
                           before here instead
+  / ENTER  ? ENTER        repeat the last search pattern, forward / back
   N P                     jump to next / previous search match
                             <CHANGING FILES>
   :n :p                   next / previous file, when more than one was
@@ -260,7 +261,7 @@ Keys:
                         <MISCELLANEOUS COMMANDS>
   ^L                      redraw the screen
   F1 :h                   show this help (q to close it)
-  q                       quit\
+  q :q                    quit\
 """
 
 FORWARD_LINE_KEYS = {"e", "\x05", "j", "\x0e", "\r", "DOWN"}
@@ -4451,7 +4452,17 @@ class Viewer:
             self.search_pos = 0
         else:
             step = 1 if forward else -1
-            self.search_pos = (self.search_pos + step) % len(self.search_matches)
+            next_pos = self.search_pos + step
+            if not (0 <= next_pos < len(self.search_matches)):
+                # No wraparound - N past the last match / P before the
+                # first one just reports there's nowhere further to go,
+                # the way less(1)'s own (non-wrapping) search does.
+                self.draw_status(
+                    f'"{self.search_query}" no more matches '
+                    + ("forward" if forward else "backward")
+                )
+                return
+            self.search_pos = next_pos
         self._goto_search_match(self.search_pos)
 
     def _goto_search_match(self, idx):
@@ -4708,6 +4719,7 @@ def run_viewer(
     num_buf = ""
     search_buf = None  # None: not typing; otherwise the query in progress
     search_backward = False  # whether that query was opened with "?" (not "/")
+    last_search_query = None  # remembered across searches, for a bare "/"/"?"
     colon_pending = False  # True right after ":", awaiting n/p/h
     dash_pending = False  # True right after "-" in text mode, awaiting "S"
 
@@ -4858,9 +4870,10 @@ def run_viewer(
             # already empty). Every other key is swallowed so it can't
             # leak through as a page command while the prompt is up.
             if key in ("\r", "\n"):
-                query = search_buf
+                query = search_buf or last_search_query
                 search_buf = None
                 if query:
+                    last_search_query = query
                     viewer.start_search(query, backward=search_backward)
                 else:
                     viewer.draw_status()
@@ -4883,8 +4896,8 @@ def run_viewer(
             # ":" was just pressed - less(1)'s :n/:p, next/previous file
             # (only meaningful with more than one file on the command
             # line; harmless otherwise, since go_to_file() just reports
-            # there's nowhere to go), plus pdfless's own ":h" for the
-            # help screen. Any other key cancels quietly.
+            # there's nowhere to go), :q to quit, plus pdfless's own ":h"
+            # for the help screen. Any other key cancels quietly.
             colon_pending = False
             if key == "n":
                 viewer.next_file()
@@ -4892,6 +4905,8 @@ def run_viewer(
                 viewer.previous_file()
             elif key == "h":
                 viewer.show_help()  # the spelt-out way in; F1 is primary
+            elif key == "q":
+                break  # less(1)'s ":q" - same as the plain "q" quit key
             else:
                 viewer.draw_status()
             continue

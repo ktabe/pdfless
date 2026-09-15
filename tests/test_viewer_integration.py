@@ -103,3 +103,45 @@ def test_question_mark_opens_a_backward_search_prompt(pty_session, sample_text):
 
     session.send(b"line\r")
     assert_no_crash(session, [b"q"], initial_wait=0)
+
+
+def test_colon_q_quits(pty_session, sample_text):
+    """less(1) users reach for ":q" out of habit - it should quit just
+    like the plain "q" key, not just cancel the colon-command prompt."""
+    session = pty_session([sample_text])
+    time.sleep(3)
+    session.read_all(0.5)
+
+    session.send(b":q", wait=0)
+    deadline = time.monotonic() + 5
+    exited = False
+    while time.monotonic() < deadline:
+        # Keep draining the pty's master side while polling - otherwise
+        # the terminal-reset escapes pdfless writes on its way out can
+        # fill the pty buffer and block the child inside write(),
+        # keeping it from ever reaching the exit() that follows (and
+        # hanging this check regardless of whether ":q" itself worked).
+        session.read_all(0.2)
+        pid, _status = os.waitpid(session.pid, os.WNOHANG)
+        if pid != 0:
+            exited = True
+            break
+    assert exited, "pdfless did not exit after \":q\""
+
+
+def test_empty_search_pattern_repeats_the_last_one(pty_session, sample_text):
+    """An empty "/"/"?" (just Enter) should re-run the previous search
+    pattern, less(1)-style, rather than doing nothing."""
+    session = pty_session([sample_text])
+    time.sleep(3)
+    session.read_all(0.5)
+
+    session.send(b"/line\r")
+    session.read_all(0.5)
+
+    session.send(b"/\r")
+    out = session.read_all(0.5).decode(errors="replace")
+    assert "no previous search pattern" not in out
+    assert "Traceback" not in out
+
+    assert_no_crash(session, [b"q"], initial_wait=0)

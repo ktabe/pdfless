@@ -133,6 +133,31 @@ def test_backward_search_lands_on_the_match_above_you(tmp_path):
     assert viewer.search_matches[viewer.search_pos][0] == 40
 
 
+def test_repeat_search_does_not_wrap_around(sample_text):
+    """N past the last match, or P before the first one, should just
+    stay put and report there's nothing further - unlike the initial
+    "/"/"?" jump (_match_index_from()), which does wrap."""
+    viewer = make_viewer(pdfless.TextDocument(sample_text))
+    viewer.start_search("line")
+    assert len(viewer.search_matches) == 3
+
+    viewer.repeat_search(forward=True)
+    assert viewer.search_pos == 1
+    viewer.repeat_search(forward=True)
+    assert viewer.search_pos == 2
+
+    viewer.repeat_search(forward=True)  # past the last match - no wrap
+    assert viewer.search_pos == 2
+
+    viewer.repeat_search(forward=False)
+    assert viewer.search_pos == 1
+    viewer.repeat_search(forward=False)
+    assert viewer.search_pos == 0
+
+    viewer.repeat_search(forward=False)  # before the first match - no wrap
+    assert viewer.search_pos == 0
+
+
 def test_backward_search_in_a_pdf_works_by_page(sample_pdf):
     viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
     viewer.start_search("Lorem")  # from page 1: the first match forward
