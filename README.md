@@ -80,6 +80,10 @@ X11 forwarding, and no need to copy the PDF to your local machine first.
   working on [iTerm2](https://iterm2.com) and
   [WezTerm](https://wezterm.org); terminals
   without this protocol will not display anything.
+- Inside tmux, nothing will render at all unless passthrough is turned
+  on (tmux 3.3+): add `set -g allow-passthrough on` to `~/.tmux.conf`
+  (and reload it, e.g. `tmux source-file ~/.tmux.conf`) — tmux drops
+  the inline-image escape sequence by default otherwise.
 - [poppler](https://poppler.freedesktop.org) (`pdftoppm`/`pdfinfo`/
   `pdftocairo`) - needed for viewing PDFs directly, and for rasterizing
   pictures embedded in a Quick Look preview file (Word/Excel/

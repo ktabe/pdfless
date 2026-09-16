@@ -60,6 +60,7 @@ macOSでローカルにChrome/Chromiumがインストールされていれば、
 ## 必要なもの
 
 - iTerm2のインラインイメージプロトコルに対応した端末 — [iTerm2](https://iterm2.com) と [WezTerm](https://wezterm.org) で動作確認済み。このプロトコルに非対応の端末では何も表示されません。
+- tmux内では、パススルーを有効にしない限り（tmux 3.3以降）何も表示されません: `~/.tmux.conf` に `set -g allow-passthrough on` を追加して読み直してください（例: `tmux source-file ~/.tmux.conf`）。これがないと、tmuxはデフォルトでインライン画像のエスケープシーケンスを破棄します。
 - [poppler](https://poppler.freedesktop.org)（`pdftoppm`/`pdfinfo`/`pdftocairo`）— PDFを直接見るとき、およびQuick Lookプレビューファイル（Word/Excel/PowerPointなど）に埋め込まれた画像をラスタライズするときに必要です。画像ファイルしか開かないなら不要です。
 - macOS + ローカルのChrome/Chromium — Office/Keynote/PagesなどをQuick Look経由で開くときだけ必要です。どちらかがなければ、そのファイルは警告を出してスキップされます。
 - Python 3.9以上
