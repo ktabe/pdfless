@@ -4070,8 +4070,8 @@ class Viewer:
                 STATUS_COLOR_FILE_INDEX,
             ))
         segments += [
-            (f" page {self.page}/{self.npages} ", STATUS_COLOR_PAGE),
-            (f" {pct}% ", STATUS_COLOR_LOC),
+            (f" page {self.page:>{len(str(self.npages))}}/{self.npages} ", STATUS_COLOR_PAGE),
+            (f" {pct:>3}% ", STATUS_COLOR_LOC),
             (mode_field, STATUS_COLOR_ZOOM),
             (" F1 or :h for help ", STATUS_COLOR_HELP),
         ]
@@ -5146,8 +5146,11 @@ def main():
         "-v", "--version", action="version", version=f"%(prog)s {__version__}"
     )
     parser.add_argument(
-        "files", nargs="+", metavar="file",
-        help="path to one or more PDF, image, text, or Quick-Look-previewable files",
+        "files", nargs="*", metavar="file",
+        help="path to one or more PDF, image, text, or Quick-Look-"
+             "previewable files - reads from stdin instead if none are "
+             "given (or if \"-\" is given in their place), so pdfless "
+             "can also be used as $PAGER",
     )
     parser.add_argument(
         "-p", "--page", type=int, default=1,
@@ -5242,22 +5245,43 @@ def main():
     )
     args = parser.parse_args()
 
-    # Validate every file up front - each one is checked (existence,
-    # type, and that it actually decodes) before the terminal ever goes
-    # into raw/alternate-screen mode. An invalid file is skipped (with a
-    # warning) rather than aborting the whole thing, so one bad path in
-    # a big batch doesn't stop you from seeing the rest.
-    candidates = []  # [abs_path, ...] - files that at least exist
-    for arg in args.files:
-        if not os.path.isfile(arg):
-            print(f"pdfless: no such file, skipping: {arg}", file=sys.stderr)
-            continue
-        candidates.append(os.path.abspath(arg))
-    if any(PdfDocument.is_pdf_file(path) for path in candidates):
-        check_deps()
+    # Reading from stdin - no file given at all, or "-" given in its
+    # place - lets pdfless work as $PAGER: git/man/etc. invoke $PAGER
+    # with nothing but the piped content on stdin. Every
+    # DocumentHandler.sniff() reads from a real path, not a stream, so
+    # the whole pipe has to be drained into a file of its own first -
+    # before stdin's fd gets reused for keyboard/mouse input, further
+    # down (see "reading_stdin" again below).
+    reading_stdin = not args.files or "-" in args.files
+    if reading_stdin and sys.stdin.isatty():
+        die("no file given, and stdin is a terminal - pipe something "
+            "into pdfless, or name a file")
 
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
+    tty_fd = None  # set below if reading_stdin - ours to close on the way out
     try:
+        if reading_stdin:
+            stdin_path = os.path.join(tmpdir, "stdin")
+            with open(stdin_path, "wb") as f:
+                shutil.copyfileobj(sys.stdin.buffer, f)
+            # "-" (if given) stands for this same captured file; bare
+            # `pdfless.py` with no file arguments at all means just it.
+            args.files = [stdin_path if a == "-" else a for a in args.files] or [stdin_path]
+
+        # Validate every file up front - each one is checked (existence,
+        # type, and that it actually decodes) before the terminal ever goes
+        # into raw/alternate-screen mode. An invalid file is skipped (with a
+        # warning) rather than aborting the whole thing, so one bad path in
+        # a big batch doesn't stop you from seeing the rest.
+        candidates = []  # [abs_path, ...] - files that at least exist
+        for arg in args.files:
+            if not os.path.isfile(arg):
+                print(f"pdfless: no such file, skipping: {arg}", file=sys.stderr)
+                continue
+            candidates.append(os.path.abspath(arg))
+        if any(PdfDocument.is_pdf_file(path) for path in candidates):
+            check_deps()
+
         files = []  # [DocumentHandler, ...], in the given order (each knows its own .path)
         for path in candidates:
             # Try each DocumentHandler subclass, in priority order, for
@@ -5297,10 +5321,23 @@ def main():
         start_page = args.page if first_npages is None else min(first_npages, args.page)
         start_page = max(1, start_page)
 
-        if not sys.stdout.isatty() or not sys.stdin.isatty():
-            die("stdin/stdout must be a terminal")
+        if not sys.stdout.isatty():
+            die("stdout must be a terminal")
+        if reading_stdin:
+            # stdin's own fd was just drained above (or was never going
+            # to be read again, for bare `pdfless.py`) - /dev/tty is the
+            # real keyboard now, the same trick less(1)/most(1) use to
+            # double as $PAGER.
+            try:
+                fd = tty_fd = os.open("/dev/tty", os.O_RDWR)
+            except OSError as e:
+                die(f"can't open /dev/tty for keyboard input: {e}")
+        else:
+            if not sys.stdin.isatty():
+                die("stdin must be a terminal (or pipe something into "
+                    "pdfless, or pass \"-\", to page it)")
+            fd = sys.stdin.fileno()
 
-        fd = sys.stdin.fileno()
         with RawTerminal(fd) as rt:
             # A text-kind first file starts straight in text mode (see
             # Viewer.__init__), where mouse reporting should be off, the
@@ -5337,6 +5374,8 @@ def main():
                     )
                 sys.stdout.flush()
     finally:
+        if tty_fd is not None:
+            os.close(tty_fd)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

@@ -144,11 +144,13 @@ python3 pdfless.py some.pdf
 ```
 usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [-B] [-S]
                [-E] [-N] [--no-scrollbar] [-F] [--wheel-scroll-step N]
-               file [file ...]
+               [file ...]
 
 positional arguments:
   file                  path to one or more PDF, image, text, or Quick-Look-
-                        previewable files
+                        previewable files - reads from stdin instead if none
+                        are given (or if "-" is given in their place), so
+                        pdfless can also be used as $PAGER
 
 options:
   --help                show this help message and exit
@@ -201,6 +203,30 @@ from a build script, a LaTeX watch loop, or a script re-rendering a PNG) —
 `pdfless` picks up each rebuild automatically, without losing your place.
 With multiple files open, it only watches whichever one is currently
 displayed, switching what it watches along with `:n`/`:p`.
+
+### Using pdfless as `$PAGER`
+
+With no `file` argument at all (or with `-` in its place), `pdfless`
+reads from stdin instead - the shape most tools invoke `$PAGER` with:
+
+```sh
+export PAGER=/path/to/pdfless.py
+git log     # or: man some-command, journalctl, ...
+```
+
+or one-off, without exporting anything:
+
+```sh
+git log | pdfless.py
+```
+
+The whole input is read up front and shown as a plain text file (so
+it's a snapshot, not a live `tail -f`-style follow), and keyboard input
+still comes from the real terminal even though stdin itself is a pipe
+- the same trick `less(1)`/`most(1)` use. A colorized tool's raw ANSI
+escape codes aren't interpreted - most tools already turn color off
+when their output isn't a terminal, but one forced on with something
+like `--color=always` will show up as `^[` noise rather than color.
 
 ## Office Document Support (Experimental)
 

@@ -138,15 +138,31 @@ class PtySession:
     needs a real tty for ioctl-based terminal-size queries), the same
     way this was done by hand throughout development."""
 
-    def __init__(self, args, rows=40, cols=120):
+    def __init__(self, args, rows=40, cols=120, stdin_data=None):
+        """`stdin_data`, if given, is piped in on fd 0 instead of the pty
+        itself - simulating `cat file | pdfless.py`, the shape pdfless
+        needs to work as $PAGER (see main()'s "reading_stdin"). The pty
+        is still stdout/stderr/the controlling terminal either way -
+        pdfless falls back to /dev/tty for keyboard input once its own
+        stdin is a plain pipe rather than a tty."""
+        if stdin_data is not None:
+            stdin_r, stdin_w = os.pipe()
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
+            if stdin_data is not None:
+                os.dup2(stdin_r, 0)
+                os.close(stdin_r)
+                os.close(stdin_w)
             os.execvp(sys.executable, [sys.executable, PDFLESS_PY, *args])
         else:
             fcntl.ioctl(
                 self.fd, termios.TIOCSWINSZ,
                 struct.pack("HHHH", rows, cols, cols * 8, rows * 16),
             )
+            if stdin_data is not None:
+                os.close(stdin_r)
+                os.write(stdin_w, stdin_data)
+                os.close(stdin_w)  # EOF - the whole point being paged
 
     def send(self, data, wait=0.5):
         os.write(self.fd, data)
@@ -206,8 +222,8 @@ class PtySession:
 def pty_session():
     sessions = []
 
-    def _make(args, rows=40, cols=120):
-        s = PtySession(args, rows=rows, cols=cols)
+    def _make(args, rows=40, cols=120, stdin_data=None):
+        s = PtySession(args, rows=rows, cols=cols, stdin_data=stdin_data)
         sessions.append(s)
         return s
 
