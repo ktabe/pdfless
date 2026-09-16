@@ -2761,7 +2761,7 @@ class Viewer:
     def __init__(
         self, files, file_index, page, tmpdir, fd, fit="width",
         border=True, wrap=True, eol_mark=True, line_numbers=False,
-        scrollbar=True, wheel_scroll_step=2,
+        scrollbar=True, wheel_scroll_step=2, incremental_scroll=True,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False,
     ):
@@ -2777,6 +2777,12 @@ class Viewer:
         # (NEWLINE_MARKER) in text mode - independent of text_wrap/-S, on
         # by default either way (see _draw_text_wrapped()/_unwrapped())
         self.wheel_scroll_step = wheel_scroll_step
+        self.incremental_scroll = incremental_scroll  # --no-incremental-
+        # scroll: force every redraw through _draw()'s full-viewport
+        # path, skipping the _scroll_shift_rows()/_draw_shifted()
+        # shortcut - an escape hatch for a terminal where that shortcut
+        # (confirmed by hand on iTerm2 - see _scroll_shift_rows()) turns
+        # out not to hold
         # A real (not just placeholder-0) self.rows/cols before
         # _set_current_file() below is what lets its lazy office-preview
         # render (if the first file needs one) show live status-line
@@ -2862,6 +2868,15 @@ class Viewer:
         self._last_viewport_set = False
         self._last_char_h = 0
         self._last_marker_bounds = None  # (row0, col0, row1, col1) or None
+        # What _draw() last actually put on screen, for _scroll_shift_rows()
+        # to compare against - only trusted while _last_viewport_set is
+        # True, which every place that overwrites the screen with
+        # something else (help, text mode, a resize, ...) already turns
+        # off, so these never need resetting anywhere but here.
+        self._last_page = None
+        self._last_x_offset = None
+        self._last_zoom_key = None
+        self._last_scroll = None
 
     def request_resize(self):
         self.resized = True
@@ -3975,6 +3990,13 @@ class Viewer:
 
     def _draw(self):
         crop_bottom = min(self.scroll + self.avail_height_px, self.img.height)
+        crop_h = crop_bottom - self.scroll
+
+        shift = self._scroll_shift_rows(self.crop_width, crop_h)
+        if shift is not None:
+            self._draw_shifted(shift, crop_bottom)
+            return
+
         crop = self.img.crop(
             (self.x_offset, self.scroll, self.x_offset + self.crop_width, crop_bottom)
         )
@@ -4000,6 +4022,7 @@ class Viewer:
         self._last_viewport_w = crop_w
         self._last_viewport_h = crop_h
         self._last_viewport_set = True
+        self._remember_drawn_position()
 
         match = self._active_search_page_match()
         new_bounds = (
@@ -4027,25 +4050,153 @@ class Viewer:
             out.append(self._format_marker_at_bounds(*new_bounds))
         self._last_marker_bounds = new_bounds
 
-        if self.scrollbar:
-            # Same row count avail_height_px was computed from (see
-            # _recompute_geometry()) - the column itself was already
-            # held back from base_width_px, so the image never reaches
-            # into it regardless of zoom/pan. self.page/self.npages fold
-            # this page's own (self.scroll, avail_height_px, img.height)
-            # fraction into a whole-document position - see
-            # _scrollbar_fractions() - rather than just this page's own.
-            avail_rows = max(1, self.rows - 1)
-            start_frac, visible_frac = self._scrollbar_fractions(
-                self.scroll, self.avail_height_px, self.img.height, self.page, self.npages
-            )
-            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
-            for i, cell in enumerate(cells):
-                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
-
+        out.extend(self._scrollbar_column_escapes())
         out.append(self.format_status())
         sys.stdout.write("".join(out))
         sys.stdout.flush()
+
+    def _remember_drawn_position(self):
+        """Bookkeeping shared by _draw()'s full redraw and _draw_shifted()'s
+        incremental one - what _scroll_shift_rows() compares the *next*
+        draw's position against, to tell a plain scroll apart from a page
+        turn, a zoom, or a pan (see there)."""
+        self._last_page = self.page
+        self._last_x_offset = self.x_offset
+        self._last_zoom_key = round(self.zoom * 100)
+        self._last_scroll = self.scroll
+
+    def _scroll_shift_rows(self, crop_w, crop_h):
+        """Whole character-rows the viewport shifted since the last
+        _draw(), or None if a full redraw is required.
+
+        A vertical-only scroll within the same page/zoom/pan can reuse
+        what's already on screen: the terminal's own scroll-region
+        primitive (DECSTBM + CSI S/T) shifts an already-placed iTerm2
+        inline image right along with plain text (confirmed by hand -
+        see scroll_spike.py in this repo's history), so _draw_shifted()
+        only has to transmit the newly-exposed strip instead of
+        re-encoding and re-sending the whole viewport. This is what
+        decides whether that shortcut applies; every condition here
+        falls back to the always-correct full redraw when in doubt:
+
+        - _last_viewport_set is the same "do we know anything about the
+          previous frame" flag _needs_full_clear() uses - every place
+          that overwrites the screen with something else (help, text
+          mode, a resize, ...) already clears it, so relying on it here
+          for free means _last_page/_last_x_offset/etc. never need
+          resetting anywhere but _remember_drawn_position().
+        - TMUX / not iterm2_like(): the shortcut depends on inline-image
+          placements riding along with a scroll-region shift, which is
+          unverified (and, for tmux, actively suspect - tmux owns the
+          pane's own scrolling and may not replay image content the way
+          a real terminal's internal grid does).
+        - page/x_offset/zoom/crop size all matching: anything else means
+          self.img itself or the crop rectangle changed shape, so there
+          may be nothing valid left on screen to shift.
+        - no active search marker: its box-drawing overlay would need
+          shifting (or erasing) too, and matches are rare enough that
+          it's simplest to just fall back when one's showing.
+        - self.incremental_scroll: --no-incremental-scroll's escape
+          hatch, for a terminal where the above turns out not to hold.
+        """
+        if (not self.incremental_scroll
+                or not self._last_viewport_set
+                or os.environ.get("TMUX")
+                or not iterm2_like()
+                or crop_w != self._last_viewport_w
+                or crop_h != self._last_viewport_h
+                or self._last_page != self.page
+                or self._last_x_offset != self.x_offset
+                or self._last_zoom_key != round(self.zoom * 100)
+                or self._last_marker_bounds is not None
+                or self._active_search_page_match() is not None):
+            return None
+        delta = self.scroll - self._last_scroll
+        if delta == 0 or delta % self.cell_h_px != 0:
+            return None
+        shift = delta // self.cell_h_px
+        avail_rows = max(1, self.rows - 1)
+        if abs(shift) >= avail_rows:
+            return None  # no overlap left - a full redraw is just as cheap
+        return shift
+
+    def _draw_shifted(self, shift, crop_bottom):
+        """The incremental path _draw() takes for a plain vertical
+        scroll (see _scroll_shift_rows()): shift whatever's already
+        displayed with the terminal's own scroll region instead of
+        redrawing it, and transmit only the strip of pixels that just
+        became visible."""
+        avail_rows = max(1, self.rows - 1)
+        strip_rows = abs(shift)
+        strip_h = strip_rows * self.cell_h_px
+        if shift > 0:
+            # Scrolled forward: content moves UP, revealing new rows at
+            # the BOTTOM.
+            strip_top = crop_bottom - strip_h
+            screen_row = avail_rows - strip_rows + 1
+        else:
+            # Scrolled backward: content moves DOWN, revealing new rows
+            # at the TOP.
+            strip_top = self.scroll
+            screen_row = 1
+        strip = self.img.crop((
+            self.x_offset, strip_top,
+            self.x_offset + self.crop_width, strip_top + strip_h,
+        ))
+
+        encode_key = (
+            self.page, strip_top, self.x_offset, strip.width, strip.height,
+            round(self.zoom * 100),
+        )
+        data = self.encode_cache.get(encode_key)
+        if data is None:
+            data = self._encode_crop(strip)
+            self.encode_cache.put(encode_key, data)
+
+        b64 = base64.b64encode(data).decode("ascii")
+        osc = (
+            f"\x1b]1337;File=inline=1;doNotMoveCursor=1;size={len(data)};"
+            f"width={strip.width}px;height={strip.height}px;"
+            f"preserveAspectRatio=0:{b64}\x07"
+        )
+
+        self._remember_drawn_position()
+
+        out = [
+            STATUS_COLOR_OFF,
+            f"\x1b[1;{avail_rows}r",
+            f"\x1b[{shift}S" if shift > 0 else f"\x1b[{strip_rows}T",
+            "\x1b[r",  # back to a full-screen scroll region right away -
+            # nothing past this point should be confined by it.
+            f"\x1b[{screen_row};1H",
+            wrap_for_tmux(osc),
+        ]
+        out.extend(self._scrollbar_column_escapes())
+        out.append(self.format_status())
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    def _scrollbar_column_escapes(self):
+        """The scrollbar column's cells, as a list of positioned escape
+        strings - shared by _draw()'s full redraw and _draw_shifted()'s
+        incremental one, both of which repaint it every frame regardless
+        (it's cheap plain text, not part of what differential drawing
+        is meant to optimize)."""
+        if not self.scrollbar:
+            return []
+        # Same row count avail_height_px was computed from (see
+        # _recompute_geometry()) - the column itself was already
+        # held back from base_width_px, so the image never reaches
+        # into it regardless of zoom/pan. self.page/self.npages fold
+        # this page's own (self.scroll, avail_height_px, img.height)
+        # fraction into a whole-document position - see
+        # _scrollbar_fractions() - rather than just this page's own.
+        avail_rows = max(1, self.rows - 1)
+        start_frac, visible_frac = self._scrollbar_fractions(
+            self.scroll, self.avail_height_px, self.img.height, self.page, self.npages
+        )
+        cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
+        return [f"\x1b[{i + 1};{self.cols}H{cell}" for i, cell in enumerate(cells)]
 
     def status_segments(self):
         """The default status line, as (text, color) fields in order."""
@@ -4561,6 +4712,17 @@ class Viewer:
         out.append(SEARCH_MARKER_RESET)
         return "".join(out)
 
+    def _half_page_step(self):
+        """"d"/"u"'s step size: half a screenful, rounded to a whole
+        number of terminal rows rather than avail_height_px // 2 (which
+        can land mid-row when the row count is odd). Keeping it a clean
+        multiple of cell_h_px is also what lets _scroll_shift_rows()
+        treat a "d"/"u" press the same as any other scroll - otherwise
+        it'd fall back to a full redraw exactly on terminals with an
+        odd number of rows, for no reason a user could see."""
+        half_rows = max(1, (self.rows - 1) // 2)
+        return self.cell_h_px * half_rows
+
     def scroll_down(self, step):
         if self.scroll < self.scroll_max:
             self.scroll = min(self.scroll_max, self.scroll + step)
@@ -4650,9 +4812,9 @@ class Viewer:
         elif key in BACKWARD_WINDOW_KEYS:
             self.scroll_up(self.avail_height_px)
         elif key in ("d", "\x04"):
-            self.scroll_down(self.avail_height_px // 2)
+            self.scroll_down(self._half_page_step())
         elif key in ("u", "\x15"):
-            self.scroll_up(self.avail_height_px // 2)
+            self.scroll_up(self._half_page_step())
         elif key in FORWARD_LINE_KEYS:
             self.scroll_down(self.cell_h_px)
         elif key in BACKWARD_LINE_KEYS:
@@ -4697,7 +4859,7 @@ class Viewer:
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
     border=True, wrap=True, eol_mark=True, line_numbers=False, scrollbar=True,
-    follow=False, wheel_scroll_step=2, keep=False,
+    follow=False, wheel_scroll_step=2, keep=False, incremental_scroll=True,
     debug=False, office_render_scale=OFFICE_RENDER_SCALE,
     office_continuous=False,
 ):
@@ -4707,6 +4869,7 @@ def run_viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
         border=border, wrap=wrap, eol_mark=eol_mark, line_numbers=line_numbers,
         scrollbar=scrollbar, wheel_scroll_step=wheel_scroll_step,
+        incremental_scroll=incremental_scroll,
         debug=debug,
         office_render_scale=office_render_scale, office_continuous=office_continuous,
     )
@@ -5232,6 +5395,17 @@ def main():
              "both image and text mode; toggle any time with r",
     )
     parser.add_argument(
+        "--no-incremental-scroll",
+        action="store_false",
+        dest="incremental_scroll",
+        default=True,
+        help="always redraw the full page image on scroll, instead of "
+             "shifting the terminal's existing content and transmitting "
+             "only the newly-exposed strip - a fallback for a terminal "
+             "where that shortcut (iTerm2/WezTerm-only, and already off "
+             "under tmux) doesn't render correctly",
+    )
+    parser.add_argument(
         "-F", "--follow",
         action="store_true",
         help="watch the file and reload it if it changes on disk "
@@ -5354,6 +5528,7 @@ def main():
                     eol_mark=args.eol_mark, line_numbers=args.line_numbers,
                     scrollbar=args.scrollbar, follow=args.follow,
                     wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
+                    incremental_scroll=args.incremental_scroll,
                     debug=args.debug,
                     office_render_scale=args.rendering_scale,
                     office_continuous=args.continuous,

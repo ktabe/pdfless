@@ -112,7 +112,8 @@ python3 pdfless.py some.pdf
 
 ```
 usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [-B] [-S]
-               [-E] [-N] [--no-scrollbar] [-F] [--wheel-scroll-step N]
+               [-E] [-N] [--no-scrollbar] [--no-incremental-scroll] [-F]
+               [--wheel-scroll-step N]
                [file ...]
 
 positional arguments:
@@ -160,6 +161,12 @@ options:
   --no-scrollbar        スクロールバー（端末の右端に現在位置を示す列）を
                         表示しない——デフォルトでは画像モード・テキスト
                         モードどちらでも表示する。rでいつでも切り替え可能
+  --no-incremental-scroll
+                        スクロール時に常にページ画像全体を再描画する
+                        ——本来は端末上の既存の表示内容をずらし、新しく
+                        見えるようになった帯だけを送信する。この近道
+                        （iTerm2/WezTerm限定、tmux使用時はすでに無効）が
+                        正しく描画されない端末向けのフォールバック
   -F, --follow          ファイルを監視し、更新されたら自動的に読み直す
                         （3秒おきにチェック。同じページ・同じモードのまま）
   --wheel-scroll-step N

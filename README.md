@@ -143,7 +143,8 @@ python3 pdfless.py some.pdf
 
 ```
 usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [-B] [-S]
-               [-E] [-N] [--no-scrollbar] [-F] [--wheel-scroll-step N]
+               [-E] [-N] [--no-scrollbar] [--no-incremental-scroll] [-F]
+               [--wheel-scroll-step N]
                [file ...]
 
 positional arguments:
@@ -190,6 +191,13 @@ options:
                         terminal's right edge marking your position) -
                         shown by default, in both image and text mode;
                         toggle any time with r
+  --no-incremental-scroll
+                        always redraw the full page image on scroll, instead
+                        of shifting the terminal's existing content and
+                        transmitting only the newly-exposed strip - a
+                        fallback for a terminal where that shortcut
+                        (iTerm2/WezTerm-only, and already off under tmux)
+                        doesn't render correctly
   -F, --follow          watch the file and reload it if it changes on disk
                         (checked every 3s), staying on the same page and in
                         the same mode
