@@ -67,8 +67,13 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
 </p>
 
 <p align="center">
+  <img src="docs/screenshots/pdfless-image.png" alt="A plain image file"><br>
+  <em>A plain image file (PNG/JPEG/...)</em>
+</p>
+
+<p align="center">
   <img src="docs/screenshots/pdfless-help.png" alt="Help overlay"><br>
-  <em>Help (<code>?</code>)</em>
+  <em>Help (<code>F1 / :h</code>)</em>
 </p>
 
 ## Requirements

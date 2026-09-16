@@ -48,8 +48,13 @@
 </p>
 
 <p align="center">
+  <img src="docs/screenshots/pdfless-image.png" alt="画像ファイル"><br>
+  <em>画像ファイル（PNG・JPEGなど）</em>
+</p>
+
+<p align="center">
   <img src="docs/screenshots/pdfless-help.png" alt="ヘルプ表示"><br>
-  <em>ヘルプ（<code>?</code>）</em>
+  <em>ヘルプ（<code>F1 / :h</code>）</em>
 </p>
 
 ## 必要なもの
