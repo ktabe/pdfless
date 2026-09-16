@@ -302,6 +302,7 @@ view, boxed on a PDF page image or highlighted in text:
 | --- | --- |
 | `/<regex>` `Enter` | search the whole document for `<regex>`, landing on the first match from here on |
 | `?<regex>` `Enter` | the same search, landing on the last match before here instead - `less(1)`'s backward search |
+| `/` `Enter` / `?` `Enter` | with no pattern typed, repeat the last search pattern, forward / backward |
 | `N` / `P` | jump to the next / previous match |
 | `n` / `p` | while a search is active, the same as `N` / `P` above (otherwise next / previous page) |
 
@@ -321,7 +322,7 @@ Misc:
 | `r` | toggle the scrollbar - a column on the terminal's right edge showing where you are in the whole document (image mode and text mode alike). In the page image you can click it to jump to that position, or drag it to move around; in text mode it's display only, so the terminal's own click-drag text selection keeps working. On by default (`--no-scrollbar` to start it off) |
 | `^L` | redraw the screen |
 | `F1` / `:h` | show a keybinding help box (`q` to close it). `less(1)` puts this on `h`/`H`, which are panning keys here, and `?` is its backward search - hence `F1`, with `:h` as a second way in |
-| `q` / `^C` | quit |
+| `q` / `:q` / `^C` | quit |
 
 ## Testing
 
