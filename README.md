@@ -315,6 +315,16 @@ Misc:
   (tmux 3.3+): add `set -g allow-passthrough on` to `~/.tmux.conf`
   (and reload it, e.g. `tmux source-file ~/.tmux.conf`) — tmux drops
   the inline-image escape sequence by default otherwise.
+- Also under tmux: switching away from a pane showing `pdfless` can
+  leave it blank, since tmux's own screen model doesn't understand the
+  passed-through image and repaints the pane without it. `pdfless`
+  redraws automatically as soon as that pane is focused again, but only
+  if tmux is told to forward focus events at all: add
+  `set -g focus-events on` to `~/.tmux.conf` too. `^L` always redraws
+  by hand if needed. (The pane can't redraw itself the moment it loses
+  focus - by then tmux has already moved the terminal's one real cursor
+  to the pane gaining focus, which is where a same-moment redraw would
+  actually end up landing instead.)
 
 ## Testing
 

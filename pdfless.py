@@ -124,6 +124,33 @@ MOUSE_OFF = "\x1b[?1000l\x1b[?1002l\x1b[?1006l"
 ALT_SCROLL_ON = "\x1b[?1007h"
 ALT_SCROLL_OFF = "\x1b[?1007l"
 
+# Focus reporting (xterm's FocusIn/FocusOut, CSI I / CSI O): lets a
+# regained focus trigger a redraw (see FOCUS_IN handling in run_viewer()).
+# This is what fixes a real bug, not just a nicety: under tmux, switching
+# away from and back to the pane showing a PDF can leave it blank - its
+# own screen model doesn't understand the passed-through inline image
+# (see wrap_for_tmux()), so its internal redraw on a focus change repaints
+# the pane from a model that never had the image in it.
+#
+# Only FOCUS_IN gets a redraw, not FOCUS_OUT, even though both panes
+# involved in a focus change can go blank this way - confirmed by hand
+# that redrawing on FOCUS_OUT actually makes things worse. OSC 1337 draws
+# at "the current cursor position" with no coordinates of its own, and by
+# the time a pane's process is told it just lost focus, tmux has already
+# moved the terminal's one real cursor to the pane gaining focus - so
+# that redraw's image lands in the *other* pane instead (as a stray,
+# oddly-scaled fragment near its prompt). By the time a pane is told it
+# gained focus, the cursor has already moved to it, which is why only
+# that direction is safe to redraw on. A pane that just lost focus still
+# goes blank in the meantime - nothing here can fix that under tmux -
+# but switching back to it fixes it via its own FOCUS_IN.
+#
+# Left on for the whole run, on the same reasoning as ALT_SCROLL_ON
+# above. Requires tmux's own "focus-events on" to reach an app running
+# inside it at all - see the Caveats section in README.md.
+FOCUS_ON = "\x1b[?1004h"
+FOCUS_OFF = "\x1b[?1004l"
+
 
 def char_width(ch):
     """Terminal column width of one character: 2 for wide/fullwidth East
@@ -2523,6 +2550,10 @@ def decode_csi_key(seq):
     key name such as "UP" or "SHIFT-LEFT", or None if unrecognized."""
     if not seq:
         return None
+    if seq == "I":
+        return "FOCUS_IN"
+    if seq == "O":
+        return "FOCUS_OUT"
     final = seq[-1]
     params = seq[:-1].split(";") if seq[:-1] else [""]
     modifier = params[1] if len(params) > 1 else "1"
@@ -4998,7 +5029,7 @@ def run_viewer(
             # otherwise leave the alternate screen like normal, so the
             # shell prompt lands on the real scrollback instead.
             leave_screen = "" if keep else "\x1b[?1049l"
-            sys.stdout.write(MOUSE_OFF + ALT_SCROLL_OFF + "\x1b[?25h" + leave_screen)
+            sys.stdout.write(MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h" + leave_screen)
             sys.stdout.flush()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
             # SIGSTOP rather than SIGTSTP: the cleanup above already does
@@ -5018,7 +5049,7 @@ def run_viewer(
             tty.setraw(fd)
             enter_screen = "" if keep else "\x1b[?1049h"
             sys.stdout.write(
-                enter_screen + "\x1b[?25l" + ALT_SCROLL_ON
+                enter_screen + "\x1b[?25l" + ALT_SCROLL_ON + FOCUS_ON
                 + ("" if viewer.text_mode else MOUSE_ON)
             )
             sys.stdout.flush()
@@ -5116,6 +5147,16 @@ def run_viewer(
         if key == "\x0c":  # ^L: repaint the screen (e.g. after other
             # output has garbled it), without otherwise changing anything
             viewer.refresh()
+            continue
+
+        if key == "FOCUS_IN":
+            # Same fix as ^L, triggered automatically: see FOCUS_ON's
+            # comment for why a focus change (under tmux, especially)
+            # can otherwise leave this pane blank - and for why only
+            # this direction, not FOCUS_OUT, is safe to redraw on.
+            viewer.refresh()
+            continue
+        if key == "FOCUS_OUT":
             continue
 
         if key == "r":
@@ -5517,7 +5558,7 @@ def main():
             # Viewer.__init__), where mouse reporting should be off, the
             # same as it would be for a PDF's `t` toggle.
             initial_mouse = MOUSE_OFF if files[0].starts_in_text_mode() else MOUSE_ON
-            sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON)
+            sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON + FOCUS_ON)
             sys.stdout.flush()
             viewer = None
             try:
@@ -5540,12 +5581,12 @@ def main():
                     # line and bring the cursor back so the shell prompt
                     # lands cleanly below the image.
                     sys.stdout.write(
-                        MOUSE_OFF + ALT_SCROLL_OFF
+                        MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF
                         + f"\x1b[{viewer.rows};1H\x1b[2K\x1b[?25h"
                     )
                 else:
                     sys.stdout.write(
-                        MOUSE_OFF + ALT_SCROLL_OFF + "\x1b[?25h\x1b[?1049l"
+                        MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h\x1b[?1049l"
                     )
                 sys.stdout.flush()
     finally:
