@@ -6,36 +6,33 @@ A `less(1)`-like full-screen pager for PDFs and images, for terminals
 that support [iTerm2](https://iterm2.com)'s inline image protocol.
 Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
 
-Lets you view a PDF (or a plain image - PNG, JPEG, and whatever else
-[Pillow](https://python-pillow.org) can decode) right in the terminal,
-using almost the same keybindings as `less(1)` — scroll by line, by
-half/full window, jump to a page, and so on.
-On top of that, `pdfless` also supports zooming in/out and panning. The mouse wheel is supported too, for scrolling.
-
-For a PDF, `pdfless` also has a plain-text mode, which extracts the
-text from the page — handy for copying text out. You can switch
-between image mode and text mode any time with `t`.
-
-You can also search a PDF with a regex, jumping straight to each
-match — works in both image mode and text mode.
-
-PDF hyperlinks are clickable in the page image — both external URLs
-(opened in your system browser) and internal links to another page in
-the same document.
-
-You can also open more than one file at once (`pdfless a.pdf b.png ...`)
-and switch between them with `:n`/`:p`, `less(1)`-style.
-
-(As a bonus, `pdfless` can open a plain text file too, shown straight in
-that same text mode and searchable the same way as a PDF's.)
-
-On macOS, with a local Chrome/Chromium install, `pdfless` can also open
-Word/Excel/PowerPoint/Keynote/Pages/RTF files and more — see
-[Office Document Support (Experimental)](#office-document-support-experimental)
-below.
-
-Since it's just a terminal program, it works the same way over SSH — no
-X11 forwarding, and no need to copy the PDF to your local machine first.
+- View a PDF (or a plain image - PNG, JPEG, and whatever else
+  [Pillow](https://python-pillow.org) can decode) right in the
+  terminal, using almost the same keybindings as `less(1)` — scroll by
+  line, by half/full window, jump to a page, and so on
+- Zoom in/out and pan around a page; the mouse wheel scrolls too
+- A scrollbar - a column on the terminal's right edge showing where
+  you are in the whole document, in both image and text mode; click or
+  drag it to jump around
+- For a PDF, a plain-text mode that extracts the text from the page -
+  handy for copying text out. Switch between image mode and text mode
+  any time with `t`
+- Search a PDF with a regex, jumping straight to each match - works in
+  both image mode and text mode
+- Clickable PDF hyperlinks in the page image - both external URLs
+  (opened in your system browser) and internal links to another page
+  in the same document
+- Open more than one file at once (`pdfless a.pdf b.png ...`) and
+  switch between them with `:n`/`:p`, `less(1)`-style
+- Also opens a plain text file directly, shown straight in that same
+  text mode and searchable the same way a PDF is
+- On macOS, with a local Chrome/Chromium install, also opens
+  Word/Excel/PowerPoint/Keynote/Pages/RTF files and more - see
+  [Office Document Support (Experimental)](#office-document-support-experimental)
+  below
+- Works the same way over SSH, since it's just a terminal program - no
+  need for VNC/Remote Desktop or to copy the file to your local machine
+  first
 
 ## Screenshots
 
@@ -80,10 +77,6 @@ X11 forwarding, and no need to copy the PDF to your local machine first.
   working on [iTerm2](https://iterm2.com) and
   [WezTerm](https://wezterm.org); terminals
   without this protocol will not display anything.
-- Inside tmux, nothing will render at all unless passthrough is turned
-  on (tmux 3.3+): add `set -g allow-passthrough on` to `~/.tmux.conf`
-  (and reload it, e.g. `tmux source-file ~/.tmux.conf`) — tmux drops
-  the inline-image escape sequence by default otherwise.
 - [poppler](https://poppler.freedesktop.org) (`pdftoppm`/`pdfinfo`/
   `pdftocairo`) - needed for viewing PDFs directly, and for rasterizing
   pictures embedded in a Quick Look preview file (Word/Excel/
@@ -154,16 +147,13 @@ usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [-B] [-S]
 positional arguments:
   file                  path to one or more PDF, image, text, or Quick-Look-
                         previewable files - reads from stdin instead if none
-                        are given (or if "-" is given in their place), so
-                        pdfless can also be used as $PAGER
+                        or "-" are given
 
 options:
   --help                show this help message and exit
   -v, --version         show program's version number and exit
   -p, --page PAGE       page to start on, in the first file (default: 1)
-  -d, --debug           print timing for each stage of Quick Look preview
-                        rendering (qlmanage, pdftocairo, measuring, rendering,
-                        splitting into pages) to stderr
+  -d, --debug           print some debug information to stderr
   -s, --rendering-scale N
                         device-pixel-ratio to render Quick Look preview files
                         (Word/Excel/PowerPoint/etc., macOS only) at - higher
@@ -198,10 +188,7 @@ options:
   --no-incremental-scroll
                         always redraw the full page image on scroll, instead
                         of shifting the terminal's existing content and
-                        transmitting only the newly-exposed strip - a
-                        fallback for a terminal where that shortcut
-                        (iTerm2/WezTerm-only, and already off under tmux)
-                        doesn't render correctly
+                        transmitting only the newly-exposed strip
   -F, --follow          watch the file and reload it if it changes on disk
                         (checked every 3s), staying on the same page and in
                         the same mode
@@ -216,53 +203,34 @@ from a build script, a LaTeX watch loop, or a script re-rendering a PNG) —
 With multiple files open, it only watches whichever one is currently
 displayed, switching what it watches along with `:n`/`:p`.
 
-### Using pdfless as `$PAGER`
-
-With no `file` argument at all (or with `-` in its place), `pdfless`
-reads from stdin instead - the shape most tools invoke `$PAGER` with:
-
-```sh
-export PAGER=/path/to/pdfless.py
-git log     # or: man some-command, journalctl, ...
-```
-
-or one-off, without exporting anything:
-
-```sh
-git log | pdfless.py
-```
-
-The whole input is read up front and shown as a plain text file (so
-it's a snapshot, not a live `tail -f`-style follow), and keyboard input
-still comes from the real terminal even though stdin itself is a pipe
-- the same trick `less(1)`/`most(1)` use. A colorized tool's raw ANSI
-escape codes aren't interpreted - most tools already turn color off
-when their output isn't a terminal, but one forced on with something
-like `--color=always` will show up as `^[` noise rather than color.
-
 ## Office Document Support (Experimental)
 
 On macOS, with a local Chrome/Chromium install, `pdfless` can also open
-anything your Mac's Quick Look generators know how to preview — Word,
-Excel, PowerPoint, Keynote, Pages, RTF, and more — by rendering that
-Quick Look preview through a headless Chrome instead of poppler/pypdf.
-This is experimental: unlike the PDF/image/text-file support above, it
-depends entirely on what each app's own Quick Look generator exposes,
-and that varies a lot from one format to the next — most noticeably in
-whether a multi-page/multi-sheet/multi-slide document can actually be
-paged through, or only ever shown as one long continuously-scrollable
-image (the same as a plain image file, and the same as `-c`/`--continuous`
-forces for any of these).
+anything your Mac's Quick Look generators can preview — Word, Excel,
+PowerPoint, Keynote, Pages, RTF, and more — by rendering that preview
+through a headless Chrome instead of poppler/pypdf.
 
-| Format | Extensions | Paging | Notes |
-| --- | --- | --- | --- |
-| Word | `.doc`, `.docx` | Always continuous | No page-boundary marker in Word's Quick Look preview |
-| Excel | `.xls`, `.xlsx` | One page per sheet | |
-| PowerPoint | `.ppt`, `.pptx` | One page per slide | The most reliably paginated of any format here |
-| RTF | `.rtf` | Always continuous | Converted to `.docx` via macOS's own `textutil` first (Quick Look has no HTML preview of its own for RTF), then rendered the same way as Word |
-| Pages | `.pages` | Always continuous | Same limitation as Word - no page-boundary marker |
-| Numbers | `.numbers` | Only the first sheet is shown | Numbers' Quick Look tab strip is marked up differently from Excel's and isn't recognized yet - a known gap, not a deliberate design choice |
-| Keynote | `.key` | Always continuous | Unlike PowerPoint, Keynote's Quick Look preview exposes no slide-boundary marker at all - a known gap |
+This is experimental: how well paging works depends entirely on what
+each format's own Quick Look generator exposes, which varies a lot -
+see the table below. A format that can't be paged is shown as one long
+scrollable image instead (the same as a plain image file, or as
+`-c`/`--continuous` forces for any of these).
+
+| Format | Extensions | Paging | Text mode | Notes |
+| --- | --- | --- | --- | --- |
+| Word | `.doc`, `.docx` | Always continuous | Yes | No page-boundary marker in Word's Quick Look preview |
+| Excel | `.xls`, `.xlsx` | One page per sheet | No | |
+| PowerPoint | `.ppt`, `.pptx` | One page per slide | No | The most reliably paginated of any format here |
+| RTF | `.rtf` | Always continuous | Yes | Converted to `.docx` via macOS's own `textutil` first (Quick Look has no HTML preview of its own for RTF), then rendered the same way as Word |
+| Pages | `.pages` | Always continuous | No | Same limitation as Word - no page-boundary marker |
+| Numbers | `.numbers` | Only the first sheet is shown | No | Numbers' Quick Look tab strip is marked up differently from Excel's and isn't recognized yet - a known gap, not a deliberate design choice |
+| Keynote | `.key` | Always continuous | No | Unlike PowerPoint, Keynote's Quick Look preview exposes no slide-boundary marker at all - a known gap |
+
+Text mode (`t`) comes from macOS's own `textutil`, which only
+understands Word-family documents (`.doc`/`.docx`/`.rtf`) - it has
+nothing to say about a spreadsheet, slide deck, or Apple's own iWork
+bundle formats (Pages/Numbers/Keynote), so `t` reports no text there
+even though the image view still works.
 
 A file in any of these formats is skipped with a warning if `qlmanage`
 or a local Chrome/Chromium isn't available. `-s`/`--rendering-scale`
@@ -300,21 +268,21 @@ Zoom and pan:
 | `K` / `U` / `Shift-Up` | jump to top of the current page (same as `g`) |
 | `J` / `D` / `Shift-Down` | jump to bottom of the current page (same as `G`) |
 
-Search (PDFs and plain text files always; a Quick Look preview file -
-Word/Excel/PowerPoint/etc. - once switched into text mode with `t`,
-since there's no equivalent way to search its rendered page image; not
-available at all for a plain image - a case-insensitive
-[Python regex](https://docs.python.org/3/library/re.html) against the
-extracted/file text, across the whole document — not just the current
-page; falls back to a literal substring match if the pattern isn't
-valid regex syntax, e.g. `C++`). Jumping to a match scrolls it into
-view, boxed on a PDF page image or highlighted in text:
+Search always works for PDFs and plain text files; for a Quick Look
+preview file (Word/Excel/PowerPoint/etc.) only once switched into text
+mode with `t`, since there's no way to search its rendered page image
+directly; not available at all for a plain image. It's a
+case-insensitive [Python regex](https://docs.python.org/3/library/re.html)
+against the extracted/file text, across the whole document (not just
+the current page) - falling back to a literal substring match if the
+pattern isn't valid regex syntax, e.g. `C++`. Jumping to a match
+scrolls it into view, boxed on a PDF page image or highlighted in text:
 
 | Keys | Action |
 | --- | --- |
-| `/<regex>` `Enter` | search the whole document for `<regex>`, landing on the first match from here on |
-| `?<regex>` `Enter` | the same search, landing on the last match before here instead - `less(1)`'s backward search |
-| `/` `Enter` / `?` `Enter` | with no pattern typed, repeat the last search pattern, forward / backward |
+| `/<regex>` `Enter` | forward search for `<regex>` |
+| `?<regex>` `Enter` | backward search for `<regex>` |
+| `/` `Enter` / `?` `Enter` | with no pattern typed, repeat the last search pattern |
 | `N` / `P` | jump to the next / previous match |
 | `n` / `p` | while a search is active, the same as `N` / `P` above (otherwise next / previous page) |
 
@@ -325,16 +293,23 @@ Misc:
 | click / drag | (page image, not text mode) on the scrollbar, jump to the position clicked - and keep following the pointer while you drag; otherwise open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
 | mouse wheel | scroll up / down - in the page image, two lines at a time (`--wheel-scroll-step` to change that); in text mode, one line at a time |
 | `[` / `]` | back / forward, through the positions internal links have jumped from |
-| `t` | toggle a plain-text view (scrollable by page/line, and `h`/`l`/`H`/`L` pan for lines wider than the terminal) - for a PDF, the current page's extracted text; for a Word-family Quick Look preview file (`.doc`/`.docx`/`.odt`/`.rtf`/...), the whole document's text via macOS's `textutil` (not paginated - `n`/`p` do nothing in this view). On a plain image, a spreadsheet, or a slide deck, this just reports that there's no text to show (a plain text file is already shown this way, with nothing to toggle; an `.rtf` file falls back to this too, shown as its actual text via `textutil` rather than its raw markup, only if Quick Look/Chrome rendering isn't available) |
-| `B` | (text mode) toggle a border around the page's edges - on by default (`--no-border`/`-B` to start with it off); a plain text file starts with it off regardless, since there's usually no real "page" boundary in one worth bordering; no border while wrapped, regardless of `B` (`-S` to unwrap first) |
-| `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped); no border while wrapped, regardless of `B`. `s` is the primary key; `-S` (`less(1)`-style) is kept only for compatibility |
-| `E` | (text mode) toggle marking a real end-of-line (↵) - on by default (`-E`/`--no-eol-mark` to start without it); uppercase, since lowercase `e` already scrolls forward one line |
-| `#` / `-N` | (text mode) toggle a right-aligned, gray line-number gutter - off by default (`-N`/`--line-numbers` to start with it on) |
+| `t` | toggle plain-text view - the page's extracted text for a PDF, or the whole document's for a Word-family file (`.doc`/`.docx`/`.rtf`/...); a no-op for an image, spreadsheet, or slide deck, which have no text to extract |
+| `B` | (text mode) toggle a border around the page's edges - on by default (`--no-border`/`-B` to start with it off); a plain text file starts with it off regardless; no border while wrapped, regardless of `B` (`-S` to unwrap first) |
+| `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped) |
+| `E` | (text mode) toggle marking a real end-of-line (↵) - on by default (`-E`/`--no-eol-mark` to start without it) |
+| `#` / `-N` | (text mode) toggle a line-number gutter - off by default (`-N`/`--line-numbers` to start with it on) |
 | `C` | (text mode) clear the way for a select-and-copy: turn off the EOL markers, the border, the scrollbar and the line numbers in one go, so a drag across the text picks up the text alone. A second press puts back whatever was on before - anything you'd already switched off stays off |
-| `r` | toggle the scrollbar - a column on the terminal's right edge showing where you are in the whole document (image mode and text mode alike). In the page image you can click it to jump to that position, or drag it to move around; in text mode it's display only, so the terminal's own click-drag text selection keeps working. On by default (`--no-scrollbar` to start it off) |
+| `r` | toggle the scrollbar - on by default (`--no-scrollbar` to start it off). In text mode it's display only, so the terminal's own click-drag text selection keeps working |
 | `^L` | redraw the screen |
-| `F1` / `:h` | show a keybinding help box (`q` to close it). `less(1)` puts this on `h`/`H`, which are panning keys here, and `?` is its backward search - hence `F1`, with `:h` as a second way in |
+| `F1` / `:h` | show a keybinding help box (`q` to close it) |
 | `q` / `:q` / `^C` | quit |
+
+## Caveats
+
+- Under tmux, nothing renders at all unless passthrough is turned on
+  (tmux 3.3+): add `set -g allow-passthrough on` to `~/.tmux.conf`
+  (and reload it, e.g. `tmux source-file ~/.tmux.conf`) — tmux drops
+  the inline-image escape sequence by default otherwise.
 
 ## Testing
 
