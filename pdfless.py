@@ -4070,8 +4070,8 @@ class Viewer:
                 STATUS_COLOR_FILE_INDEX,
             ))
         segments += [
-            (f" page {self.page}/{self.npages} ", STATUS_COLOR_PAGE),
-            (f" {pct}% ", STATUS_COLOR_LOC),
+            (f" page {self.page:>{len(str(self.npages))}}/{self.npages} ", STATUS_COLOR_PAGE),
+            (f" {pct:>3}% ", STATUS_COLOR_LOC),
             (mode_field, STATUS_COLOR_ZOOM),
             (" F1 or :h for help ", STATUS_COLOR_HELP),
         ]
