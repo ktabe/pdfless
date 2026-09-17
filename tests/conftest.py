@@ -85,6 +85,32 @@ def sample_twopage_docx():
 
 
 @pytest.fixture
+def sample_docx_with_link():
+    """A Word document with one real external hyperlink ("click me" ->
+    https://example.com/hello) - built via python-docx (its w:hyperlink
+    XML written by hand, since python-docx has no built-in helper for
+    it). Used to confirm a Word document's own hyperlinks survive
+    Chrome's --print-to-pdf as real, clickable PDF link annotations
+    (see OfficeDocument.get_page_image()'s PdfDocument delegate)."""
+    return os.path.join(FIXTURES_DIR, "sample_with_link.docx")
+
+
+@pytest.fixture
+def sample_docx_with_internal_link():
+    """A Word document with an internal hyperlink ("jump to target") to
+    a w:bookmark ~80 filler paragraphs further down - built via
+    python-docx (bookmarkStart/bookmarkEnd and an anchor-based
+    w:hyperlink, both written by hand). Since FlowingText always
+    renders as a single continuous page (see its class docstring), a
+    genuine same-document jump like this resolves to the *same* page
+    with a different scroll target, not a different page - confirmed
+    by hand that it survives Chrome's --print-to-pdf as a real PDF
+    /GoTo link annotation pypdf resolves to {"kind": "page", "page": 1,
+    "top_pt": ...}, the same as a real PDF's own internal links."""
+    return os.path.join(FIXTURES_DIR, "sample_with_internal_link.docx")
+
+
+@pytest.fixture
 def sample_twopage_doc():
     """Same document as sample_twopage_docx, converted to the legacy
     binary format via `soffice --headless --convert-to doc`."""

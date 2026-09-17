@@ -161,9 +161,11 @@ options:
   -d, --debug           print some debug information to stderr
   -s, --rendering-scale N
                         device-pixel-ratio to render Quick Look preview files
-                        (Word/Excel/PowerPoint/etc., macOS only) at - higher
-                        looks sharper when zoomed in but is slower to render
-                        (default: 1)
+                        (Excel/PowerPoint/Keynote/etc., macOS only) at -
+                        higher looks sharper when zoomed in but is slower to
+                        render (default: 1). No effect on Word/RTF/Pages,
+                        which render to a real PDF instead and are always
+                        sharp regardless of zoom
   -c, --continuous      for a Quick Look preview file (macOS only), force
                         continuous scrolling instead of paginating
   -k, --keep            leave the last page on screen when quitting (q or ^C)
@@ -221,6 +223,12 @@ see the table below. A format that can't be paged is shown as one long
 scrollable image instead (the same as a plain image file, or as
 `-c`/`--continuous` forces for any of these).
 
+Word, RTF, and Pages render to a real PDF under the hood (via Chrome's
+headless `--print-to-pdf`, rather than a screenshot), so - like a
+normal PDF, and unlike the other formats below - they stay sharp at any
+zoom level, and a hyperlink in the original document is clickable, the
+same as a real PDF's.
+
 | Format | Extensions | Paging | Text mode | Notes |
 | --- | --- | --- | --- | --- |
 | Word | `.doc`, `.docx` | Always continuous | Yes | No page-boundary marker in Word's Quick Look preview |
@@ -239,7 +247,8 @@ even though the image view still works.
 
 A file in any of these formats is skipped with a warning if `qlmanage`
 or a local Chrome/Chromium isn't available. `-s`/`--rendering-scale`
-controls how sharp the rendered pages look when zoomed in; see
+controls how sharp the rendered pages look when zoomed in for the
+formats that don't render to a real PDF (see above); see
 [Usage](#usage) for both options.
 
 ## Keys

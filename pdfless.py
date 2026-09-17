@@ -617,6 +617,22 @@ def _pdf_page_size_pt_safe(pdf_path):
     return (float(m.group(1)), float(m.group(2))) if m else None
 
 
+def _pdf_page_count_safe(pdf_path):
+    """Like PdfDocument._pdf_page_count(), but tolerant of failure
+    (returns None rather than die()ing the whole program) - for reading
+    back how many pages Chrome's --print-to-pdf produced (see
+    FlowingText.build_pages()), where a bad reading just means falling
+    back to the screenshot-based path rather than aborting entirely."""
+    try:
+        out = subprocess.run(
+            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
+    return int(m.group(1)) if m else None
+
+
 def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
     """A Quick Look Office/iWork preview can embed a picture as
     `<img src="AttachmentN.pdf">` - the relevant generator apparently
@@ -881,6 +897,64 @@ def _capture_html_screenshot(chrome, html_path, width, height, out_png, render_s
     )
 
 
+def _capture_html_pdf(chrome, html_path, width, height, out_pdf, timeout=20):
+    """Print `html_path` to a real (vector) PDF at an exact `width` x
+    `height` CSS-pixel page size, via Chrome's headless --print-to-pdf -
+    unlike _capture_html_screenshot()'s fixed-resolution PNG, this keeps
+    text as real PDF text (not a bitmap of it), so pdfless can
+    re-rasterize it at whatever DPI the current zoom needs (see
+    PdfDocument.get_page_image()) instead of upscaling one fixed
+    screenshot. Confirmed by hand that Chrome's print engine happily
+    paginates content taller than one `height`-tall page into further
+    real PDF pages, and that a plain `<a href>` survives as a real PDF
+    link annotation (see Viewer._ensure_link_index()).
+
+    The page size is set via an injected `@page` CSS rule, in a scratch
+    copy of html_path that's never written back (same idea as
+    _measure_slide_offsets()'s instrumented copy) - headless Chrome's
+    CLI has no --paper-width/--paper-height flag of its own; this is
+    the only way to reach a custom page size without going through the
+    DevTools protocol (which is what a browser-automation library like
+    Playwright would use instead - not worth the extra dependency just
+    for this one knob).
+
+    Returns True on success, False for anything that went wrong
+    (a too-old Chrome without --print-to-pdf, a bad html_path, ...) -
+    the caller falls back to the screenshot-based path either way, so
+    this never raises."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return False
+
+    style = f"<style>@page {{ size: {width}px {height}px; margin: 0; }}</style>"
+    idx = content.lower().find("</head>")
+    injected = content[:idx] + style + content[idx:] if idx != -1 else style + content
+    print_path = os.path.join(os.path.dirname(html_path), "pdfless-print.html")
+    try:
+        with open(print_path, "w", encoding="utf-8") as f:
+            f.write(injected)
+    except OSError:
+        return False
+
+    try:
+        subprocess.run(
+            [
+                chrome, "--headless", "--disable-gpu", "--no-sandbox",
+                f"--print-to-pdf={out_pdf}", "--print-to-pdf-no-header",
+                f"file://{os.path.abspath(print_path)}",
+            ],
+            capture_output=True, check=True, timeout=timeout,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return False
+    finally:
+        if os.path.exists(print_path):
+            os.unlink(print_path)
+    return os.path.exists(out_pdf)
+
+
 def _sample_background_color(img):
     """A representative "blank" background color for `img`, sampled from
     its very top-left corner - outside the actual document content for
@@ -1099,6 +1173,56 @@ def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
         return None
 
 
+def _measure_content_height(chrome, html_path, width, timeout=30):
+    """document.body.scrollHeight for `html_path` at `width` (logical
+    CSS px) - the same script-injected-title / --dump-dom technique as
+    _measure_slide_offsets() (see there for why dump-dom rather than a
+    screenshot), but for a document's total flowing height rather than
+    per-slide boundaries.
+
+    Used to size FlowingText's single continuous @page height to the
+    document's real content instead of one size-fits-all oversized
+    page regardless of how short the document actually is - CSS's
+    `size: <width> auto` looks like the obvious way to ask a browser's
+    print engine to size a page's height to its content, but confirmed
+    by hand that Chromium doesn't support "auto" here at all (silently
+    falls back to a default Letter page instead), so measuring first
+    and passing an explicit height is the only way. Returns None on
+    any failure - the caller falls back to a fixed cap
+    (OFFICE_MAX_CAPTURE_HEIGHT) instead."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+    script = "<script>document.title = String(Math.ceil(document.body.scrollHeight));</script>"
+    idx = content.rfind("</body>")
+    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
+    measure_path = os.path.join(os.path.dirname(html_path), "pdfless-height-measure.html")
+    try:
+        with open(measure_path, "w", encoding="utf-8") as f:
+            f.write(instrumented)
+    except OSError:
+        return None
+    try:
+        r = subprocess.run(
+            [
+                chrome, "--headless", "--no-sandbox",
+                f"--window-size={width},1080",
+                "--dump-dom", "--virtual-time-budget=8000",
+                f"file://{os.path.abspath(measure_path)}",
+            ],
+            capture_output=True, text=True, timeout=timeout, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        if os.path.exists(measure_path):
+            os.unlink(measure_path)
+    m = re.search(r"<title>(\d+)</title>", r.stdout)
+    return int(m.group(1)) if m else None
+
+
 def _slice_and_save_pages(trimmed, bounds, tmpdir, tag):
     """Crop `trimmed` at each consecutive pair in `bounds` (a list of Y
     pixel offsets, first always 0, last always trimmed.height) and save
@@ -1135,7 +1259,11 @@ class OfficeVariant:
 
     def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
         """Returns a list of page PNG paths, or None on failure (a
-        Chrome screenshot subprocess failing)."""
+        Chrome screenshot subprocess failing) - or, for FlowingText
+        specifically, the 3-tuple ("pdf", pdf_path, npages) when a real
+        PDF was captured instead (see FlowingText._build_pdf_pages()
+        and OfficeDocument._render_office_pages(), which turns that
+        into a PdfDocument delegate)."""
         raise NotImplementedError
 
     def _save_pages(self, trimmed, bounds, tmpdir, debug, progress):
@@ -1310,17 +1438,76 @@ class SlideDeck(OfficeVariant):
 
 class FlowingText(OfficeVariant):
     """A continuously-flowing document with no slide markers (e.g.
-    Word), or one whose measurement simply didn't pan out - its true
-    total content height isn't known up front, so this starts with a
-    guess and doubles it if the content still reaches the bottom edge,
-    up to a hard cap. Renders at OFFICE_RENDER_SCALE_FLOWING rather
-    than the caller's default - these documents are usually short and
-    text-heavy enough that sharpness matters more than the render-time
-    tradeoff the default otherwise makes for a large slide deck -
-    unless the caller (-s/--rendering-scale) asked for a specific scale
-    explicitly."""
+    Word). Tries Chrome's headless --print-to-pdf first (see
+    _build_pdf_pages()) - a real PDF pdfless can re-rasterize crisply at
+    any zoom - and only falls back to the older screenshot-and-slice
+    approach (_build_pages_via_screenshot(), see there for the
+    "grow the capture height and retry" doubling loop, up to a hard
+    cap) if that Chrome build doesn't support it. Renders the fallback
+    at OFFICE_RENDER_SCALE_FLOWING rather than the caller's default -
+    these documents are usually short and text-heavy enough that
+    sharpness matters more than the render-time tradeoff the default
+    otherwise makes for a large slide deck - unless the caller
+    (-s/--rendering-scale) asked for a specific scale explicitly (moot
+    for the PDF path, which is always re-rasterized at whatever DPI the
+    current zoom needs, regardless of any render_scale)."""
 
     def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
+        pdf_pages = self._build_pdf_pages(tmpdir, debug, progress, continuous)
+        if pdf_pages is not None:
+            return pdf_pages
+        return self._build_pages_via_screenshot(tmpdir, debug, render_scale, progress, continuous)
+
+    def _build_pdf_pages(self, tmpdir, debug, progress, continuous):
+        """Real PDF pages via _capture_html_pdf() - Chrome's own print
+        engine paginates content overflow into further pages on its
+        own, so (unlike the screenshot path) there's no grow-and-retry
+        loop needed here. Returns ("pdf", path, npages) for
+        OfficeDocument._render_office_pages() to wire up as a
+        PdfDocument delegate, or None to fall back to the screenshot
+        path (an older Chrome without --print-to-pdf, or anything else
+        going wrong).
+
+        Always requests one page sized to the document's own content
+        (ignoring `continuous`, unlike the screenshot path's own bounds
+        logic below) - a continuously-flowing document (Word, Pages, a
+        converted RTF) has no real page boundaries of its own for the
+        print engine to land on (see the class docstring), so letting
+        it paginate at self.height would just be a different arbitrary
+        cut than the screenshot path's, not a truer one - and it's
+        documented (README) that these always render as a single
+        continuous page regardless of -c/--continuous, which already
+        covers this case implicitly (there's nothing for it to toggle
+        here)."""
+        out_pdf = os.path.join(tmpdir, f"office-capture-{self.tag}.pdf")
+        measure_label = f"{self.name}: measuring content height"
+        with _DebugTimer(debug, measure_label), progress.spin(measure_label + "..."):
+            content_height = _measure_content_height(self.chrome, self.html_path, self.width)
+        if not content_height:
+            # Couldn't measure - rather than guess a one-size-fits-all
+            # OFFICE_MAX_CAPTURE_HEIGHT (a real, if rare, source of a
+            # giant near-blank page under load, where Chrome's dump-dom
+            # measurement is more likely to time out), fall back to the
+            # screenshot path, which doesn't depend on this measurement
+            # at all.
+            return None
+        # A little headroom: print-mode layout can measure a few px
+        # taller than screen-mode's scrollHeight for the same content
+        # (a marginal font-metric difference between the two rendering
+        # paths) - this only has to avoid spilling a couple of
+        # leftover px onto a needless second page, not be exact.
+        page_height = min(OFFICE_MAX_CAPTURE_HEIGHT, content_height + 40)
+        label = f"{self.name}: rendering to PDF"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            ok = _capture_html_pdf(self.chrome, self.html_path, self.width, page_height, out_pdf)
+        npages = _pdf_page_count_safe(out_pdf) if ok else None
+        if not npages:
+            if os.path.exists(out_pdf):
+                os.unlink(out_pdf)
+            return None
+        return ("pdf", out_pdf, npages)
+
+    def _build_pages_via_screenshot(self, tmpdir, debug, render_scale, progress, continuous):
         if render_scale == OFFICE_RENDER_SCALE:
             render_scale = OFFICE_RENDER_SCALE_FLOWING
         out_png = os.path.join(tmpdir, f"office-capture-{self.tag}.png")
@@ -2052,6 +2239,14 @@ class OfficeDocument(DocumentHandler):
         super().__init__(path)
         self.pages = None  # [png_path, ...] once rendered - see
         # build_pages()/ensure_pages(); None until the first render.
+        self._pdf_delegate = None  # a PdfDocument wrapping a real,
+        # print-to-pdf-rendered PDF, when FlowingText managed one (see
+        # _render_office_pages()) - get_page_image() forwards to it
+        # instead of treating self.pages as a list of PNGs, so these
+        # pages stay crisp at any zoom the same way a real PDF does.
+        # self.pages is still set (to a same-length placeholder list)
+        # in that case, purely so len(self.pages) keeps working for
+        # Viewer._ensure_office_pages()/reload().
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
@@ -2199,6 +2394,19 @@ class OfficeDocument(DocumentHandler):
     def _render_and_remember(self, source_path, tmpdir, **kwargs):
         pages = self._render_office_pages(source_path, tmpdir, **kwargs)
         if pages:
+            if isinstance(pages, tuple) and pages[0] == "pdf":
+                # FlowingText managed a real PDF (see
+                # FlowingText._build_pdf_pages()) - wrap it as a
+                # PdfDocument delegate (see get_page_image()) and
+                # normalize back to a same-length list of paths, so
+                # every other caller of build_pages()/ensure_pages()
+                # (which only ever does len(pages)) sees the same shape
+                # it always has.
+                _, pdf_path, npages = pages
+                self._pdf_delegate = PdfDocument(pdf_path)
+                pages = [pdf_path] * npages
+            else:
+                self._pdf_delegate = None
             self.pages = pages
         return pages
 
@@ -2356,7 +2564,22 @@ class OfficeDocument(DocumentHandler):
         # unlike ImageDocument, there's no single fixed path, so this
         # reads self.pages (kept in sync by build_pages()/
         # ensure_pages()) rather than a path fixed at construction time.
+        # Only reached when self._pdf_delegate is None - get_page_image()
+        # (below) forwards to it directly otherwise, without ever
+        # calling this (self.pages holds a same-length placeholder list
+        # in that case, not real per-page paths - see
+        # _render_and_remember()).
         return self.pages[page - 1]
+
+    def get_page_image(self, cache, page, target_px, fit):
+        # A FlowingText document rendered to a real PDF instead of PNGs
+        # (see _render_and_remember()) - re-rasterize it the same way a
+        # real PdfDocument would, at whatever DPI the current zoom
+        # needs, instead of resizing one fixed-resolution screenshot
+        # (the DocumentHandler default this falls back to otherwise).
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.get_page_image(cache, page, target_px, fit)
+        return super().get_page_image(cache, page, target_px, fit)
 
 
 class RtfOfficeDocument(OfficeDocument):
@@ -4317,10 +4540,25 @@ class Viewer:
         self._load_page()
         self.scroll = scroll
 
+    def _pdf_source(self):
+        """The PdfDocument to defer to for anything that only makes
+        sense against a real PDF (page_size_pt(), build_link_index()) -
+        either self.doc_handler itself, or the PdfDocument an
+        OfficeDocument rendered to under the hood (see
+        OfficeDocument.get_page_image()'s _pdf_delegate - a plain
+        <a href> in the original Word/RTF/Pages document survives
+        Chrome's --print-to-pdf as a real PDF link annotation, so this
+        lets it be treated exactly like a real PDF's hyperlinks
+        wherever this is used), or None if neither applies."""
+        if self.is_pdf:
+            return self.doc_handler
+        return getattr(self.doc_handler, "_pdf_delegate", None)
+
     def _ensure_link_index(self):
         if self._link_index is None:
-            if self.is_pdf:
-                self._link_index = self.doc_handler.build_link_index(self.npages)
+            pdf_source = self._pdf_source()
+            if pdf_source is not None:
+                self._link_index = pdf_source.build_link_index(self.npages)
             else:
                 # No hyperlinks outside a PDF, but a multi-page "office"
                 # preview (or, in principle, a multi-page "image") still
@@ -4503,7 +4741,8 @@ class Viewer:
         if top_pt is None:
             self.scroll = 0
             return
-        _, height_pt = self.doc_handler.page_size_pt(self.page)
+        pdf_source = self._pdf_source()
+        height_pt = pdf_source.page_size_pt(self.page)[1] if pdf_source else None
         if not height_pt:
             self.scroll = 0
             return
@@ -5370,8 +5609,10 @@ def main():
     parser.add_argument(
         "-s", "--rendering-scale", type=float, default=OFFICE_RENDER_SCALE, metavar="N",
         help="device-pixel-ratio to render Quick Look preview files "
-             "(Word/Excel/PowerPoint/etc., macOS only) at - higher looks "
-             "sharper when zoomed in but is slower to render (default: %(default)s)",
+             "(Excel/PowerPoint/Keynote/etc., macOS only) at - higher looks "
+             "sharper when zoomed in but is slower to render (default: "
+             "%(default)s). No effect on Word/RTF/Pages, which render to a "
+             "real PDF instead and are always sharp regardless of zoom",
     )
     parser.add_argument(
         "-c", "--continuous",

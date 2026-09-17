@@ -9,6 +9,12 @@ no way to test ExcelWorkbook/SlideDeck/FlowingText selection without
 actually rendering.
 """
 
+import fcntl
+import pty
+import struct
+import termios
+import tempfile
+
 import pdfless
 from conftest import requires_office_support
 
@@ -71,6 +77,109 @@ def test_docx_twopage_renders_as_single_continuous_page(sample_twopage_docx, tmp
     text = "\n".join(handler.extract_text(1))
     assert "Page one content" in text
     assert "Page two content" in text
+
+
+@requires_office_support
+def test_docx_renders_via_a_pdf_delegate_for_crisp_zoom(sample_twopage_docx, tmp_path):
+    """FlowingText tries Chrome's --print-to-pdf first (see
+    FlowingText._build_pdf_pages()) - a real PDF that pdfless
+    re-rasterizes at whatever DPI the current zoom needs (see
+    OfficeDocument.get_page_image()), instead of resizing one
+    fixed-resolution screenshot. Confirmed here by asking for the same
+    page at two different target widths and checking the returned
+    image's actual pixel width tracks each one - a fixed screenshot
+    resized by Pillow would still report the target width after an
+    upscale (Pillow's resize() always returns exactly the requested
+    size), so this alone doesn't distinguish the two paths; what does
+    is handler._pdf_delegate itself being set at all - only the PDF
+    path ever creates one, the screenshot fallback never does."""
+    handler = classify(sample_twopage_docx, tmp_path)
+    assert isinstance(handler, pdfless.OfficeDocument)
+    handler.build_pages(str(tmp_path))
+    assert handler._pdf_delegate is not None
+
+    cache = pdfless.PageCache(handler.path, str(tmp_path), handler)
+    small = handler.get_page_image(cache, 1, 300, "width")
+    big = handler.get_page_image(cache, 1, 1200, "width")
+    assert small.width == 300
+    assert big.width == 1200
+    # Re-rasterized independently at each width, not the same bitmap
+    # twice over - the aspect ratio (and so the height) should match,
+    # within the couple of pixels two independently-rounded DPIs can
+    # differ by.
+    assert abs(big.height - round(small.height * 1200 / 300)) <= 2
+
+
+@requires_office_support
+def test_docx_hyperlink_survives_as_a_real_pdf_link(sample_docx_with_link, tmp_path):
+    """A plain <a href> in the original Word document, run through
+    Quick Look -> Chrome's --print-to-pdf, comes out as a real PDF
+    /Link annotation (confirmed by hand with pypdf) - so it's clickable
+    exactly like a native PDF's hyperlink, via the exact same
+    PdfDocument.build_link_index() a real PDF's links go through (see
+    Viewer._ensure_link_index()'s pdf_source fallback to
+    doc_handler._pdf_delegate)."""
+    handler = classify(sample_docx_with_link, tmp_path)
+    assert isinstance(handler, pdfless.OfficeDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert handler._pdf_delegate is not None
+
+    link_index = handler._pdf_delegate.build_link_index(len(pages))
+    links = link_index[0]["links"]
+    assert any(link.get("uri") == "https://example.com/hello" for link in links)
+
+
+@requires_office_support
+def test_docx_internal_link_survives_as_a_real_pdf_goto(sample_docx_with_internal_link, tmp_path):
+    """An internal (bookmark-anchored) hyperlink survives as a real PDF
+    /GoTo link, resolved the same way a real PDF's internal links are
+    (build_link_index()'s "kind": "page" case) - since FlowingText
+    always renders as a single continuous page (see its class
+    docstring), a same-document jump like this lands on that same
+    page, at a different scroll position (top_pt), not a different
+    page number."""
+    handler = classify(sample_docx_with_internal_link, tmp_path)
+    assert isinstance(handler, pdfless.OfficeDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 1
+    assert handler._pdf_delegate is not None
+
+    link_index = handler._pdf_delegate.build_link_index(len(pages))
+    links = link_index[0]["links"]
+    goto_links = [link for link in links if link.get("kind") == "page"]
+    assert len(goto_links) == 1
+    assert goto_links[0]["page"] == 1
+    assert goto_links[0]["top_pt"] is not None
+    # The target bookmark is ~80 filler paragraphs below the link
+    # itself - a real jump, not a same-spot no-op.
+    assert goto_links[0]["top_pt"] > 100
+
+
+@requires_office_support
+def test_docx_internal_link_click_scrolls_without_crashing(sample_docx_with_internal_link, tmp_path):
+    """Regression test: Viewer.go_to_link_target() used to call
+    self.doc_handler.page_size_pt() unconditionally, assuming
+    doc_handler is a real PdfDocument - AttributeError for an
+    OfficeDocument (even one with a _pdf_delegate, since that's the
+    delegate's method, not doc_handler's own). Exercises the exact
+    path a mouse click on this link takes (handle_click() ->
+    _activate_link() -> go_to_link_target()) via a real Viewer,
+    checking the click actually scrolls to the target instead of
+    crashing or silently landing at the top."""
+    _master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 960, 720))
+    handler = classify(sample_docx_with_internal_link, tmp_path)
+    viewer = pdfless.Viewer([handler], 0, 1, str(tmp_path), slave, None)
+    viewer.refresh()
+
+    viewer._ensure_link_index()
+    links = viewer._link_index[0]["links"]
+    goto_links = [link for link in links if link.get("kind") == "page"]
+    assert len(goto_links) == 1
+
+    assert viewer.scroll == 0
+    viewer._activate_link(goto_links[0])
+    assert viewer.scroll > 0
 
 
 @requires_office_support
