@@ -589,16 +589,17 @@ _TAB_VIEW_ITEM_RE = re.compile(
 _TAG_RE = re.compile(r'<[^>]+>')
 
 
-# A hard ceiling on either dimension of a PDF-embedded picture, once
-# rasterized - regardless of what DPI the math below otherwise settles
-# on. A Numbers/Pages/Keynote sheet can embed its *entire* content (a
-# whole spreadsheet, potentially thousands of points on a side) as one
-# such "picture" (see _rasterize_pdf_img_sources()), and poppler's
-# pdftocairo (see there for why it's used instead of pdftoppm) has its
-# own ceiling on the cairo surface size it'll produce - past that, it
-# fails loudly (a non-zero exit, caught below) rather than silently
-# writing something degenerate. This cap keeps the request comfortably
-# clear of that ceiling.
+# A hard ceiling on either dimension of a broken embedded picture
+# (PDF or TIFF), once rasterized/re-encoded - regardless of what DPI
+# the math below otherwise settles on for a PDF one. A Numbers/Pages/
+# Keynote sheet can embed its *entire* content (a whole spreadsheet,
+# potentially thousands of points on a side) as one such "picture"
+# (see _rasterize_broken_img_sources()), and poppler's pdftocairo (see
+# there for why it's used instead of pdftoppm) has its own ceiling on
+# the cairo surface size it'll produce - past that, it fails loudly (a
+# non-zero exit, caught below) rather than silently writing something
+# degenerate. This cap keeps the request comfortably clear of that
+# ceiling either way.
 OFFICE_EMBEDDED_IMG_MAX_PX = 6000
 
 
@@ -633,43 +634,49 @@ def _pdf_page_count_safe(pdf_path):
     return int(m.group(1)) if m else None
 
 
-def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
+def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
     """A Quick Look Office/iWork preview can embed a picture as
-    `<img src="AttachmentN.pdf">` - the relevant generator apparently
-    assumes a renderer that can show a PDF inline as an image, the way
-    Safari/WebKit (Quick Look's own host) does; plain Chrome can't, and
-    just shows a broken-image icon at whatever size the <img> tag's
-    style gives it. Across every picture in a slide deck, that's often
-    enough bogus extra height to throw off later slides' measured
-    positions entirely (see _measure_slide_offsets()).
+    `<img src="AttachmentN.pdf">` or `<img src="AttachmentN.tiff">` -
+    formats the relevant generator apparently assumes a renderer that
+    can show inline as an image, the way Safari/WebKit (Quick Look's
+    own host) does; plain Chrome can't decode either one, and just
+    shows a broken-image icon at whatever size the <img> tag's style
+    gives it (confirmed by hand: a real Word document with a mix of
+    PNG and TIFF pictures showed the PNGs fine and the TIFFs broken,
+    scattered throughout - TIFF has no web-standard decode support at
+    all, unlike PDF, which at least fails the same way in every
+    browser other than Safari/WebKit). Across every picture in a slide
+    deck, that's often enough bogus extra height to throw off later
+    slides' measured positions entirely (see _measure_slide_offsets()).
 
     iWork.qlgenerator (Numbers/Pages/Keynote) additionally splits a
     multi-sheet/page document into one `<iframe src="AttachmentN.html">`
     per sheet rather than embedding everything directly in Preview.html
     the way Office.qlgenerator does - and it's each of *those* files
-    that actually embeds a `<img src="*.pdf">`, not Preview.html itself.
-    So this looks for that pattern recursively, through every local (not
-    http/data/...) iframe target, not just in `html_path` itself.
+    that actually embeds the broken `<img>`, not Preview.html itself.
+    So this looks for that pattern recursively, through every local
+    (not http/data/...) iframe target, not just in `html_path` itself.
 
-    Rewrites each PDF reference found anywhere in that tree to a PNG
-    rasterized from that PDF via poppler's pdftocairo (not pdftoppm -
-    see _convert() below for why), and rewrites each iframe reference
-    to point at its (recursively) patched target. Every patched file is
-    written alongside the original it came from (same directory,
-    different name) rather than elsewhere, so any *other* (non-PDF,
-    non-iframe) relative reference in it keeps resolving exactly as
-    before, untouched.
+    Rewrites each such reference found anywhere in that tree to a PNG -
+    rasterized from a PDF via poppler's pdftocairo (not pdftoppm - see
+    _convert() below for why), or straightforwardly re-encoded via
+    Pillow for a TIFF (already a raster image; no DPI to choose, unlike
+    a PDF) - and rewrites each iframe reference to point at its
+    (recursively) patched target. Every patched file is written
+    alongside the original it came from (same directory, different
+    name) rather than elsewhere, so any *other* (unrelated) relative
+    reference in it keeps resolving exactly as before, untouched.
 
     Returns the path to `html_path`'s own patched copy - or `html_path`
-    unchanged if nothing anywhere in the tree needed patching, or
-    pdftocairo isn't available. `on_progress`, if given, is called as
-    `on_progress(done, total)` after each PDF conversion finishes,
-    `total` counting every one found across the whole tree."""
+    unchanged if nothing anywhere in the tree needed patching.
+    `on_progress`, if given, is called as `on_progress(done, total)`
+    after each conversion finishes, `total` counting every one found
+    across the whole tree."""
     # Phase 1: walk html_path plus every local HTML file it (recursively)
     # embeds via <iframe src>, collecting each file's own content and
-    # its own <img src="*.pdf"> references.
+    # its own <img src="*.pdf"/"*.tiff"/"*.tif"> references.
     file_contents = {}  # path -> content
-    pdf_refs_by_file = {}  # path -> [ref, ...]
+    broken_refs_by_file = {}  # path -> [ref, ...]
     to_visit = [html_path]
     seen = set()
     while to_visit:
@@ -685,28 +692,29 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
             continue
         file_contents[path] = content
         base_dir = os.path.dirname(path)
-        # (ref, declared width, declared height) for every <img src=
-        # "*.pdf"> - the declared size (in CSS px, i.e. ~1:1 with
-        # points) is what lets _convert() below pick a sane DPI instead
-        # of a fixed one that can be wildly wrong for a huge embedded
-        # page. Deduplicated by ref, first occurrence winning, same as
-        # a plain set() would for the src-only info this replaced.
-        pdf_refs = {}
+        # (ref, declared width, declared height) for every broken <img
+        # src=...> - the declared size (in CSS px, i.e. ~1:1 with
+        # points) is what lets _convert() below pick a sane DPI for a
+        # PDF ref instead of a fixed one that can be wildly wrong for a
+        # huge embedded page (moot for a TIFF ref, already a fixed-size
+        # raster). Deduplicated by ref, first occurrence winning, same
+        # as a plain set() would for the src-only info this replaced.
+        broken_refs = {}
         for tag_m in _IMG_TAG_RE.finditer(content):
             tag = tag_m.group(0)
             src_m = _SRC_ATTR_RE.search(tag)
-            if not src_m or not src_m.group(1).lower().endswith(".pdf"):
+            if not src_m or not src_m.group(1).lower().endswith((".pdf", ".tiff", ".tif")):
                 continue
             ref = src_m.group(1)
-            if ref in pdf_refs:
+            if ref in broken_refs:
                 continue
             w_m, h_m = _WIDTH_ATTR_RE.search(tag), _HEIGHT_ATTR_RE.search(tag)
-            pdf_refs[ref] = (
+            broken_refs[ref] = (
                 float(w_m.group(1)) if w_m else None,
                 float(h_m.group(1)) if h_m else None,
             )
-        pdf_refs_by_file[path] = sorted(
-            (ref, w, h) for ref, (w, h) in pdf_refs.items()
+        broken_refs_by_file[path] = sorted(
+            (ref, w, h) for ref, (w, h) in broken_refs.items()
         )
         for m in _IFRAME_SRC_RE.finditer(content):
             src = m.group(2)
@@ -716,64 +724,79 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
             if src.lower().endswith((".html", ".htm")) and os.path.isfile(candidate):
                 to_visit.append(candidate)
 
-    if not shutil.which("pdftocairo"):
-        return html_path
     all_refs = [
         (path, ref, w, h)
-        for path, refs in pdf_refs_by_file.items()
+        for path, refs in broken_refs_by_file.items()
         for ref, w, h in refs
     ]
     if not all_refs:
         return html_path
+    have_pdftocairo = shutil.which("pdftocairo") is not None
 
     def _convert(item):
         path, ref, decl_w, decl_h = item
-        src_pdf = os.path.join(os.path.dirname(path), ref)
-        if not os.path.isfile(src_pdf):
+        src_path = os.path.join(os.path.dirname(path), ref)
+        if not os.path.isfile(src_path):
             return path, ref, None
-
-        # A fixed DPI (this used to always be 300) is wildly wrong for
-        # a picture that's actually an entire spreadsheet/page flattened
-        # into one PDF, sized in the thousands of points on a side - Numbers
-        # in particular does this for a sheet too big to fit its normal
-        # preview. Aim instead for roughly the size the <img> tag is
-        # actually going to display it at (that's in CSS px, and a PDF
-        # point is already ~1 CSS px at 96dpi, so this is close to
-        # 1:1 - not literally 1:1 only because a page's declared point
-        # size can differ slightly from its <img> tag's declared pixel
-        # size), falling back to the old 300 if either the page size or
-        # the declared display size isn't available - then hard-capped
-        # regardless (see OFFICE_EMBEDDED_IMG_MAX_PX).
-        dpi = 300.0
-        page_size = _pdf_page_size_pt_safe(src_pdf)
-        if page_size:
-            page_w_pt, page_h_pt = page_size
-            if decl_w and page_w_pt:
-                dpi = 72.0 * decl_w / page_w_pt
-            elif decl_h and page_h_pt:
-                dpi = 72.0 * decl_h / page_h_pt
-            if page_w_pt:
-                dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_w_pt)
-            if page_h_pt:
-                dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_h_pt)
-        dpi = max(36.0, min(300.0, dpi))
-
-        prefix = os.path.join(tmpdir, f"qlimg-{hashlib.md5(src_pdf.encode()).hexdigest()[:12]}")
-        try:
-            subprocess.run(
-                # pdftocairo (not pdftoppm - it has no -transp option) so a
-                # picture with a transparent background (e.g. a PNG/GIF with
-                # alpha, flattened into this PDF by the Quick Look
-                # generator) keeps its transparency instead of getting
-                # composited onto an opaque white background here, before
-                # Chrome ever gets to draw it over the slide's real
-                # background.
-                ["pdftocairo", "-png", "-transp", "-r", str(round(dpi)), "-singlefile", src_pdf, prefix],
-                capture_output=True, check=True, timeout=20,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            return path, ref, None
+        prefix = os.path.join(tmpdir, f"qlimg-{hashlib.md5(src_path.encode()).hexdigest()[:12]}")
         png_path = prefix + ".png"
+
+        if ref.lower().endswith(".pdf"):
+            if not have_pdftocairo:
+                return path, ref, None
+            # A fixed DPI (this used to always be 300) is wildly wrong for
+            # a picture that's actually an entire spreadsheet/page flattened
+            # into one PDF, sized in the thousands of points on a side - Numbers
+            # in particular does this for a sheet too big to fit its normal
+            # preview. Aim instead for roughly the size the <img> tag is
+            # actually going to display it at (that's in CSS px, and a PDF
+            # point is already ~1 CSS px at 96dpi, so this is close to
+            # 1:1 - not literally 1:1 only because a page's declared point
+            # size can differ slightly from its <img> tag's declared pixel
+            # size), falling back to the old 300 if either the page size or
+            # the declared display size isn't available - then hard-capped
+            # regardless (see OFFICE_EMBEDDED_IMG_MAX_PX).
+            dpi = 300.0
+            page_size = _pdf_page_size_pt_safe(src_path)
+            if page_size:
+                page_w_pt, page_h_pt = page_size
+                if decl_w and page_w_pt:
+                    dpi = 72.0 * decl_w / page_w_pt
+                elif decl_h and page_h_pt:
+                    dpi = 72.0 * decl_h / page_h_pt
+                if page_w_pt:
+                    dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_w_pt)
+                if page_h_pt:
+                    dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_h_pt)
+            dpi = max(36.0, min(300.0, dpi))
+
+            try:
+                subprocess.run(
+                    # pdftocairo (not pdftoppm - it has no -transp option) so a
+                    # picture with a transparent background (e.g. a PNG/GIF with
+                    # alpha, flattened into this PDF by the Quick Look
+                    # generator) keeps its transparency instead of getting
+                    # composited onto an opaque white background here, before
+                    # Chrome ever gets to draw it over the slide's real
+                    # background.
+                    ["pdftocairo", "-png", "-transp", "-r", str(round(dpi)), "-singlefile", src_path, prefix],
+                    capture_output=True, check=True, timeout=20,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                return path, ref, None
+        else:  # .tiff / .tif - already a raster image, just re-encoded
+            # to a format Chrome can actually decode inline, downscaled
+            # if it's absurdly large (see OFFICE_EMBEDDED_IMG_MAX_PX) -
+            # there's no DPI to choose the way a PDF page needs.
+            try:
+                with Image.open(src_path) as img:
+                    img.load()
+                    if img.width > OFFICE_EMBEDDED_IMG_MAX_PX or img.height > OFFICE_EMBEDDED_IMG_MAX_PX:
+                        img.thumbnail((OFFICE_EMBEDDED_IMG_MAX_PX, OFFICE_EMBEDDED_IMG_MAX_PX), Image.LANCZOS)
+                    img.convert("RGBA" if "A" in img.getbands() else "RGB").save(png_path, "PNG")
+            except Exception:
+                return path, ref, None
+
         if not os.path.isfile(png_path):
             return path, ref, None
         # Defensive: pdftocairo failing outright over OFFICE_EMBEDDED_IMG_MAX_PX
@@ -781,8 +804,8 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
         # CalledProcessError) - this instead guards a degenerate ~1px
         # output from some other cause (e.g. a wildly wrong declared
         # width/height), treating it as a failure too (leaving the
-        # original <img src="*.pdf"> in place - a broken-image icon -
-        # rather than silently serving a blank picture).
+        # original broken <img src=...> in place rather than silently
+        # serving a blank picture).
         try:
             with Image.open(png_path) as probe:
                 if probe.width <= 2 or probe.height <= 2:
@@ -792,10 +815,11 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
         return path, ref, pathlib.Path(png_path).as_uri()
 
     # A slide deck can embed dozens to a couple hundred of these (one
-    # `pdftocairo` process each) - running them one at a time was most of
-    # this whole function's cost, and each is independent, so a thread
-    # pool (subprocess.run releases the GIL while the child runs) cuts
-    # that down by roughly the number of workers.
+    # pdftocairo/Pillow conversion each) - running them one at a time was
+    # most of this whole function's cost, and each is independent, so a
+    # thread pool (subprocess.run releases the GIL while the child runs,
+    # and Pillow's C decoders release it too) cuts that down by roughly
+    # the number of workers.
     png_by_file_ref = {}  # (path, ref) -> uri
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -1330,18 +1354,18 @@ class ExcelWorkbook(OfficeVariant):
     def _build_multi_sheet(self, tmpdir, debug, render_scale, progress):
         # Each sheet is an independent render (its own already-
         # rasterized HTML, its own Chrome screenshot subprocess), so -
-        # like _rasterize_pdf_img_sources()'s embedded-image conversion
-        # - run them concurrently rather than one at a time; a workbook
-        # can have dozens of sheets, and each is mostly subprocess wait
-        # (releases the GIL), not CPU time here.
+        # like _rasterize_broken_img_sources()'s embedded-image
+        # conversion - run them concurrently rather than one at a time;
+        # a workbook can have dozens of sheets, and each is mostly
+        # subprocess wait (releases the GIL), not CPU time here.
         sheet_tabs = self.sheet_tabs
         name = self.name
 
         def _render_sheet(i, sheet_name, sheet_html_path):
             with _DebugTimer(
-                debug, f"{name}: sheet {i + 1} ({sheet_name}): pdftocairo (embedded images)"
+                debug, f"{name}: sheet {i + 1} ({sheet_name}): converting embedded images"
             ):
-                sheet_html_path = _rasterize_pdf_img_sources(sheet_html_path, tmpdir)
+                sheet_html_path = _rasterize_broken_img_sources(sheet_html_path, tmpdir)
             page_path = os.path.join(tmpdir, f"office-page-{self.tag}-{i + 1}.png")
             label = f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): rendering"
             with _DebugTimer(debug, label):
@@ -1459,44 +1483,56 @@ class FlowingText(OfficeVariant):
         return self._build_pages_via_screenshot(tmpdir, debug, render_scale, progress, continuous)
 
     def _build_pdf_pages(self, tmpdir, debug, progress, continuous):
-        """Real PDF pages via _capture_html_pdf() - Chrome's own print
-        engine paginates content overflow into further pages on its
-        own, so (unlike the screenshot path) there's no grow-and-retry
-        loop needed here. Returns ("pdf", path, npages) for
-        OfficeDocument._render_office_pages() to wire up as a
-        PdfDocument delegate, or None to fall back to the screenshot
-        path (an older Chrome without --print-to-pdf, or anything else
-        going wrong).
+        """Real PDF pages via _capture_html_pdf(). Returns ("pdf",
+        path, npages) for OfficeDocument._render_office_pages() to
+        wire up as a PdfDocument delegate, or None to fall back to the
+        screenshot path (an older Chrome without --print-to-pdf, or
+        anything else going wrong).
 
-        Always requests one page sized to the document's own content
-        (ignoring `continuous`, unlike the screenshot path's own bounds
-        logic below) - a continuously-flowing document (Word, Pages, a
-        converted RTF) has no real page boundaries of its own for the
-        print engine to land on (see the class docstring), so letting
-        it paginate at self.height would just be a different arbitrary
-        cut than the screenshot path's, not a truer one - and it's
-        documented (README) that these always render as a single
-        continuous page regardless of -c/--continuous, which already
-        covers this case implicitly (there's nothing for it to toggle
-        here)."""
+        Not continuous (the common case): one page's own height
+        (self.height, from the Quick Look preview's own plist) becomes
+        the @page height, and Chrome's print engine paginates the rest
+        on its own - real page breaks driven by the actual content
+        flow, unlike the screenshot path's own bounds logic below,
+        which can only guess at a fixed pixel height after the fact.
+        That's also why this doesn't need SlideDeck's
+        _measure_slide_offsets() dance in the first place: a
+        print-mode page break follows the content wherever it actually
+        flows, so a slightly-off page height just spills part of one
+        page onto the next rather than throwing off every later page's
+        position too (fixed pixel-slicing's boundaries are cumulative
+        - one page's error shifts every one after it; print-mode's
+        aren't, each page break is independent).
+
+        continuous=True (-c/--continuous) instead measures the
+        document's real total height first (_measure_content_height())
+        and requests one oversized page sized to fit it - a
+        continuously-flowing document has no real page boundaries of
+        its own to paginate at in the first place (see the class
+        docstring), so there's nothing for the print engine to do here
+        that measuring wouldn't do more precisely."""
         out_pdf = os.path.join(tmpdir, f"office-capture-{self.tag}.pdf")
-        measure_label = f"{self.name}: measuring content height"
-        with _DebugTimer(debug, measure_label), progress.spin(measure_label + "..."):
-            content_height = _measure_content_height(self.chrome, self.html_path, self.width)
-        if not content_height:
-            # Couldn't measure - rather than guess a one-size-fits-all
-            # OFFICE_MAX_CAPTURE_HEIGHT (a real, if rare, source of a
-            # giant near-blank page under load, where Chrome's dump-dom
-            # measurement is more likely to time out), fall back to the
-            # screenshot path, which doesn't depend on this measurement
-            # at all.
-            return None
-        # A little headroom: print-mode layout can measure a few px
-        # taller than screen-mode's scrollHeight for the same content
-        # (a marginal font-metric difference between the two rendering
-        # paths) - this only has to avoid spilling a couple of
-        # leftover px onto a needless second page, not be exact.
-        page_height = min(OFFICE_MAX_CAPTURE_HEIGHT, content_height + 40)
+        if continuous:
+            measure_label = f"{self.name}: measuring content height"
+            with _DebugTimer(debug, measure_label), progress.spin(measure_label + "..."):
+                content_height = _measure_content_height(self.chrome, self.html_path, self.width)
+            if not content_height:
+                # Couldn't measure - rather than guess a one-size-fits-
+                # all OFFICE_MAX_CAPTURE_HEIGHT (a real, if rare, source
+                # of a giant near-blank page under load, where Chrome's
+                # dump-dom measurement is more likely to time out), fall
+                # back to the screenshot path, which doesn't depend on
+                # this measurement at all.
+                return None
+            # A little headroom: print-mode layout can measure a few px
+            # taller than screen-mode's scrollHeight for the same
+            # content (a marginal font-metric difference between the
+            # two rendering paths) - this only has to avoid spilling a
+            # couple of leftover px onto a needless second page, not be
+            # exact.
+            page_height = min(OFFICE_MAX_CAPTURE_HEIGHT, content_height + 40)
+        else:
+            page_height = self.height
         label = f"{self.name}: rendering to PDF"
         with _DebugTimer(debug, label), progress.spin(label + "..."):
             ok = _capture_html_pdf(self.chrome, self.html_path, self.width, page_height, out_pdf)
@@ -2435,19 +2471,26 @@ class OfficeDocument(DocumentHandler):
         take anywhere from under a second to tens of seconds and would
         otherwise look like pdfless had simply hung.
 
-        Pagination (splitting into distinct page/slide images, so
-        `n`/`p`/`g`/`G` and jumping straight to page N work) is only
-        used when the slide boundaries are known with confidence - i.e.
-        the Quick Look generator's own plist named a PageElementXPath
-        (currently true for PowerPoint and some Keynote decks), and
-        measuring it produced sane (strictly increasing) offsets.
-        Anything else - Word's continuously-flowing text, spreadsheets,
-        and Keynote/Pages variants where the boundary can only be
-        guessed via a content-shape heuristic (see
+        Pagination for a screenshot-sliced variant (splitting into
+        distinct page/slide images, so `n`/`p`/`g`/`G` and jumping
+        straight to page N work) is only used when the slide
+        boundaries are known with confidence - i.e. the Quick Look
+        generator's own plist named a PageElementXPath (currently true
+        for PowerPoint and some Keynote decks), and measuring it
+        produced sane (strictly increasing) offsets. Anything else -
+        spreadsheets, and Keynote/Pages variants where the boundary can
+        only be guessed via a content-shape heuristic (see
         _detect_fallback_page_xpath()) - is rendered as a single,
         continuously-scrollable "page" instead (the same as a plain
         image file), since a guessed boundary has been observed to
-        drift/overflow on some real decks.
+        drift/overflow on some real decks. FlowingText is the one
+        exception to all of this: its own PDF path
+        (_build_pdf_pages()) paginates for real when not continuous,
+        driven by Chrome's print engine rather than any measured/
+        guessed boundary - though RtfOfficeDocument always asks for
+        continuous=True regardless (see its build_pages()), since a
+        converted RTF's page-height metadata doesn't correspond to
+        anything in the original file either way.
 
         continuous=True (-c/--continuous) forces the single-continuous-
         page behavior even for a document that would otherwise paginate
@@ -2499,8 +2542,8 @@ class OfficeDocument(DocumentHandler):
                 on_img_progress = lambda done, total: progress.update(
                     f"{name}: converting embedded images ({done}/{total})..."
                 )
-                with _DebugTimer(debug, f"{name}: pdftocairo (embedded images)"):
-                    html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
+                with _DebugTimer(debug, f"{name}: converting embedded images"):
+                    html_path = _rasterize_broken_img_sources(html_path, tmpdir, on_progress=on_img_progress)
 
                 # Confident means the Quick Look generator itself named
                 # the page/slide element (page_element_xpath came from
@@ -4546,7 +4589,7 @@ class Viewer:
         either self.doc_handler itself, or the PdfDocument an
         OfficeDocument rendered to under the hood (see
         OfficeDocument.get_page_image()'s _pdf_delegate - a plain
-        <a href> in the original Word/RTF/Pages document survives
+        <a href> in the original Word/RTF document survives
         Chrome's --print-to-pdf as a real PDF link annotation, so this
         lets it be treated exactly like a real PDF's hyperlinks
         wherever this is used), or None if neither applies."""
@@ -5609,9 +5652,9 @@ def main():
     parser.add_argument(
         "-s", "--rendering-scale", type=float, default=OFFICE_RENDER_SCALE, metavar="N",
         help="device-pixel-ratio to render Quick Look preview files "
-             "(Excel/PowerPoint/Keynote/etc., macOS only) at - higher looks "
-             "sharper when zoomed in but is slower to render (default: "
-             "%(default)s). No effect on Word/RTF/Pages, which render to a "
+             "(Excel/PowerPoint/Keynote/Pages/etc., macOS only) at - higher "
+             "looks sharper when zoomed in but is slower to render (default: "
+             "%(default)s). No effect on Word/RTF, which render to a "
              "real PDF instead and are always sharp regardless of zoom",
     )
     parser.add_argument(
