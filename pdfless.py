@@ -655,12 +655,13 @@ def _pdf_page_count_safe(pdf_path):
 
 
 def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
-    """Convert `path` (a Word/RTF document) to a real PDF via
-    LibreOffice's `soffice --convert-to pdf`, natively - no Quick Look/
-    Chrome involved at all - returning the output PDF's path, or None
-    on any failure (timeout, non-zero exit, or no output file), so
-    callers (see OfficeDocument._try_soffice_pages()) can always fall
-    back to the qlmanage/Chrome pipeline.
+    """Convert `path` (a Word/RTF/PowerPoint document - see
+    OfficeDocument._SOFFICE_EXTENSIONS) to a real PDF via LibreOffice's
+    `soffice --convert-to pdf`, natively - no Quick Look/Chrome
+    involved at all - returning the output PDF's path, or None on any
+    failure (timeout, non-zero exit, or no output file), so callers
+    (see OfficeDocument._try_soffice_pages()) can always fall back to
+    the qlmanage/Chrome pipeline.
 
     Deliberately does NOT pass --headless: confirmed by hand that
     --headless breaks CJK (Japanese) font rendering entirely (text
@@ -2328,6 +2329,20 @@ class OfficeDocument(DocumentHandler):
 
     kind = "office"
 
+    # Extensions where soffice's own --convert-to pdf pagination lands
+    # on the same "page" boundary the qlmanage/Chrome pipeline already
+    # uses - a real Word/RTF page break, or one slide per PowerPoint
+    # page (confirmed by hand: soffice's page count matches the
+    # existing qlmanage/Chrome one exactly, both for a small fixture
+    # and for a real 55-slide deck with hidden slides). Deliberately
+    # excludes Excel (.xls/.xlsx): soffice paginates a spreadsheet by
+    # its print area/page setup, which for a workbook never tuned for
+    # printing fragments one sheet across several oddly-cut pages
+    # (confirmed by hand on a real 2-sheet workbook: 9 soffice pages,
+    # split mid-column with no header row) - nothing like qlmanage's
+    # "one full sheet per page". See _soffice_pages_if_eligible().
+    _SOFFICE_EXTENSIONS = (".doc", ".docx", ".ppt", ".pptx", ".rtf")
+
     def __init__(self, path):
         super().__init__(path)
         self.pages = None  # [png_path, ...] once rendered - see
@@ -2511,14 +2526,37 @@ class OfficeDocument(DocumentHandler):
             self.pages = pages
         return pages
 
+    def _soffice_pages_if_eligible(self, path, tmpdir, debug, progress, continuous):
+        """The one place that decides whether _try_soffice_pages() is
+        even worth attempting for `path` - both call sites
+        (_render_office_pages(), for Word/PowerPoint, and
+        RtfOfficeDocument.build_pages(), for RTF) delegate here instead
+        of repeating the same two checks:
+
+        - continuous=True is never eligible: soffice always paginates
+          for real (one PDF page per real page/slide), and unlike the
+          qlmanage/Chrome screenshot path, there's no way to collapse
+          that back into a single continuously-scrollable page.
+        - the extension must be one of _SOFFICE_EXTENSIONS - see its
+          comment for why Excel is deliberately excluded.
+
+        Returns the ("pdf", pdf_path, npages) tuple _try_soffice_pages()
+        produces, or None - either because it wasn't eligible to try at
+        all, or because the attempt itself failed - so callers always
+        fall through to their own qlmanage/Chrome-based rendering."""
+        if continuous or not path.lower().endswith(self._SOFFICE_EXTENSIONS):
+            return None
+        return self._try_soffice_pages(path, tmpdir, debug, progress)
+
     def _try_soffice_pages(self, path, tmpdir, debug, progress):
-        """Attempt to render `path` (a Word/RTF document) to a real PDF
-        via LibreOffice's `soffice --convert-to pdf` (see
-        _convert_via_soffice() for why --headless is never used),
-        preferred over the qlmanage/Chrome pipeline when available -
-        soffice paginates natively (real page breaks matching the
-        original document) and needs no embedded-picture workaround
-        (see _rasterize_broken_img_sources()) at all.
+        """Render `path` to a real PDF via LibreOffice's `soffice
+        --convert-to pdf` (see _convert_via_soffice() for why
+        --headless is never used) - the mechanism _soffice_pages_if_eligible()
+        decides whether to even attempt. Preferred over the qlmanage/
+        Chrome pipeline when available - soffice paginates natively
+        (real page breaks/slide boundaries matching the original
+        document) and needs no embedded-picture workaround (see
+        _rasterize_broken_img_sources()) at all.
 
         Returns the same ("pdf", pdf_path, npages) tuple shape
         FlowingText._build_pdf_pages() already produces, or None if
@@ -2588,14 +2626,15 @@ class OfficeDocument(DocumentHandler):
         Chrome fallback always asks for continuous=True regardless
         (see its build_pages()), since a converted RTF's page-height
         metadata doesn't correspond to anything in the original file
-        either way. Word (.doc/.docx) tries LibreOffice's soffice
-        before any of this (see _try_soffice_pages(), called at the
-        very top of this method) when it's installed, since it
-        paginates natively and renders with higher fidelity than
-        either of the above; RTF does the same, but from its own
-        build_pages(), against the original .rtf rather than a
-        converted .docx - so it isn't limited to always-continuous the
-        way the qlmanage/Chrome fallback is.
+        either way. Word and PowerPoint (see _SOFFICE_EXTENSIONS) try
+        LibreOffice's soffice before any of this (see
+        _soffice_pages_if_eligible(), called at the very top of this
+        method) when it's installed, since it paginates natively and
+        renders with higher fidelity than either of the above; RTF
+        does the same, but from its own build_pages(), against the
+        original .rtf rather than a converted .docx - so it isn't
+        limited to always-continuous the way the qlmanage/Chrome
+        fallback is.
 
         continuous=True (-c/--continuous) forces the single-continuous-
         page behavior even for a document that would otherwise paginate
@@ -2605,18 +2644,9 @@ class OfficeDocument(DocumentHandler):
         name = os.path.basename(path)
         t_start = time.monotonic()
         try:
-            # LibreOffice's soffice, when installed, renders Word
-            # (.doc/.docx) with real page breaks and higher fidelity
-            # than the qlmanage/Chrome pipeline below (see
-            # _try_soffice_pages()) - tried first, falling through to
-            # qlmanage/Chrome on any failure. Skipped in continuous
-            # mode: soffice always paginates for real, and there's no
-            # way to collapse that back into a single "page" the way
-            # FlowingText's own screenshot/measured-height path can.
-            if not continuous and path.lower().endswith((".doc", ".docx")):
-                soffice_pages = self._try_soffice_pages(path, tmpdir, debug, progress)
-                if soffice_pages is not None:
-                    return soffice_pages
+            soffice_pages = self._soffice_pages_if_eligible(path, tmpdir, debug, progress, continuous)
+            if soffice_pages is not None:
+                return soffice_pages
 
             progress.update(f"{name}: looking for a local Chrome...")
             chrome = find_chrome()
@@ -2730,9 +2760,10 @@ class OfficeDocument(DocumentHandler):
     def supports_search(self):
         # Real per-page/bbox search (build_search_index()/
         # find_search_matches() below) only works against a real PDF -
-        # a screenshot-based OfficeVariant (Excel/PowerPoint/Keynote/
-        # Pages/Numbers, or Word/RTF without soffice or Chrome's
-        # --print-to-pdf available) has no such index to search.
+        # a screenshot-based OfficeVariant (always true for Excel/
+        # Keynote/Pages/Numbers; for Word/RTF/PowerPoint, only when
+        # neither soffice nor Chrome's --print-to-pdf could be used)
+        # has no such index to search.
         return self._pdf_delegate is not None
 
     def text_mode_is_paginated(self):
@@ -2833,14 +2864,10 @@ class RtfOfficeDocument(OfficeDocument):
         # the original .rtf natively, so its page breaks correspond to
         # the real document - no need to force continuous=True just to
         # dodge untrustworthy converted-page-height metadata (see the
-        # comment below). Tried first, regardless of the caller's
-        # -c/--continuous setting; only skipped when continuous=True
-        # was explicitly requested, since soffice can't collapse its
-        # real pagination back into one page.
-        if not continuous:
-            soffice_pages = self._try_soffice_pages(self.path, tmpdir, debug, progress)
-            if soffice_pages is not None:
-                return self._remember_pages(soffice_pages)
+        # comment below).
+        soffice_pages = self._soffice_pages_if_eligible(self.path, tmpdir, debug, progress, continuous)
+        if soffice_pages is not None:
+            return self._remember_pages(soffice_pages)
 
         docx_path = self._rtf_to_docx(self.path, tmpdir)
         if docx_path is None:

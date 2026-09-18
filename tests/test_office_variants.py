@@ -334,7 +334,12 @@ def test_pages_twopage_renders_as_single_continuous_page(sample_twopage_pages, t
 def test_pptx_twoslide_paginates_confidently(sample_twoslide_pptx, tmp_path):
     """PowerPoint's Quick Look generator names the slide boundary via
     PageElementXPath, so (unlike Word) this is trusted to paginate by
-    default with no -c/--continuous involved."""
+    default with no -c/--continuous involved - true regardless of
+    whether soffice (see OfficeDocument._SOFFICE_EXTENSIONS) or the
+    qlmanage/Chrome fallback ends up rendering it, since one soffice
+    PDF page per slide was confirmed (by hand, against both this
+    fixture and a real 55-slide deck) to land on the same page count
+    either way."""
     handler = classify(sample_twoslide_pptx, tmp_path)
     assert isinstance(handler, pdfless.OfficeDocument)
     pages = handler.build_pages(str(tmp_path))
@@ -347,6 +352,58 @@ def test_ppt_legacy_twoslide_paginates_confidently(sample_twoslide_ppt, tmp_path
     assert isinstance(handler, pdfless.OfficeDocument)
     pages = handler.build_pages(str(tmp_path))
     assert len(pages) == 2
+
+
+@requires_office_support
+@requires_soffice
+def test_pptx_uses_soffice_when_available(sample_twoslide_pptx, tmp_path):
+    """PowerPoint prefers soffice over the qlmanage/Chrome pipeline
+    when it's installed (see OfficeDocument._SOFFICE_EXTENSIONS/
+    _soffice_pages_if_eligible()) - confirmed directly here, the same
+    way test_docx_uses_soffice_when_available does for Word."""
+    handler = classify(sample_twoslide_pptx, tmp_path)
+    assert isinstance(handler, pdfless.OfficeDocument)
+    soffice_pages = handler._try_soffice_pages(
+        sample_twoslide_pptx, str(tmp_path), debug=False, progress=pdfless._ProgressLine(enabled=False),
+    )
+    assert soffice_pages is not None
+    kind, pdf_path, npages = soffice_pages
+    assert kind == "pdf"
+    assert npages == 2
+    assert os.path.isfile(pdf_path)
+
+
+@requires_office_support
+def test_pptx_falls_back_to_qlmanage_when_soffice_missing(sample_twoslide_pptx, tmp_path, monkeypatch):
+    """Regression test: with soffice unavailable (simulated here rather
+    than relying on this machine's actual install state), PowerPoint
+    must still render via the pre-existing qlmanage/Chrome + SlideDeck
+    pipeline exactly as before soffice support existed - the same
+    2-page result, just without a PDF delegate."""
+    monkeypatch.setattr(pdfless, "find_soffice", lambda: None)
+    handler = classify(sample_twoslide_pptx, tmp_path)
+    assert isinstance(handler, pdfless.OfficeDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 2
+    assert handler._pdf_delegate is None
+
+
+@requires_office_support
+@requires_soffice
+def test_pptx_becomes_searchable_and_gains_text_mode_via_its_pdf_delegate(sample_twoslide_pptx, tmp_path):
+    """PowerPoint gains the same benefits Word already got from a real
+    PDF delegate (see OfficeDocument.supports_search()/extract_text()):
+    real per-page/bbox search, and - newly, since textutil (see
+    extract_office_text()) has never been able to extract anything at
+    all from a .pptx - working text mode with each slide's own text."""
+    handler = classify(sample_twoslide_pptx, tmp_path)
+    assert isinstance(handler, pdfless.OfficeDocument)
+    handler.build_pages(str(tmp_path))
+    assert handler._pdf_delegate is not None
+
+    assert handler.supports_search() is True
+    assert handler.text_mode_is_paginated() is True
+    assert "Slide two content" in "\n".join(handler.extract_text(2))
 
 
 @requires_office_support

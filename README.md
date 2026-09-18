@@ -91,10 +91,15 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
   Office/Keynote/Pages/etc. files via Quick Look; a file like that is
   skipped with a warning if either is missing.
 - [LibreOffice](https://www.libreoffice.org) (`soffice`) - optional;
-  when installed, Word (`.doc`/`.docx`) and RTF files render through
-  it instead of the Quick Look + Chrome pipeline, for real page
-  breaks and higher-fidelity output (see the Office/iWork table
-  below). Falls back to Quick Look + Chrome when it isn't installed.
+  when installed, Word (`.doc`/`.docx`), RTF, and PowerPoint
+  (`.ppt`/`.pptx`) files render through it instead of the Quick Look +
+  Chrome pipeline, for real page breaks and higher-fidelity output
+  (see the Office/iWork table below). Falls back to Quick Look +
+  Chrome when it isn't installed. Deliberately not used for Excel:
+  soffice paginates a spreadsheet by its print area/page setup, which
+  for a workbook never tuned for printing can fragment one sheet
+  across several oddly-cut pages, unlike Quick Look's one-page-per-
+  sheet view.
 - Python 3.9+
 - [uv](https://docs.astral.sh/uv/)
 
@@ -243,11 +248,22 @@ doesn't have in the first place). `-c`/`--continuous` still collapses
 any of these back to a single scrollable page, e.g. for a document
 whose real page breaks land somewhere unhelpful.
 
+PowerPoint gets the same soffice-rendered-PDF treatment when
+`soffice` is installed (one slide per PDF page, matching the existing
+one-page-per-slide paging exactly), gaining the same crisp-zoom/
+clickable-hyperlink treatment, plus working text mode and real
+search - neither of which Quick Look's own screenshot rendering can
+offer at all. Without `soffice`, PowerPoint falls back to the
+screenshot-based rendering it always used before, unlike Word/RTF
+(which always end up as a real PDF either way, just via Chrome
+instead). Excel is deliberately excluded from this - see Requirements
+above.
+
 | Format | Extensions | Paging | Text mode | Notes |
 | --- | --- | --- | --- | --- |
 | Word | `.doc`, `.docx` | Real page breaks | Yes | Renders to a PDF (see above) - via `soffice` when installed, else Chrome's `--print-to-pdf` |
 | Excel | `.xls`, `.xlsx` | One page per sheet | No | |
-| PowerPoint | `.ppt`, `.pptx` | One page per slide | No | The most reliably paginated of any format here |
+| PowerPoint | `.ppt`, `.pptx` | One page per slide | With `soffice` | With `soffice` installed, renders to a real PDF (see above); otherwise the original screenshot-based rendering, with no extractable text |
 | RTF | `.rtf` | Real page breaks with `soffice`, otherwise always continuous | Yes | With `soffice` installed, rendered natively (real page breaks) the same as Word; otherwise converted to `.docx` via macOS's own `textutil` first (Quick Look has no HTML preview of its own for RTF), then rendered the same way as Word but always as one continuous page, since a converted RTF's page-height metadata doesn't correspond to anything in the original file |
 | Pages | `.pages` | Always continuous | No | No page-boundary marker in Pages' Quick Look preview |
 | Numbers | `.numbers` | Only the first sheet is shown | No | Numbers' Quick Look tab strip is marked up differently from Excel's and isn't recognized yet - a known gap, not a deliberate design choice |
@@ -296,10 +312,14 @@ Zoom and pan:
 | `K` / `U` / `Shift-Up` | jump to top of the current page (same as `g`) |
 | `J` / `D` / `Shift-Down` | jump to bottom of the current page (same as `G`) |
 
-Search always works for PDFs and plain text files; for a Quick Look
-preview file (Word/Excel/PowerPoint/etc.) only once switched into text
-mode with `t`, since there's no way to search its rendered page image
-directly; not available at all for a plain image. It's a
+Search always works for PDFs and plain text files, and for a Word/
+RTF/PowerPoint document rendered via a real PDF (see Office Document
+Support below) - directly in image mode, the same as a native PDF,
+without needing `t` first. For any other Quick Look preview file
+(Excel, or Word/RTF/PowerPoint without a real PDF available) it only
+works once switched into text mode with `t`, since there's no way to
+search its rendered page image directly; not available at all for a
+plain image. It's a
 case-insensitive [Python regex](https://docs.python.org/3/library/re.html)
 against the extracted/file text, across the whole document (not just
 the current page) - falling back to a literal substring match if the
@@ -321,7 +341,7 @@ Misc:
 | click / drag | (page image, not text mode) on the scrollbar, jump to the position clicked - and keep following the pointer while you drag; otherwise open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
 | mouse wheel | scroll up / down - in the page image, two lines at a time (`--wheel-scroll-step` to change that); in text mode, one line at a time |
 | `[` / `]` | back / forward, through the positions internal links have jumped from |
-| `t` | toggle plain-text view - the page's extracted text for a PDF, or the whole document's for a Word-family file (`.doc`/`.docx`/`.rtf`/...); a no-op for an image, spreadsheet, or slide deck, which have no text to extract |
+| `t` | toggle plain-text view - the current page's extracted text for a PDF, or a Word/RTF/PowerPoint file rendered via a real PDF (see Office Document Support); otherwise the whole document's text for a Word-family file (`.doc`/`.docx`/`.rtf`), via macOS's `textutil`; a no-op for an image, spreadsheet, or a slide deck with no real PDF available, which have no text to extract |
 | `B` | (text mode) toggle a border around the page's edges - on by default (`--no-border`/`-B` to start with it off); a plain text file starts with it off regardless; no border while wrapped, regardless of `B` (`-S` to unwrap first) |
 | `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped) |
 | `E` | (text mode) toggle marking a real end-of-line (↵) - on by default (`-E`/`--no-eol-mark` to start without it) |
