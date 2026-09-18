@@ -4703,7 +4703,20 @@ class Viewer:
                 if self.scroll_max == 0
                 else int(100 * self.scroll / self.scroll_max)
             )
-            mode_field = f" zoom {round(self.zoom * 100)}% "
+            # self.zoom alone isn't comparable across m/M (fit height/
+            # width): it's always "1.0" right after switching fit mode
+            # (see set_fit()), which would show "100%" for either one
+            # even though a fit-height page is rarely the same actual
+            # size as its fit-width rendering. Comparing the page's
+            # current pixel width (self.img.width - fit="height" still
+            # yields a real width, just one implied by the page's
+            # aspect ratio rather than target_px directly - see
+            # get_page_image()) against self.base_width_px (M's own
+            # 100% reference) instead makes the percentage mean the
+            # same thing - "size relative to fit-to-width" - no matter
+            # which fit mode or zoom level produced it.
+            zoom_pct = round(100 * self.img.width / max(1, self.base_width_px))
+            mode_field = f" zoom {zoom_pct}% "
         segments = [(f" {self.name} ", STATUS_COLOR_FILENAME)]
         if len(self.files) > 1:
             segments.append((
