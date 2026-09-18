@@ -53,6 +53,16 @@ def sample_docx():
 
 
 @pytest.fixture
+def sample_twopage_rtf():
+    """A 2-page RTF file (an explicit \\page break between two
+    paragraphs) - unlike sample_rtf, real enough to confirm soffice's
+    native RTF pagination (see OfficeDocument._try_soffice_pages())
+    lands on the real page count, the same way sample_twopage_docx
+    does for Word."""
+    return os.path.join(FIXTURES_DIR, "sample_twopage.rtf")
+
+
+@pytest.fixture
 def sample_multisheet_xlsx():
     """A 3-sheet workbook (Alpha/Beta/Gamma), each with distinct
     content in A1 - built via openpyxl (see the fixture-generation
@@ -155,6 +165,12 @@ def office_support_available():
 requires_office_support = pytest.mark.skipif(
     not office_support_available(),
     reason="needs macOS Quick Look (qlmanage) + a local Chrome/Chromium",
+)
+
+
+requires_soffice = pytest.mark.skipif(
+    pdfless.find_soffice() is None,
+    reason="needs a local LibreOffice (soffice) install",
 )
 
 

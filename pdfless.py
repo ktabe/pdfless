@@ -566,6 +566,26 @@ def find_chrome():
     return None
 
 
+SOFFICE_CANDIDATES = (
+    "/opt/homebrew/bin/soffice",
+    "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+)
+
+
+def find_soffice():
+    """A local LibreOffice `soffice` binary, for converting Word/RTF
+    documents to a real PDF with higher fidelity than the qlmanage +
+    Chrome --print-to-pdf pipeline (real page breaks, correctly
+    rendered embedded pictures of any format, no reliance on Quick
+    Look at all) - or None if it isn't installed. Optional: callers
+    (see OfficeDocument._try_soffice_pages()) always fall back to the
+    qlmanage/Chrome pipeline when this returns None."""
+    for path in SOFFICE_CANDIDATES:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("soffice")
+
+
 
 
 _IMG_SRC_RE = re.compile(r'(<img\b[^>]*\bsrc=")([^"]+)(")', re.IGNORECASE)
@@ -632,6 +652,43 @@ def _pdf_page_count_safe(pdf_path):
         return None
     m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
     return int(m.group(1)) if m else None
+
+
+def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
+    """Convert `path` (a Word/RTF document) to a real PDF via
+    LibreOffice's `soffice --convert-to pdf`, natively - no Quick Look/
+    Chrome involved at all - returning the output PDF's path, or None
+    on any failure (timeout, non-zero exit, or no output file), so
+    callers (see OfficeDocument._try_soffice_pages()) can always fall
+    back to the qlmanage/Chrome pipeline.
+
+    Deliberately does NOT pass --headless: confirmed by hand that
+    --headless breaks CJK (Japanese) font rendering entirely (text
+    comes out blank, though the PDF's own text layer is fine - a pure
+    glyph-resolution bug), while running without it renders correctly,
+    including over SSH.
+
+    -env:UserInstallation points at a profile directory scoped to this
+    `tmpdir` (unique per render), so concurrent soffice invocations
+    (e.g. two files opened around the same time) don't collide over a
+    shared user profile lock."""
+    profile_dir = os.path.join(tmpdir, "soffice-profile")
+    try:
+        subprocess.run(
+            [
+                soffice,
+                f"-env:UserInstallation=file://{profile_dir}",
+                "--convert-to", "pdf",
+                "--outdir", tmpdir,
+                path,
+            ],
+            capture_output=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    base = os.path.splitext(os.path.basename(path))[0]
+    out_pdf = os.path.join(tmpdir, f"{base}.pdf")
+    return out_pdf if os.path.isfile(out_pdf) else None
 
 
 def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
@@ -2429,15 +2486,23 @@ class OfficeDocument(DocumentHandler):
 
     def _render_and_remember(self, source_path, tmpdir, **kwargs):
         pages = self._render_office_pages(source_path, tmpdir, **kwargs)
+        return self._remember_pages(pages)
+
+    def _remember_pages(self, pages):
+        """Normalize and remember whatever build_pages()'s underlying
+        rendering produced - either a ("pdf", pdf_path, npages) tuple
+        (FlowingText's own PDF path, or soffice - see
+        _try_soffice_pages()) or a plain list of per-page PNG paths -
+        into self.pages/self._pdf_delegate, and return the same
+        same-length list of paths every caller of build_pages()/
+        ensure_pages() (which only ever does len(pages)) already
+        expects."""
         if pages:
             if isinstance(pages, tuple) and pages[0] == "pdf":
-                # FlowingText managed a real PDF (see
-                # FlowingText._build_pdf_pages()) - wrap it as a
-                # PdfDocument delegate (see get_page_image()) and
-                # normalize back to a same-length list of paths, so
-                # every other caller of build_pages()/ensure_pages()
-                # (which only ever does len(pages)) sees the same shape
-                # it always has.
+                # A real PDF (Chrome's --print-to-pdf or soffice) -
+                # wrap it as a PdfDocument delegate (see
+                # get_page_image()) and normalize back to a
+                # same-length list of paths.
                 _, pdf_path, npages = pages
                 self._pdf_delegate = PdfDocument(pdf_path)
                 pages = [pdf_path] * npages
@@ -2445,6 +2510,38 @@ class OfficeDocument(DocumentHandler):
                 self._pdf_delegate = None
             self.pages = pages
         return pages
+
+    def _try_soffice_pages(self, path, tmpdir, debug, progress):
+        """Attempt to render `path` (a Word/RTF document) to a real PDF
+        via LibreOffice's `soffice --convert-to pdf` (see
+        _convert_via_soffice() for why --headless is never used),
+        preferred over the qlmanage/Chrome pipeline when available -
+        soffice paginates natively (real page breaks matching the
+        original document) and needs no embedded-picture workaround
+        (see _rasterize_broken_img_sources()) at all.
+
+        Returns the same ("pdf", pdf_path, npages) tuple shape
+        FlowingText._build_pdf_pages() already produces, or None if
+        soffice isn't installed or the conversion/page-count reading
+        failed for any reason - callers always fall back to the
+        existing qlmanage/Chrome pipeline in that case."""
+        name = os.path.basename(path)
+        progress.update(f"{name}: looking for LibreOffice...")
+        soffice = find_soffice()
+        if soffice is None:
+            return None
+        if debug:
+            print(f"pdfless: [debug] {name}: using soffice: {soffice}", file=sys.stderr, end="\r\n")
+        label = f"{name}: converting via LibreOffice"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            out_pdf = _convert_via_soffice(soffice, path, tmpdir)
+        if out_pdf is None:
+            return None
+        npages = _pdf_page_count_safe(out_pdf)
+        if not npages:
+            os.unlink(out_pdf)
+            return None
+        return ("pdf", out_pdf, npages)
 
     def _render_office_pages(
         self, path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
@@ -2487,10 +2584,18 @@ class OfficeDocument(DocumentHandler):
         exception to all of this: its own PDF path
         (_build_pdf_pages()) paginates for real when not continuous,
         driven by Chrome's print engine rather than any measured/
-        guessed boundary - though RtfOfficeDocument always asks for
-        continuous=True regardless (see its build_pages()), since a
-        converted RTF's page-height metadata doesn't correspond to
-        anything in the original file either way.
+        guessed boundary - though RtfOfficeDocument's own qlmanage/
+        Chrome fallback always asks for continuous=True regardless
+        (see its build_pages()), since a converted RTF's page-height
+        metadata doesn't correspond to anything in the original file
+        either way. Word (.doc/.docx) tries LibreOffice's soffice
+        before any of this (see _try_soffice_pages(), called at the
+        very top of this method) when it's installed, since it
+        paginates natively and renders with higher fidelity than
+        either of the above; RTF does the same, but from its own
+        build_pages(), against the original .rtf rather than a
+        converted .docx - so it isn't limited to always-continuous the
+        way the qlmanage/Chrome fallback is.
 
         continuous=True (-c/--continuous) forces the single-continuous-
         page behavior even for a document that would otherwise paginate
@@ -2500,6 +2605,19 @@ class OfficeDocument(DocumentHandler):
         name = os.path.basename(path)
         t_start = time.monotonic()
         try:
+            # LibreOffice's soffice, when installed, renders Word
+            # (.doc/.docx) with real page breaks and higher fidelity
+            # than the qlmanage/Chrome pipeline below (see
+            # _try_soffice_pages()) - tried first, falling through to
+            # qlmanage/Chrome on any failure. Skipped in continuous
+            # mode: soffice always paginates for real, and there's no
+            # way to collapse that back into a single "page" the way
+            # FlowingText's own screenshot/measured-height path can.
+            if not continuous and path.lower().endswith((".doc", ".docx")):
+                soffice_pages = self._try_soffice_pages(path, tmpdir, debug, progress)
+                if soffice_pages is not None:
+                    return soffice_pages
+
             progress.update(f"{name}: looking for a local Chrome...")
             chrome = find_chrome()
             if chrome is None:
@@ -2594,6 +2712,13 @@ class OfficeDocument(DocumentHandler):
         return self.pages
 
     def extract_text(self, page):
+        if self._pdf_delegate is not None:
+            # A real PDF page (soffice or Chrome's --print-to-pdf) -
+            # use its own per-page text (pdftotext -layout), so page
+            # breaks - lost once extract_office_text()'s textutil
+            # flattens the whole document into one blob - come through
+            # correctly (see also text_mode_is_paginated()).
+            return self._pdf_delegate.extract_text(page)
         # textutil (see extract_office_text()) has no notion of pages -
         # the whole document, or None for a format it can't handle at
         # all (a spreadsheet or slide deck).
@@ -2601,6 +2726,27 @@ class OfficeDocument(DocumentHandler):
 
     def supports_text_mode(self):
         return True
+
+    def supports_search(self):
+        # Real per-page/bbox search (build_search_index()/
+        # find_search_matches() below) only works against a real PDF -
+        # a screenshot-based OfficeVariant (Excel/PowerPoint/Keynote/
+        # Pages/Numbers, or Word/RTF without soffice or Chrome's
+        # --print-to-pdf available) has no such index to search.
+        return self._pdf_delegate is not None
+
+    def text_mode_is_paginated(self):
+        return self._pdf_delegate is not None
+
+    def build_search_index(self):
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.build_search_index()
+        return None
+
+    def find_search_matches(self, index, query):
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.find_search_matches(index, query)
+        return []
 
     def _source_for_page(self, cache, page):
         # One pre-rendered PNG per page (see OfficeDocument._render_office_pages()) -
@@ -2681,6 +2827,21 @@ class RtfOfficeDocument(OfficeDocument):
         self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
         progress=None, continuous=False,
     ):
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        # Unlike the textutil-converted-docx path below, soffice reads
+        # the original .rtf natively, so its page breaks correspond to
+        # the real document - no need to force continuous=True just to
+        # dodge untrustworthy converted-page-height metadata (see the
+        # comment below). Tried first, regardless of the caller's
+        # -c/--continuous setting; only skipped when continuous=True
+        # was explicitly requested, since soffice can't collapse its
+        # real pagination back into one page.
+        if not continuous:
+            soffice_pages = self._try_soffice_pages(self.path, tmpdir, debug, progress)
+            if soffice_pages is not None:
+                return self._remember_pages(soffice_pages)
+
         docx_path = self._rtf_to_docx(self.path, tmpdir)
         if docx_path is None:
             return None
@@ -2696,6 +2857,11 @@ class RtfOfficeDocument(OfficeDocument):
         )
 
     def extract_text(self, page):
+        if self._pdf_delegate is not None:
+            # soffice rendered the original .rtf natively to a real
+            # PDF (see build_pages()) - use its own per-page text, the
+            # same as OfficeDocument.extract_text() does for Word.
+            return self._pdf_delegate.extract_text(page)
         # textutil already handles RTF directly for plain-text
         # extraction (see extract_office_text()) - no need to go via
         # the .docx conversion just for this.

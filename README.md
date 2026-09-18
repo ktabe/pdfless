@@ -90,6 +90,11 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
 - macOS + a local Chrome/Chromium install - only needed for opening
   Office/Keynote/Pages/etc. files via Quick Look; a file like that is
   skipped with a warning if either is missing.
+- [LibreOffice](https://www.libreoffice.org) (`soffice`) - optional;
+  when installed, Word (`.doc`/`.docx`) and RTF files render through
+  it instead of the Quick Look + Chrome pipeline, for real page
+  breaks and higher-fidelity output (see the Office/iWork table
+  below). Falls back to Quick Look + Chrome when it isn't installed.
 - Python 3.9+
 - [uv](https://docs.astral.sh/uv/)
 
@@ -223,24 +228,27 @@ see the table below. A format that can't be paged is shown as one long
 scrollable image instead (the same as a plain image file, or as
 `-c`/`--continuous` forces for any of these).
 
-Word and RTF render to a real PDF under the hood (via Chrome's
-headless `--print-to-pdf`, rather than a screenshot), so - like a
-normal PDF, and unlike the other formats below - they stay sharp at any
-zoom level, and a hyperlink in the original document is clickable, the
-same as a real PDF's. Paging for these comes from Chrome's own print
-engine breaking real content flow across pages, the same as printing
-the document normally would, rather than a screen-mode page-boundary
-marker (which Word's Quick Look preview doesn't have in the first
-place); `-c`/`--continuous` still collapses either one back to a
-single scrollable page, e.g. for a document whose real page breaks
-land somewhere unhelpful.
+Word and RTF render to a real PDF under the hood, so - like a normal
+PDF, and unlike the other formats below - they stay sharp at any zoom
+level, and a hyperlink in the original document is clickable, the same
+as a real PDF's. When [LibreOffice](https://www.libreoffice.org)
+(`soffice`) is installed, it's used to produce that PDF, natively and
+with higher fidelity (real page breaks matching the original document,
+correctly rendered embedded pictures of any format); otherwise it
+falls back to rendering the Quick Look preview through headless
+Chrome's `--print-to-pdf`, with paging coming from Chrome's own print
+engine breaking real content flow across pages, rather than a
+screen-mode page-boundary marker (which Word's Quick Look preview
+doesn't have in the first place). `-c`/`--continuous` still collapses
+any of these back to a single scrollable page, e.g. for a document
+whose real page breaks land somewhere unhelpful.
 
 | Format | Extensions | Paging | Text mode | Notes |
 | --- | --- | --- | --- | --- |
-| Word | `.doc`, `.docx` | Real page breaks | Yes | Renders to a PDF (see above); paginated via Chrome's print engine rather than a Quick Look page-boundary marker, which this format's preview doesn't have |
+| Word | `.doc`, `.docx` | Real page breaks | Yes | Renders to a PDF (see above) - via `soffice` when installed, else Chrome's `--print-to-pdf` |
 | Excel | `.xls`, `.xlsx` | One page per sheet | No | |
 | PowerPoint | `.ppt`, `.pptx` | One page per slide | No | The most reliably paginated of any format here |
-| RTF | `.rtf` | Always continuous | Yes | Converted to `.docx` via macOS's own `textutil` first (Quick Look has no HTML preview of its own for RTF), then rendered the same way as Word - but always as one continuous page, since a converted RTF's page-height metadata doesn't correspond to anything in the original file |
+| RTF | `.rtf` | Real page breaks with `soffice`, otherwise always continuous | Yes | With `soffice` installed, rendered natively (real page breaks) the same as Word; otherwise converted to `.docx` via macOS's own `textutil` first (Quick Look has no HTML preview of its own for RTF), then rendered the same way as Word but always as one continuous page, since a converted RTF's page-height metadata doesn't correspond to anything in the original file |
 | Pages | `.pages` | Always continuous | No | No page-boundary marker in Pages' Quick Look preview |
 | Numbers | `.numbers` | Only the first sheet is shown | No | Numbers' Quick Look tab strip is marked up differently from Excel's and isn't recognized yet - a known gap, not a deliberate design choice |
 | Keynote | `.key` | Always continuous | No | Unlike PowerPoint, Keynote's Quick Look preview exposes no slide-boundary marker at all - a known gap |

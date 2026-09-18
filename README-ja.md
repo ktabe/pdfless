@@ -62,6 +62,7 @@
 - iTerm2のインラインイメージプロトコルに対応した端末 — [iTerm2](https://iterm2.com) と [WezTerm](https://wezterm.org) で動作確認済み。このプロトコルに非対応の端末では何も表示されません。
 - [poppler](https://poppler.freedesktop.org)（`pdftoppm`/`pdfinfo`/`pdftocairo`）— PDFを直接見るとき、およびQuick Lookプレビューファイル（Word/Excel/PowerPointなど）に埋め込まれた画像をラスタライズするときに必要です。画像ファイルしか開かないなら不要です。
 - macOS + ローカルのChrome/Chromium — Office/Keynote/PagesなどをQuick Look経由で開くときだけ必要です。どちらかがなければ、そのファイルは警告を出してスキップされます。
+- [LibreOffice](https://www.libreoffice.org)（`soffice`）— 任意。インストールされていれば、Word（`.doc`/`.docx`）とRTFファイルはQuick Look + Chromeの代わりにこちらでレンダリングされ、実際のページ分割・より高忠実度な出力になります（詳細は後述のOffice/iWork対応表を参照）。未インストールならQuick Look + Chromeにフォールバックします。
 - Python 3.9以上
 - [uv](https://docs.astral.sh/uv/)
 
@@ -183,14 +184,14 @@ macOSでローカルにChrome/Chromiumがインストールされていれば、
 
 これは実験的な機能です——ページ送りがどこまでうまくいくかは、各形式のQuick Lookジェネレータが何を提供するか次第で大きく変わります（詳しくは下表）。ページ送りできない形式は、代わりに1枚の連続スクロール画像として表示されます（プレーンな画像ファイルと同じ、また`-c`/`--continuous`が強制するのと同じ表示方法です）。
 
-Word・RTFは、内部で(スクリーンショットではなく)Chromeのheadless `--print-to-pdf`を使って実PDFとしてレンダリングされます。そのため、他の形式と違い、通常のPDFと同じようにどのズーム倍率でもシャープなままで、元の文書内のハイパーリンクも本物のPDFと同様にクリック可能です。ページ送りもChromeの印刷エンジンが実際のコンテンツの流れに沿って自然に行うので(通常の印刷と同じ)、Quick Look側のページ境界情報(そもそもWordのプレビューにはこれがない)を使うわけではありません。`-c`/`--continuous`を指定すれば、いつでも1枚の連続スクロール表示に戻せます。
+Word・RTFは、内部で実PDFとしてレンダリングされます。そのため、他の形式と違い、通常のPDFと同じようにどのズーム倍率でもシャープなままで、元の文書内のハイパーリンクも本物のPDFと同様にクリック可能です。[LibreOffice](https://www.libreoffice.org)（`soffice`）がインストールされていれば、そちらを使ってネイティブに、かつより高忠実度で（実際のページ分割が元の文書と一致し、埋め込まれた画像もどの形式でも正しくレンダリングされる）PDF化します。インストールされていなければ、Quick Lookプレビューを(スクリーンショットではなく)Chromeのheadless `--print-to-pdf`でレンダリングする方式にフォールバックし、ページ送りはChromeの印刷エンジンが実際のコンテンツの流れに沿って自然に行います(通常の印刷と同じ、Quick Look側のページ境界情報——そもそもWordのプレビューにはこれがない——は使いません)。`-c`/`--continuous`を指定すれば、どちらの場合でもいつでも1枚の連続スクロール表示に戻せます。
 
 | 形式 | 拡張子 | ページ送り | テキストモード | 備考 |
 | --- | --- | --- | --- | --- |
-| Word | `.doc`, `.docx` | 実際のページ分割 | ○ | 実PDFとしてレンダリング(上記参照)。Quick Lookのページ境界情報(この形式のプレビューにはそもそも無い)ではなく、Chromeの印刷エンジンによる分割 |
+| Word | `.doc`, `.docx` | 実際のページ分割 | ○ | 実PDFとしてレンダリング(上記参照)。`soffice`があればそちらを使用、なければChromeの`--print-to-pdf` |
 | Excel | `.xls`, `.xlsx` | シートごとに1ページ | × | |
 | PowerPoint | `.ppt`, `.pptx` | スライドごとに1ページ | × | この中で最も確実にページ送りできる形式 |
-| RTF | `.rtf` | 常に連続表示 | ○ | まずmacOSの`textutil`で`.docx`に変換してから（Quick Look自体はRTF用のHTMLプレビューを持たないため）、Wordと同じ扱いでレンダリングされる——ただし常に1枚の連続表示（変換後のdocxのページ高さ情報は元のRTFのページとは対応しないため） |
+| RTF | `.rtf` | `soffice`があれば実際のページ分割、なければ常に連続表示 | ○ | `soffice`がインストールされていれば、Wordと同様にネイティブにレンダリング(実際のページ分割)。なければまずmacOSの`textutil`で`.docx`に変換してから（Quick Look自体はRTF用のHTMLプレビューを持たないため）、Wordと同じ扱いでレンダリングされる——ただし常に1枚の連続表示（変換後のdocxのページ高さ情報は元のRTFのページとは対応しないため） |
 | Pages | `.pages` | 常に連続表示 | × | PagesのQuick Lookプレビューにはページ境界を示す情報がない |
 | Numbers | `.numbers` | 最初のシートしか表示されない | × | NumbersのQuick Lookのタブ切り替え部分はExcelとマークアップが異なり、現状認識できていない（意図した仕様ではなく、既知の制限） |
 | Keynote | `.key` | 常に連続表示 | × | PowerPointと異なり、KeynoteのQuick Lookプレビューにはスライド境界を示す情報が一切ない（既知の制限） |
