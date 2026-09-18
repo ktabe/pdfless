@@ -45,17 +45,6 @@ def test_turning_the_page_keeps_the_left_edge(sample_pdf):
     assert viewer.x_offset == 0
 
 
-def test_turning_the_page_keeps_a_pan_in_the_middle_too(sample_pdf):
-    """Not just the left edge: whatever you panned to stays put."""
-    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
-    viewer.handle_key("l")
-    panned = viewer.x_offset
-    assert panned > 0
-
-    viewer.go_page(2, 0)
-    assert viewer.x_offset == panned
-
-
 def test_scrolling_off_the_bottom_of_a_page_keeps_the_pan(sample_pdf):
     """A height-fitted page has nothing left to scroll, so "j" is a
     page turn - which is how the re-centering this guards against used

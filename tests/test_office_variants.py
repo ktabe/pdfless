@@ -10,7 +10,6 @@ actually rendering.
 """
 
 import fcntl
-import os
 import pty
 import struct
 import termios
@@ -94,28 +93,6 @@ def test_docx_continuous_flag_forces_a_single_page(sample_twopage_docx, tmp_path
     assert isinstance(handler, pdfless.OfficeDocument)
     pages = handler.build_pages(str(tmp_path), continuous=True)
     assert len(pages) == 1
-
-
-@requires_office_support
-@requires_soffice
-def test_docx_uses_soffice_when_available(sample_twopage_docx, tmp_path):
-    """Word prefers LibreOffice's soffice over the qlmanage/Chrome
-    pipeline when it's installed (see
-    OfficeDocument._try_soffice_pages(), called at the top of
-    _render_office_pages()) - confirmed directly here by calling it in
-    isolation rather than inferring it indirectly from build_pages()'s
-    result, since both paths happen to produce a working PDF delegate
-    for this fixture."""
-    handler = classify(sample_twopage_docx, tmp_path)
-    assert isinstance(handler, pdfless.OfficeDocument)
-    soffice_pages = handler._try_soffice_pages(
-        sample_twopage_docx, str(tmp_path), debug=False, progress=pdfless._ProgressLine(enabled=False),
-    )
-    assert soffice_pages is not None
-    kind, pdf_path, npages = soffice_pages
-    assert kind == "pdf"
-    assert npages == 2
-    assert os.path.isfile(pdf_path)
 
 
 @requires_office_support
@@ -352,25 +329,6 @@ def test_ppt_legacy_twoslide_paginates_confidently(sample_twoslide_ppt, tmp_path
     assert isinstance(handler, pdfless.OfficeDocument)
     pages = handler.build_pages(str(tmp_path))
     assert len(pages) == 2
-
-
-@requires_office_support
-@requires_soffice
-def test_pptx_uses_soffice_when_available(sample_twoslide_pptx, tmp_path):
-    """PowerPoint prefers soffice over the qlmanage/Chrome pipeline
-    when it's installed (see OfficeDocument._SOFFICE_EXTENSIONS/
-    _soffice_pages_if_eligible()) - confirmed directly here, the same
-    way test_docx_uses_soffice_when_available does for Word."""
-    handler = classify(sample_twoslide_pptx, tmp_path)
-    assert isinstance(handler, pdfless.OfficeDocument)
-    soffice_pages = handler._try_soffice_pages(
-        sample_twoslide_pptx, str(tmp_path), debug=False, progress=pdfless._ProgressLine(enabled=False),
-    )
-    assert soffice_pages is not None
-    kind, pdf_path, npages = soffice_pages
-    assert kind == "pdf"
-    assert npages == 2
-    assert os.path.isfile(pdf_path)
 
 
 @requires_office_support

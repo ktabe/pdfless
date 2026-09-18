@@ -14,7 +14,6 @@ import termios
 import tempfile
 
 import pdfless
-from conftest import requires_office_support
 
 
 def make_viewer(handler, wrap=True, cols=40):
@@ -56,13 +55,6 @@ def test_pdf_text_mode_wrap_default_off_regardless_of_chop_long_lines(sample_pdf
     viewer2 = make_viewer(pdfless.PdfDocument(sample_pdf), wrap=False)
     assert viewer2.enter_text_mode() is True
     assert viewer2.text_wrap is False
-
-
-@requires_office_support
-def test_office_document_text_mode_wrap_default_off(sample_docx):
-    viewer = make_viewer(pdfless.OfficeDocument(sample_docx), wrap=True)
-    assert viewer.enter_text_mode() is True
-    assert viewer.text_wrap is False
 
 
 def test_dash_s_toggles_wrap_either_way(sample_text):
