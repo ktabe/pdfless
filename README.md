@@ -105,6 +105,14 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
   Required (with no fallback) for OpenDocument (`.odt`/`.odp`/`.odg`/
   `.ods`), Visio (`.vsd`/`.vsdx`), and WMF, since macOS has no Quick
   Look generator for any of these at all.
+- For Markdown (`.md`/`.markdown`): the `markdown` and `weasyprint`
+  Python packages, both declared as dependencies below so `uv`
+  installs them automatically - but `weasyprint` also needs
+  Cairo/Pango/GLib/HarfBuzz as system libraries, which `pip`/`uv`
+  can't install by themselves (e.g. `brew install cairo pango
+  gdk-pixbuf libffi` on macOS). Without a working `weasyprint`, a
+  Markdown file falls back to being shown as its own raw source, the
+  same as any other optional renderer here.
 - Python 3.9+
 - [uv](https://docs.astral.sh/uv/)
 
@@ -292,6 +300,18 @@ interactivity. Without a local Chrome, an SVG falls back to being
 shown as its own raw XML source instead (the same as before this
 feature existed).
 
+Markdown (`.md`/`.markdown`) is rendered to a real PDF too, but
+through neither Quick Look, Chrome, nor `soffice` - the `markdown`
+and `weasyprint` Python libraries (see Requirements above) convert it
+to HTML and then to a real PDF directly, dramatically faster than any
+browser/office-suite round trip (confirmed by hand: comfortably under
+a second, against a browser's own ~1-2s process startup alone) since
+WeasyPrint has a real CSS pagination engine of its own - no measuring
+step needed the way SVG/Word's Chrome path requires. A plain link
+survives as a real, clickable PDF link the same way. Without those
+libraries (or the system libraries WeasyPrint itself needs), a
+Markdown file falls back to being shown as its own raw source instead.
+
 | Format | Extensions | Paging | Text mode | Notes |
 | --- | --- | --- | --- | --- |
 | Word | `.doc`, `.docx`, `.docm` | Real page breaks | Yes | Renders to a PDF (see above) - via `soffice` when installed, else Chrome's `--print-to-pdf` |
@@ -308,6 +328,7 @@ feature existed).
 | Visio | `.vsd`, `.vsdx` | One page per Visio page | Yes | Needs `soffice` - no Quick Look generator exists for this at all; `.vsdx` unverified by hand |
 | WMF | `.wmf` | Single page | Yes | Needs `soffice` - Quick Look can't preview it and no browser can decode it either |
 | SVG | `.svg` | Single page | Yes | Renders via Chrome directly (see above), not `soffice` or Quick Look; falls back to raw XML source without a local Chrome |
+| Markdown | `.md`, `.markdown` | Real pagination | Yes | Renders via `markdown` + `weasyprint` (see above), not Chrome, `soffice`, or Quick Look; falls back to raw Markdown source without those libraries |
 
 Text mode (`t`) comes from macOS's own `textutil` for a Word-family
 document without a real PDF behind it (`.doc`/`.docx`/`.docm`/`.rtf`)
@@ -417,7 +438,7 @@ Misc:
 
 ```sh
 cd tests
-uv run --with pytest --with pytest-timeout --with pillow --with pypdf python -m pytest
+uv run --with pytest --with pytest-timeout --with pillow --with pypdf --with markdown --with weasyprint python -m pytest
 ```
 
 Most of the suite is fast (file-classification/caching unit tests); a

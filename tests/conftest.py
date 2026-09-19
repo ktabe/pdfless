@@ -260,6 +260,22 @@ requires_soffice = pytest.mark.skipif(
 )
 
 
+requires_markdown_rendering = pytest.mark.skipif(
+    not pdfless._markdown_rendering_available(),
+    reason="needs the markdown and weasyprint Python libraries (and weasyprint's own Cairo/Pango system libraries)",
+)
+
+
+@pytest.fixture
+def sample_md():
+    """A Markdown file with a title, lorem-ipsum/Japanese body text,
+    a bulleted list, a fenced code block, a blockquote, and a link -
+    long enough (see the "追加セクション" padding sections) to span 2
+    real WeasyPrint-paginated pages, so MarkdownDocument's pagination
+    (not just single-page rendering) gets exercised."""
+    return os.path.join(FIXTURES_DIR, "sample.md")
+
+
 class PtySession:
     """Drives a real `pdfless.py <files...>` subprocess through a
     pseudo-terminal - the only way to exercise Viewer end-to-end (it

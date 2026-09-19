@@ -63,6 +63,7 @@
 - [poppler](https://poppler.freedesktop.org)（`pdftoppm`/`pdfinfo`/`pdftocairo`）— PDFを直接見るとき、およびQuick Lookプレビューファイル（Word/Excel/PowerPointなど）に埋め込まれた画像をラスタライズするときに必要です。画像ファイルしか開かないなら不要です。
 - macOS + ローカルのChrome/Chromium — Office/Keynote/PagesなどをQuick Look経由で開くときと、SVGファイルを直接開くとき(Quick Lookは使わずChromeのみ)に必要です。必要な依存が無ければ、そのファイルは警告を出してスキップされます。
 - [LibreOffice](https://www.libreoffice.org)（`soffice`）— 任意。インストールされていれば、Word（`.doc`/`.docx`/`.docm`）・RTF・PowerPoint（`.ppt`/`.pptx`/`.pptm`）ファイルはQuick Look + Chromeの代わりにこちらでレンダリングされ、実際のページ分割・より高忠実度な出力になります（詳細は後述のOffice/iWork対応表を参照）。未インストールならQuick Look + Chromeにフォールバックします。Excel（`.xls`/`.xlsx`/`.xlsm`）は意図的に対象外です:sofficeはExcelの印刷設定(改ページ・印刷範囲)に従ってページ分割するため、印刷用に整えられていない実際のシートでは列の途中で不自然に分割されることがあり、Quick Lookの「1シート=1ページ」表示とは異なる挙動になります。OpenDocument（`.odt`/`.odp`/`.odg`/`.ods`）・Visio（`.vsd`/`.vsdx`）・WMFは、macOSにそもそもQuick Lookのジェネレータが存在しないため、`soffice`が(代替手段無しで)必須です。
+- Markdown（`.md`/`.markdown`）用: `markdown`と`weasyprint`というPythonパッケージ(下記に依存関係として明記済みで`uv`が自動インストール)。ただし`weasyprint`はさらにCairo/Pango/GLib/HarfBuzzといったシステムライブラリを必要とし、これは`pip`/`uv`だけでは入りません(例: macOSなら`brew install cairo pango gdk-pixbuf libffi`)。`weasyprint`が動かない場合、Markdownファイルは他の任意レンダラーと同様、生のソースとして表示されます。
 - Python 3.9以上
 - [uv](https://docs.astral.sh/uv/)
 
@@ -192,6 +193,8 @@ PowerPointも`soffice`がインストールされていれば同様に実PDF化�
 
 SVGだけは例外で、Quick Lookもsofficeも使わず、headless Chrome(pdflessがもともと必須としているもの)で直接実PDF化します。SVGを`<img>`として埋め込んでPDF印刷する方式で、SVG内のベクター部分は本物のベクターPDFとして残ることを確認済みです（Wordの実PDF化と同様、どのズームでもシャープなまま）。この方式の唯一の制限は、`<img>`要素がインタラクティブ性を無効化するため、SVG内部のハイパーリンクはクリックできなくなることです。ローカルにChromeが無い場合は、この機能が無かった頃と同じく、SVGの生のXMLソースとして表示されます。
 
+Markdown（`.md`/`.markdown`）も実PDF化されますが、Quick Look・Chrome・sofficeのいずれも使いません——`markdown`と`weasyprint`というPythonライブラリ(前述の「必要なもの」参照)でHTMLを経由して直接実PDFに変換します。ブラウザやOfficeスイートを経由するより大幅に高速です(実機確認: 1秒未満、ブラウザ起動だけで1〜2秒かかるのと比べて桁違い)。WeasyPrintは本物のCSSページネーションエンジンを持つため、SVG/Wordのように事前に高さを測る必要もありません。文中のリンクも本物のクリック可能なPDFリンクとして残ります。これらのライブラリ(またはWeasyPrintが必要とするシステムライブラリ)が無い場合は、Markdownファイルは生のソースとして表示されます。
+
 | 形式 | 拡張子 | ページ送り | テキストモード | 備考 |
 | --- | --- | --- | --- | --- |
 | Word | `.doc`, `.docx`, `.docm` | 実際のページ分割 | ○ | 実PDFとしてレンダリング(上記参照)。`soffice`があればそちらを使用、なければChromeの`--print-to-pdf` |
@@ -208,6 +211,7 @@ SVGだけは例外で、Quick Lookもsofficeも使わず、headless Chrome(pdfle
 | Visio | `.vsd`, `.vsdx` | Visioのページごとに1ページ | ○ | `soffice`が必要——そもそもQuick Lookのジェネレータが存在しない。`.vsdx`は実機未検証 |
 | WMF | `.wmf` | 単一ページ | ○ | `soffice`が必要——Quick Lookでプレビューできず、ブラウザもこの形式を読めない |
 | SVG | `.svg` | 単一ページ | ○ | Chromeで直接レンダリング(上記参照)。`soffice`もQuick Lookも使わない。ローカルにChromeが無ければ生のXMLソースとして表示 |
+| Markdown | `.md`, `.markdown` | 実際のページ分割 | ○ | `markdown` + `weasyprint`でレンダリング(上記参照)。Chrome・`soffice`・Quick Lookのいずれも使わない。これらのライブラリが無ければ生のMarkdownソースとして表示 |
 
 テキストモード（`t`）は、実PDFを持たないWord系の文書（`.doc`/`.docx`/`.docm`/`.rtf`）ではmacOSの`textutil`によるものです——表計算・スライド・Apple独自のiWork形式（Pages/Numbers/Keynote）については何もテキストを返せないため、`t`は「テキストなし」と表示します（画像表示自体は問題なく使えます）。実PDFを持つ形式（上記参照）は、そのPDFからページごとに直接テキストを取得します。
 
@@ -281,7 +285,7 @@ Quick Lookが必要な形式(上記のほとんど)は、`qlmanage`やローカ�
 
 ```sh
 cd tests
-uv run --with pytest --with pytest-timeout --with pillow --with pypdf python -m pytest
+uv run --with pytest --with pytest-timeout --with pillow --with pypdf --with markdown --with weasyprint python -m pytest
 ```
 
 大半は高速なユニットテスト（ファイル分類・ページキャッシュ関連）です。一部は実際に`pdfless.py`を擬似端末（pty）経由で起動し、Viewer自体のクラッシュを検出します（実端末でしか再現しない挙動があるため）。`qlmanage`とローカルのChrome/Chromiumが両方使える環境でなければ、`.docx`（Quick Lookプレビュー経由）のテストは自動的にスキップされます。

@@ -4,6 +4,8 @@
 # dependencies = [
 #     "pillow",
 #     "pypdf",
+#     "markdown",
+#     "weasyprint",
 # ]
 # ///
 """pdfless - a less(1)-like full-screen PDF pager for terminals that
@@ -24,6 +26,7 @@ Look generators can preview - Word, Excel, PowerPoint, Keynote, Pages,
 import argparse
 import base64
 import concurrent.futures
+import contextlib
 import fcntl
 import hashlib
 import html
@@ -690,6 +693,147 @@ def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
     base = os.path.splitext(os.path.basename(path))[0]
     out_pdf = os.path.join(tmpdir, f"{base}.pdf")
     return out_pdf if os.path.isfile(out_pdf) else None
+
+
+# Minimal styling for MarkdownDocument's rendered pages - just enough
+# that headings/code/quotes are visually distinct, deliberately not
+# trying to imitate any particular Markdown renderer's house style.
+# No @font-face/font-family override: left to whatever WeasyPrint
+# picks as the system default, so CJK text (which needs a real CJK
+# font) renders using whatever's actually installed rather than a
+# Latin-only font silently dropping every Japanese glyph.
+MARKDOWN_CSS = """
+body { line-height: 1.5; padding: 2em; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.2; margin-top: 1em; }
+pre, code { font-family: monospace; background: #f0f0f0; }
+pre { padding: 0.6em; white-space: pre-wrap; }
+code { padding: 0.1em 0.3em; }
+pre code { padding: 0; background: none; }
+blockquote { border-left: 4px solid #ccc; margin-left: 0; padding-left: 1em; color: #555; }
+table { border-collapse: collapse; max-width: 100%; }
+th, td { border: 1px solid #ccc; padding: 0.3em 0.6em; }
+img { max-width: 100%; height: auto; }
+"""
+
+
+def _ensure_homebrew_lib_path_for_weasyprint():
+    """WeasyPrint (via cffi) dlopen()s Cairo/Pango/GLib by their bare
+    library names, relying on the dynamic linker's own default search
+    to find them. Confirmed by hand: that default search does NOT
+    include Homebrew's own lib directory when running under a
+    uv-managed standalone Python build (e.g. a free-threaded 3.14
+    install) - even with those exact libraries installed via Homebrew
+    - while the same import succeeds unmodified under a
+    Homebrew-installed Python on the same machine. Rather than
+    requiring every user hitting this to discover and set
+    DYLD_LIBRARY_PATH by hand (WeasyPrint's own macOS troubleshooting
+    docs suggest exactly that), add Homebrew's lib directory to
+    DYLD_FALLBACK_LIBRARY_PATH before the first import attempt -
+    confirmed by hand this alone is enough to fix the failing case.
+    A *fallback* path (rather than DYLD_LIBRARY_PATH, which is
+    consulted first) can't ever shadow a library some other search
+    step already finds correctly, so this is safe to always do.
+    macOS-only; a no-op everywhere else."""
+    if sys.platform != "darwin":
+        return
+    existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    parts = existing.split(":") if existing else []
+    for lib_dir in ("/opt/homebrew/lib", "/usr/local/lib"):
+        if os.path.isdir(lib_dir) and lib_dir not in parts:
+            parts.append(lib_dir)
+    if parts:
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(parts)
+
+
+def _markdown_rendering_available():
+    """Whether MarkdownDocument can even attempt to render at all -
+    both the `markdown` and `weasyprint` libraries import cleanly.
+    Cheap to call more than once: a successful import is cached by
+    Python itself (sys.modules), so only the first call actually pays
+    for it. See _render_markdown_pdf() for why this has to be a
+    runtime check rather than something assumed from the PEP723
+    dependency list.
+
+    Deliberately catches more than just ImportError: weasyprint's own
+    import chain reaches into cffi to dlopen() the actual Cairo/Pango/
+    GLib shared libraries, and a missing one there raises a plain
+    OSError, not an ImportError (confirmed by hand: "cannot load
+    library 'libgobject-2.0-0'" on a machine without those system
+    libraries installed) - anything going wrong at import time means
+    the same thing here (rendering isn't available), so it's all
+    caught the same way rather than letting a fairly common
+    installation gap crash the whole program on startup.
+
+    Also deliberately swallows whatever weasyprint prints along the
+    way: on that same missing-libraries path, it print()s its own
+    multi-line "could not import some external libraries" notice
+    before the OSError above even reaches here (confirmed by hand).
+    Since this whole function's job is to fail silently and let the
+    caller fall back to plain text, letting that notice through would
+    defeat the point - and pdfless spends most of its life with the
+    terminal in raw mode showing an alternate screen, where a stray
+    print from a library is a corrupted-looking screen, not just
+    unwanted noise."""
+    _ensure_homebrew_lib_path_for_weasyprint()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            import markdown  # noqa: F401
+            import weasyprint  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _render_markdown_pdf(path, out_pdf):
+    """Convert `path` (a Markdown file) to a real PDF via the
+    `markdown` (Markdown -> HTML) and `weasyprint` (HTML+CSS -> PDF)
+    libraries - no headless Chrome or LibreOffice involved at all, and
+    dramatically faster than either (confirmed by hand: a whole
+    conversion takes well under a second, against Chrome's own ~1-2s
+    process startup alone), since WeasyPrint has a real CSS
+    pagination engine of its own - no need for FlowingText/
+    SvgDocument's own "measure the content first, then set an exact
+    @page size" dance; a long document just comes out as however many
+    pages it naturally takes.
+
+    Both libraries are declared PEP723 dependencies (so `uv run`
+    always installs the pip packages), but weasyprint also needs
+    system-level Cairo/Pango/GLib libraries pip can't install by
+    itself - so the import happens lazily, here (via
+    _markdown_rendering_available()), rather than at module load time,
+    and any failure is treated the same as "not installed": returns
+    False, and the caller falls back to plain-text rendering, the
+    same graceful degradation soffice/Chrome already get when they're
+    missing.
+
+    Returns False on any failure (including a missing library) - never
+    raises, so this is always safe for a caller to attempt speculatively."""
+    if not _markdown_rendering_available():
+        return False
+    import markdown
+    from weasyprint import HTML
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except OSError:
+        return False
+    body = markdown.markdown(source, extensions=["extra", "sane_lists"])
+    html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{MARKDOWN_CSS}</style></head><body>{body}</body></html>'
+    # base_url lets a relative-path image reference in the source
+    # (e.g. "![alt](./diagram.png)") resolve against the Markdown
+    # file's own directory, the same as a browser would for a page
+    # loaded from there.
+    base_url = os.path.dirname(os.path.abspath(path)) + "/"
+    try:
+        HTML(string=html, base_url=base_url).write_pdf(out_pdf)
+    except Exception:
+        # WeasyPrint can raise a variety of its own exception types for
+        # a malformed document/CSS - none of them worth the whole
+        # program aborting over; the caller's error-placeholder
+        # fallback handles it the same as any other rendering failure.
+        return False
+    return os.path.exists(out_pdf)
 
 
 def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
@@ -3102,19 +3246,68 @@ class SvgDocument(OfficeDocument):
             f.write(html)
 
 
+class MarkdownDocument(OfficeDocument):
+    """A Markdown file, rendered to a real PDF via the `markdown` +
+    `weasyprint` Python libraries (see _render_markdown_pdf()) - no
+    Quick Look, Chrome, or LibreOffice involved at all, and
+    dramatically faster than either (confirmed by hand: well under a
+    second, against Chrome's own ~1-2s process startup alone), since
+    WeasyPrint paginates for real on its own rather than needing a
+    measured/injected @page size the way FlowingText/SvgDocument do.
+
+    Falls back to plain text (TextDocument, showing the raw Markdown
+    source) if `markdown`/`weasyprint` - or the system libraries
+    WeasyPrint itself needs (Cairo/Pango/GLib, not something pip can
+    install on its own) - aren't available; see sniff().
+
+    -c/--continuous has no effect here, the same as SofficeOnlyDocument
+    and for the same reason: WeasyPrint's real pagination can't be
+    collapsed back into a single page."""
+
+    _MARKDOWN_EXTENSIONS = (".md", ".markdown")
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        if not path.lower().endswith(cls._MARKDOWN_EXTENSIONS):
+            return None
+        if not _markdown_rendering_available():
+            return None
+        return cls(path)
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        name = os.path.basename(self.path)
+        tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        out_pdf = os.path.join(tmpdir, f"markdown-capture-{tag}.pdf")
+        label = f"{name}: rendering to PDF"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            ok = _render_markdown_pdf(self.path, out_pdf)
+        npages = _pdf_page_count_safe(out_pdf) if ok else None
+        if not npages:
+            if os.path.exists(out_pdf):
+                os.unlink(out_pdf)
+            return None
+        return self._remember_pages(("pdf", out_pdf, npages))
+
+
 # The order main()'s classification loop tries these in - RtfOfficeDocument
 # and RtfDocument (both RTF - the former tried first, see their own
-# docstrings) and SvgDocument before the generic TextDocument, since all
-# would otherwise match the same file (RTF and SVG are both plain text -
-# SvgDocument falls through to TextDocument's raw-XML-source rendering
-# when Chrome isn't installed, the same way RtfOfficeDocument falls
+# docstrings), SvgDocument, and MarkdownDocument before the generic
+# TextDocument, since all would otherwise match the same file (RTF,
+# SVG, and Markdown are all plain text - SvgDocument/MarkdownDocument
+# fall through to TextDocument's raw-source rendering when their own
+# dependency isn't installed, the same way RtfOfficeDocument falls
 # through to RtfDocument without textutil); SofficeOnlyDocument before
 # OfficeDocument since it covers formats OfficeDocument's own qlmanage
 # probe can't handle at all; OfficeDocument last since it's the most
 # expensive check (shells out to qlmanage).
 HANDLER_CLASSES = [
     PdfDocument, ImageDocument, RtfOfficeDocument, RtfDocument, SvgDocument,
-    TextDocument, SofficeOnlyDocument, OfficeDocument,
+    MarkdownDocument, TextDocument, SofficeOnlyDocument, OfficeDocument,
 ]
 
 
