@@ -15,10 +15,14 @@ that raster in memory and redrawing the screen - the same "redraw on
 each keypress" approach less(1) uses internally, since a terminal has
 no way to scroll just part of an inline image.
 
-Plain images and text files are supported directly, and (macOS only,
-given a local Chrome/Chromium install) anything else this Mac's Quick
-Look generators can preview - Word, Excel, PowerPoint, Keynote, Pages,
-... - via qlmanage + a headless-Chrome screenshot of its HTML preview.
+Plain images and text files are supported directly. Markdown files
+(.md, ...) can be previewed as rendered HTML when pandoc and a local
+Chrome/Chromium are available (pandoc - standalone HTML, then a
+headless-Chrome screenshot - the same capture path Office previews
+use). And (macOS only, given a local Chrome/Chromium install) anything
+else this Mac's Quick Look generators can preview - Word, Excel,
+PowerPoint, Keynote, Pages, ... - via qlmanage + a headless-Chrome
+screenshot of its HTML preview.
 """
 
 import argparse
@@ -1099,6 +1103,128 @@ def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
         return None
 
 
+_SCROLL_HEIGHT_MEASURE_SCRIPT = (
+    "<script>"
+    "function _pdflessMeasure(){"
+    "document.title = String(Math.ceil(Math.max("
+    "document.documentElement.scrollHeight, document.body.scrollHeight)));"
+    "}"
+    "var _pdflessImgs = Array.from(document.images);"
+    "var _pdflessPending = _pdflessImgs.filter(function(i){return !i.complete;}).length;"
+    "if (_pdflessPending === 0) { _pdflessMeasure(); }"
+    "else {"
+    "_pdflessImgs.forEach(function(img){"
+    "if (img.complete) return;"
+    "var done = function(){ _pdflessPending--; if (_pdflessPending <= 0) _pdflessMeasure(); };"
+    "img.addEventListener('load', done);"
+    "img.addEventListener('error', done);"
+    "});"
+    "}"
+    "</script>"
+)
+
+# Extra logical px below document.body.scrollHeight when screenshotting
+# Markdown - a little room for descenders/shadows without the huge
+# over-capture FlowingText needs for Quick Look HTML.
+MARKDOWN_CAPTURE_PADDING = 16
+
+
+def _measure_html_scroll_height(chrome, html_path, width):
+    """Ask Chrome for a standalone HTML document's total scroll height
+    (logical CSS px at `width`), after embedded images load. Used by
+    MarkdownDocument so it can capture once at the right height instead
+    of FlowingText's grow-and-trim loop, which mis-reads pandoc's plain
+    white viewport fill as "content still reaching the bottom". Returns
+    None if measurement failed."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+
+    idx = content.rfind("</body>")
+    instrumented = (
+        content[:idx] + _SCROLL_HEIGHT_MEASURE_SCRIPT + content[idx:]
+        if idx != -1 else content + _SCROLL_HEIGHT_MEASURE_SCRIPT
+    )
+    measure_path = os.path.join(os.path.dirname(html_path), "pdfless-scroll-measure.html")
+    try:
+        with open(measure_path, "w", encoding="utf-8") as f:
+            f.write(instrumented)
+        r = subprocess.run(
+            [
+                chrome, "--headless", "--no-sandbox",
+                f"--window-size={width},1080",
+                "--dump-dom", "--virtual-time-budget=8000",
+                f"file://{os.path.abspath(measure_path)}",
+            ],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        if os.path.exists(measure_path):
+            os.unlink(measure_path)
+
+    m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
+    if not m:
+        return None
+    try:
+        height = float(html.unescape(m.group(1)))
+    except ValueError:
+        return None
+    return height if height > 0 else None
+
+
+def _markdown_page_bounds(trimmed_height, page_height, render_scale, continuous):
+    """How to slice one tall Markdown capture into page PNGs - either
+    one continuously-scrollable page (-c/--continuous) or fixed-height
+    slices at `page_height` logical px (OFFICE_DEFAULT_HEIGHT, i.e. a
+    US-letter page at 96dpi - the same rule FlowingText uses for Word)."""
+    if continuous:
+        return [0, trimmed_height]
+    page_px = max(1, round(page_height * render_scale))
+    npages = max(1, -(-trimmed_height // page_px))  # ceil division
+    return [min(trimmed_height, i * page_px) for i in range(npages + 1)]
+
+
+def _capture_markdown_html(
+    chrome, html_path, width, total_height, tag, name, tmpdir, debug, render_scale, progress,
+    page_height=OFFICE_DEFAULT_HEIGHT, continuous=False,
+):
+    """Screenshot pandoc HTML once at `total_height` (+ padding), crop to
+    that height in device pixels, then split into page-sized PNGs unless
+    continuous=True (-c/--continuous)."""
+    if render_scale == OFFICE_RENDER_SCALE:
+        render_scale = OFFICE_RENDER_SCALE_FLOWING
+    padded = min(
+        OFFICE_MAX_CAPTURE_HEIGHT,
+        max(1, round(total_height) + MARKDOWN_CAPTURE_PADDING),
+    )
+    out_png = os.path.join(tmpdir, f"markdown-capture-{tag}.png")
+    label = f"{name}: rendering ({width * render_scale:.0f}x{padded * render_scale:.0f})"
+    try:
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            _capture_html_screenshot(
+                chrome, html_path, width, padded, out_png, render_scale,
+            )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    try:
+        img = Image.open(out_png)
+        img.load()
+        crop_h = min(img.height, max(1, round(padded * render_scale)))
+        trimmed = img.crop((0, 0, img.width, crop_h))
+        bounds = _markdown_page_bounds(trimmed.height, page_height, render_scale, continuous)
+        npages = len(bounds) - 1
+        progress.update(f"{name}: splitting into {npages} page(s)...")
+        with _DebugTimer(debug, f"{name}: splitting into {npages} page(s)"):
+            return _slice_and_save_pages(trimmed, bounds, tmpdir, tag)
+    finally:
+        if os.path.exists(out_png):
+            os.unlink(out_png)
+
+
 def _slice_and_save_pages(trimmed, bounds, tmpdir, tag):
     """Crop `trimmed` at each consecutive pair in `bounds` (a list of Y
     pixel offsets, first always 0, last always trimmed.height) and save
@@ -1408,6 +1534,103 @@ def _caret_notation(match):
     whole range (0x00-0x1f, plus 0x7f) to the right letter/symbol in one
     step, the same trick a terminal's own ^-echoing uses."""
     return "^" + chr(ord(match.group()) ^ 0x40)
+
+
+MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown", ".mkd"}
+
+MARKDOWN_PREVIEW_CSS = """
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  max-width: 816px;
+  margin: 0 auto;
+  padding: 24px;
+  color: #222;
+  background: #fff;
+}
+img { max-width: 100%; height: auto; }
+pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+pre { overflow-x: auto; padding: 12px; background: #f6f8fa; border-radius: 6px; }
+table { border-collapse: collapse; margin: 1em 0; }
+th, td { border: 1px solid #ccc; padding: 6px 10px; }
+blockquote { margin: 1em 0; padding-left: 1em; border-left: 4px solid #ddd; color: #555; }
+"""
+
+
+def is_markdown_file(path):
+    return os.path.splitext(path)[1].lower() in MARKDOWN_EXTENSIONS
+
+
+def _rewrite_markdown_html_local_refs(html_path, base_dir):
+    """Pandoc writes the HTML under `tmpdir`, but leaves `<img src>` as
+    paths relative to the Markdown file's directory - Chrome resolves
+    those against the HTML file's location instead, so every local
+    picture shows up as a broken-image icon. Rewrite each relative src
+    to an absolute file:// URI rooted at `base_dir` (the .md's own
+    directory). Remote/data URLs are left alone."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return
+
+    def _fix_src(match):
+        prefix, src, suffix = match.group(1), match.group(2), match.group(3)
+        if _ABSOLUTE_SRC_RE.match(src):
+            return match.group(0)
+        candidate = os.path.normpath(os.path.join(base_dir, html.unescape(src)))
+        if not os.path.isfile(candidate):
+            return match.group(0)
+        return prefix + pathlib.Path(candidate).as_uri() + suffix
+
+    new_content = _IMG_SRC_RE.sub(_fix_src, content)
+    if new_content == content:
+        return
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except OSError:
+        pass
+
+
+def _pandoc_markdown_to_html(md_path, tmpdir, debug=False):
+    """Convert `md_path` to a standalone HTML file via pandoc, with a
+    small readability stylesheet injected via -H. Returns the HTML path,
+    or None if pandoc isn't available or the conversion failed."""
+    if shutil.which("pandoc") is None:
+        return None
+    tag = hashlib.md5(md_path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    html_path = os.path.join(tmpdir, f"markdown-preview-{tag}.html")
+    header_path = os.path.join(tmpdir, f"markdown-header-{tag}.html")
+    base_dir = os.path.dirname(os.path.abspath(md_path))
+    try:
+        with open(header_path, "w", encoding="utf-8") as f:
+            f.write(f"<style>{MARKDOWN_PREVIEW_CSS}</style>")
+        subprocess.run(
+            [
+                "pandoc", os.path.abspath(md_path),
+                "-o", html_path,
+                "--standalone",
+                "-H", header_path,
+                f"--resource-path={base_dir}",
+                "--metadata", "title=",
+            ],
+            capture_output=True, check=True, timeout=120, cwd=base_dir,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        if debug:
+            name = os.path.basename(md_path)
+            detail = e.stderr.decode("utf-8", "replace").strip() if isinstance(getattr(e, "stderr", None), bytes) else str(e)
+            print(
+                f"pdfless: [debug] {name}: pandoc failed: {detail}",
+                file=sys.stderr, end="\r\n",
+            )
+        return None
+    if not os.path.isfile(html_path):
+        return None
+    _rewrite_markdown_html_local_refs(html_path, base_dir)
+    return html_path
 
 
 def is_rtf_file(path):
@@ -2436,14 +2659,114 @@ class RtfOfficeDocument(OfficeDocument):
         return extract_office_text(self.path)
 
 
+class MarkdownDocument(OfficeDocument):
+    """A Markdown file, rendered as an image by converting it to HTML
+    via pandoc and screenshotting that HTML with a local Chrome/Chromium.
+    By default the capture is split into US-letter-sized pages (same
+    height rule as Word's FlowingText pagination) so n/p/g/G work; -c/
+    --continuous keeps one long scroll instead. Tried before
+    TextDocument (see HANDLER_CLASSES) so a .md file with pandoc+Chrome
+    available opens in rendered image mode rather than as raw source;
+    falls through to TextDocument when either tool is missing."""
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        if not is_markdown_file(path):
+            return None
+        if not is_probably_text(path):
+            return None
+        if shutil.which("pandoc") is None or find_chrome() is None:
+            return None
+        try:
+            read_plain_text_lines(path)
+        except Exception as e:
+            raise UnusableFile(f"not valid UTF-8 text ({e})") from e
+        return cls(path)
+
+    def _render_and_remember(self, source_path, tmpdir, **kwargs):
+        pages = self._render_markdown_pages(source_path, tmpdir, **kwargs)
+        if pages:
+            self.pages = pages
+        return pages
+
+    def _render_markdown_pages(
+        self, path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        """Render `path` (.md) into one or more page PNGs via pandoc +
+        headless Chrome. Returns a list of PNG paths, or None on failure."""
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        name = os.path.basename(path)
+        t_start = time.monotonic()
+        try:
+            progress.update(f"{name}: looking for a local Chrome...")
+            chrome = find_chrome()
+            if chrome is None:
+                return None
+            if debug:
+                print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
+
+            progress.update(f"{name}: converting Markdown to HTML (pandoc)...")
+            with _DebugTimer(debug, f"{name}: pandoc"):
+                html_path = _pandoc_markdown_to_html(path, tmpdir, debug=debug)
+            if html_path is None:
+                return None
+
+            width = OFFICE_DEFAULT_WIDTH
+            tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+            progress.update(f"{name}: measuring document height...")
+            with _DebugTimer(debug, f"{name}: measure scroll height"):
+                total_height = _measure_html_scroll_height(chrome, html_path, width)
+            if total_height is not None:
+                page_paths = _capture_markdown_html(
+                    chrome, html_path, width, total_height, tag, name,
+                    tmpdir, debug, render_scale, progress,
+                    page_height=OFFICE_DEFAULT_HEIGHT, continuous=continuous,
+                )
+            else:
+                # Fallback: FlowingText's grow-and-trim loop (slower, and
+                # can leave trailing blank on pandoc HTML - see above).
+                variant = FlowingText(
+                    chrome, html_path, width, OFFICE_DEFAULT_HEIGHT, tag, name,
+                )
+                page_paths = variant.build_pages(
+                    tmpdir, debug, render_scale, progress, continuous=continuous,
+                )
+            if page_paths is None:
+                return None
+            if debug:
+                print(
+                    f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
+                    file=sys.stderr, end="\r\n",
+                )
+            return page_paths
+        finally:
+            progress.clear()
+
+    def extract_text(self, page):
+        return read_plain_text_lines(self.path)
+
+    def supports_search(self):
+        return True
+
+    def default_text_border(self, border_default):
+        return False
+
+    def default_text_wrap(self, wrap_default):
+        return wrap_default
+
+
 # The order main()'s classification loop tries these in - RtfOfficeDocument
 # and RtfDocument (both RTF - the former tried first, see their own
 # docstrings) before the generic TextDocument, since all three would
-# otherwise match the same file (RTF is plain ASCII text); OfficeDocument
-# last since it's the most expensive check (shells out to qlmanage).
+# otherwise match the same file (RTF is plain ASCII text); MarkdownDocument
+# before TextDocument for the same reason (.md is plain UTF-8 text too);
+# OfficeDocument last since it's the most expensive check (shells out to
+# qlmanage).
 HANDLER_CLASSES = [
-    PdfDocument, ImageDocument, RtfOfficeDocument, RtfDocument, TextDocument,
-    OfficeDocument,
+    PdfDocument, ImageDocument, RtfOfficeDocument, MarkdownDocument, RtfDocument,
+    TextDocument, OfficeDocument,
 ]
 
 
@@ -5518,7 +5841,8 @@ def main():
 
             if handler is None:
                 print(
-                    f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
+                    f"pdfless: not a PDF, image, text, Markdown "
+                    f"(needs pandoc + Chrome), or Quick-Look-previewable "
                     f"file, skipping: {path}",
                     file=sys.stderr,
                 )
@@ -5527,7 +5851,7 @@ def main():
             files.append(handler)
 
         if not files:
-            die("no valid PDF, image, text, or Quick-Look-previewable files given")
+            die("no valid PDF, image, text, Markdown, or Quick-Look-previewable files given")
         # A None page_count() (an office-kind first file) means its real
         # page count isn't known until Viewer.__init__ actually renders
         # it, which also clamps self.page against it then; here just
