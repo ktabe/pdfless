@@ -79,8 +79,8 @@ def test_docx_twopage_paginates_via_print_to_pdf(sample_twopage_docx, tmp_path):
     # extract_text() delegates to the real PDF per page (see
     # OfficeDocument.extract_text()), so each page's text comes back
     # separately rather than textutil's single whole-document blob.
-    assert "Page one content" in "\n".join(handler.extract_text(1))
-    assert "Page two content" in "\n".join(handler.extract_text(2))
+    assert "日本語のサンプル段落" in "\n".join(handler.extract_text(1))
+    assert "本文の続きです" in "\n".join(handler.extract_text(2))
 
 
 @requires_office_support
@@ -145,7 +145,7 @@ def test_docx_becomes_searchable_via_its_pdf_delegate(sample_twopage_docx, tmp_p
 
     index = handler.build_search_index()
     assert len(index) == 2
-    matches = handler.find_search_matches(index, "Page two")
+    matches = handler.find_search_matches(index, "続きです")
     assert any(page == 2 for page, *_ in matches)
 
 
@@ -291,8 +291,8 @@ def test_doc_legacy_twopage_paginates_via_print_to_pdf(sample_twopage_doc, tmp_p
     pages = handler.build_pages(str(tmp_path))
     assert len(pages) == 2
 
-    assert "Page one content" in "\n".join(handler.extract_text(1))
-    assert "Page two content" in "\n".join(handler.extract_text(2))
+    assert "日本語のサンプル段落" in "\n".join(handler.extract_text(1))
+    assert "本文の続きです" in "\n".join(handler.extract_text(2))
 
 
 @requires_office_support
@@ -361,7 +361,7 @@ def test_pptx_becomes_searchable_and_gains_text_mode_via_its_pdf_delegate(sample
 
     assert handler.supports_search() is True
     assert handler.text_mode_is_paginated() is True
-    assert "Slide two content" in "\n".join(handler.extract_text(2))
+    assert "サンプルスライド" in "\n".join(handler.extract_text(2))
 
 
 @requires_office_support
@@ -375,3 +375,162 @@ def test_key_twoslide_renders_as_single_continuous_page(sample_twoslide_key, tmp
     assert isinstance(handler, pdfless.OfficeDocument)
     pages = handler.build_pages(str(tmp_path))
     assert len(pages) == 1
+
+
+@requires_office_support
+@requires_soffice
+def test_docm_uses_soffice_and_paginates_like_docx(sample_twopage_docm, tmp_path):
+    """A macro-enabled Word document (.docm) already classifies as
+    OfficeDocument via the same Office.qlgenerator that handles .docx
+    (confirmed by hand), so adding it to _SOFFICE_EXTENSIONS is all
+    that's needed for it to prefer soffice - real page breaks and a
+    PDF delegate, the same as sample_twopage_docx."""
+    handler = classify(sample_twopage_docm, tmp_path)
+    assert isinstance(handler, pdfless.OfficeDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 2
+    assert handler._pdf_delegate is not None
+
+    assert "日本語のサンプル段落" in "\n".join(handler.extract_text(1))
+    assert "本文の続きです" in "\n".join(handler.extract_text(2))
+
+
+@requires_office_support
+@requires_soffice
+def test_pptm_uses_soffice_and_paginates_like_pptx(sample_twoslide_pptm, tmp_path):
+    """A macro-enabled PowerPoint deck (.pptm) already classifies as
+    OfficeDocument via the same Office.qlgenerator that handles .pptx
+    (confirmed by hand) - adding it to _SOFFICE_EXTENSIONS upgrades it
+    from a PNG screenshot (the old SlideDeck path) to a real PDF, the
+    same as sample_twoslide_pptx."""
+    handler = classify(sample_twoslide_pptm, tmp_path)
+    assert isinstance(handler, pdfless.OfficeDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 2
+    assert handler._pdf_delegate is not None
+
+    assert "日本語の箇条書きサンプル" in "\n".join(handler.extract_text(1))
+    assert "サンプルスライド" in "\n".join(handler.extract_text(2))
+
+
+@requires_soffice
+def test_odt_renders_via_soffice_with_real_page_breaks(sample_twopage_odt, tmp_path):
+    """Quick Look has no generator at all for .odt (confirmed by hand:
+    qlmanage crashes outright), so this only classifies via
+    SofficeOnlyDocument, not OfficeDocument - and needs only soffice,
+    not qlmanage/Chrome, to render (no requires_office_support here)."""
+    handler = classify(sample_twopage_odt, tmp_path)
+    assert isinstance(handler, pdfless.SofficeOnlyDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 2
+    assert handler._pdf_delegate is not None
+
+    assert "日本語のサンプル段落" in "\n".join(handler.extract_text(1))
+    assert "本文の続きです" in "\n".join(handler.extract_text(2))
+
+
+@requires_soffice
+def test_odp_renders_via_soffice_one_page_per_slide(sample_twoslide_odp, tmp_path):
+    handler = classify(sample_twoslide_odp, tmp_path)
+    assert isinstance(handler, pdfless.SofficeOnlyDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 2
+    assert handler._pdf_delegate is not None
+
+    assert "日本語の箇条書きサンプル" in "\n".join(handler.extract_text(1))
+    assert "サンプルスライド" in "\n".join(handler.extract_text(2))
+
+
+@requires_soffice
+def test_ods_renders_via_soffice_one_page_per_sheet_for_a_simple_workbook(sample_multisheet_ods, tmp_path):
+    """A simple workbook (no print area/page-break configuration)
+    still comes out as one soffice PDF page per sheet - confirmed by
+    hand. A real-world spreadsheet with its own print layout can
+    fragment a single sheet across several pages instead (see
+    SofficeOnlyDocument's docstring for the 4-sheet-into-8-pages case
+    found on a real file); this fixture is deliberately too simple to
+    exercise that, since there's no reliable way to construct a
+    reproducible fragmentation case as a small checked-in fixture."""
+    handler = classify(sample_multisheet_ods, tmp_path)
+    assert isinstance(handler, pdfless.SofficeOnlyDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 3
+    assert handler._pdf_delegate is not None
+
+    assert "サンプルB" in "\n".join(handler.extract_text(3))
+
+
+@requires_soffice
+def test_odg_renders_via_soffice_one_page_per_draw_page(sample_odg, tmp_path):
+    """Confirmed by hand on a real multi-page Draw file that soffice's
+    PDF page count matches the source's own draw:page count exactly -
+    this fixture only has one Draw page, so that's all this can check
+    directly, but the extracted text still confirms the Japanese
+    labels survive the conversion."""
+    handler = classify(sample_odg, tmp_path)
+    assert isinstance(handler, pdfless.SofficeOnlyDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 1
+    assert handler._pdf_delegate is not None
+
+    assert "サンプル図形" in "\n".join(handler.extract_text(1))
+
+
+@requires_soffice
+def test_wmf_renders_via_soffice(sample_wmf, tmp_path):
+    """Quick Look only ever produces a Preview.url dead end for WMF
+    (confirmed by hand - the same issue SvgDocument's docstring
+    describes for SVG), so soffice is the only way this renders at
+    all."""
+    handler = classify(sample_wmf, tmp_path)
+    assert isinstance(handler, pdfless.SofficeOnlyDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 1
+    assert handler._pdf_delegate is not None
+
+    assert "サンプル図形" in "\n".join(handler.extract_text(1))
+
+
+def test_soffice_only_document_unavailable_without_soffice(sample_twopage_odt, tmp_path, monkeypatch):
+    """Unlike Word/RTF/PowerPoint, there's nothing to fall back to for
+    an ODF/Visio/WMF file when soffice isn't installed - it was
+    entirely unsupported before SofficeOnlyDocument existed, so
+    sniff() must return None (not raise, not half-render) and the file
+    ends up unclassified by every HANDLER_CLASSES entry. Runs
+    regardless of whether this machine actually has soffice, since
+    find_soffice() is monkeypatched either way."""
+    monkeypatch.setattr(pdfless, "find_soffice", lambda: None)
+    assert pdfless.SofficeOnlyDocument.sniff(sample_twopage_odt, str(tmp_path)) is None
+    assert classify(sample_twopage_odt, tmp_path) is None
+
+
+@requires_office_support
+def test_svg_renders_via_chrome_directly(sample_svg, tmp_path):
+    """SvgDocument renders via a real PDF (Chrome's --print-to-pdf on
+    an <img>-wrapped copy - see its docstring for why, and why not
+    soffice), so - like Word's own crisp-zoom test - it should
+    re-rasterize independently at whatever width is asked for, rather
+    than resizing one fixed screenshot."""
+    handler = classify(sample_svg, tmp_path)
+    assert isinstance(handler, pdfless.SvgDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) == 1
+    assert handler._pdf_delegate is not None
+
+    cache = pdfless.PageCache(handler.path, str(tmp_path), handler)
+    small = handler.get_page_image(cache, 1, 300, "width")
+    big = handler.get_page_image(cache, 1, 900, "width")
+    assert small.width == 300
+    assert big.width == 900
+
+
+def test_svg_falls_back_to_plain_text_without_chrome(sample_svg, tmp_path, monkeypatch):
+    """With no Chrome available, SvgDocument.sniff() must return None
+    so classification falls through to TextDocument (the pre-existing
+    behavior - showing the SVG's own raw XML source) rather than the
+    file going unclassified entirely, the same way RtfOfficeDocument
+    falls through to RtfDocument without textutil."""
+    monkeypatch.setattr(pdfless, "find_chrome", lambda: None)
+    handler = classify(sample_svg, tmp_path)
+    assert isinstance(handler, pdfless.TextDocument)
+    assert not isinstance(handler, pdfless.SvgDocument)

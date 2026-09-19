@@ -1305,6 +1305,64 @@ def _measure_content_height(chrome, html_path, width, timeout=30):
     return int(m.group(1)) if m else None
 
 
+def _measure_svg_natural_size(chrome, wrapper_path, timeout=20):
+    """(width, height) in CSS px that `wrapper_path`'s <img id="svg">
+    (see SvgDocument._write_svg_wrapper()) naturally renders at - the
+    same script-injected-title / --dump-dom technique
+    _measure_content_height() uses, but reading the image's own
+    naturalWidth/naturalHeight once it finishes loading (via onload,
+    since decoding a local file happens asynchronously) rather than
+    the document's scroll height.
+
+    Needed because an SVG's intrinsic size varies in both dimensions
+    at once - unlike FlowingText/SlideDeck's HTML, where a fixed
+    Quick-Look-reported width is already known up front and only the
+    height needs measuring, an SVG has no such external plist to read
+    a width from; Chrome's print engine still can't size a page to its
+    content on its own either way (see _measure_content_height()).
+
+    Returns None on any failure, including an SVG Chrome couldn't
+    determine a natural size for at all - the caller falls back to a
+    fixed default size."""
+    try:
+        with open(wrapper_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+    script = (
+        '<script>document.getElementById("svg").onload = function() {'
+        'document.title = this.naturalWidth + "x" + this.naturalHeight;'
+        "};</script>"
+    )
+    idx = content.rfind("</body>")
+    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
+    measure_path = os.path.join(os.path.dirname(wrapper_path), "pdfless-svg-measure.html")
+    try:
+        with open(measure_path, "w", encoding="utf-8") as f:
+            f.write(instrumented)
+    except OSError:
+        return None
+    try:
+        r = subprocess.run(
+            [
+                chrome, "--headless", "--no-sandbox",
+                "--dump-dom", "--virtual-time-budget=8000",
+                f"file://{os.path.abspath(measure_path)}",
+            ],
+            capture_output=True, text=True, timeout=timeout, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        if os.path.exists(measure_path):
+            os.unlink(measure_path)
+    m = re.search(r"<title>(\d+)x(\d+)</title>", r.stdout)
+    if not m:
+        return None
+    width, height = int(m.group(1)), int(m.group(2))
+    return (width, height) if width > 0 and height > 0 else None
+
+
 def _slice_and_save_pages(trimmed, bounds, tmpdir, tag):
     """Crop `trimmed` at each consecutive pair in `bounds` (a list of Y
     pixel offsets, first always 0, last always trimmed.height) and save
@@ -2334,14 +2392,18 @@ class OfficeDocument(DocumentHandler):
     # uses - a real Word/RTF page break, or one slide per PowerPoint
     # page (confirmed by hand: soffice's page count matches the
     # existing qlmanage/Chrome one exactly, both for a small fixture
-    # and for a real 55-slide deck with hidden slides). Deliberately
-    # excludes Excel (.xls/.xlsx): soffice paginates a spreadsheet by
-    # its print area/page setup, which for a workbook never tuned for
-    # printing fragments one sheet across several oddly-cut pages
-    # (confirmed by hand on a real 2-sheet workbook: 9 soffice pages,
-    # split mid-column with no header row) - nothing like qlmanage's
-    # "one full sheet per page". See _soffice_pages_if_eligible().
-    _SOFFICE_EXTENSIONS = (".doc", ".docx", ".ppt", ".pptx", ".rtf")
+    # and for a real 55-slide deck with hidden slides). .docm/.pptm
+    # (macro-enabled Word/PowerPoint) already classify as
+    # OfficeDocument via the same Office.qlgenerator that handles
+    # .docx/.pptx (confirmed by hand), so they get the same treatment.
+    # Deliberately excludes Excel (.xls/.xlsx/.xlsm): soffice
+    # paginates a spreadsheet by its print area/page setup, which for
+    # a workbook never tuned for printing fragments one sheet across
+    # several oddly-cut pages (confirmed by hand on a real 2-sheet
+    # workbook: 9 soffice pages, split mid-column with no header row)
+    # - nothing like qlmanage's "one full sheet per page". See
+    # _soffice_pages_if_eligible().
+    _SOFFICE_EXTENSIONS = (".doc", ".docx", ".docm", ".ppt", ".pptx", ".pptm", ".rtf")
 
     def __init__(self, path):
         super().__init__(path)
@@ -2895,14 +2957,164 @@ class RtfOfficeDocument(OfficeDocument):
         return extract_office_text(self.path)
 
 
+class SofficeOnlyDocument(OfficeDocument):
+    """Formats macOS Quick Look has no generator for at all - an ODF
+    document, a Visio drawing, or a WMF vector metafile (confirmed by
+    hand: qlmanage crashes outright on a real .odt, and produces no
+    preview whatsoever - not even a Preview.url - for a real .ods/
+    .odp/.odg/.vsd). Previewable only when soffice is installed, with
+    no qlmanage/Chrome fallback to speak of - unlike Word/RTF/
+    PowerPoint (see OfficeDocument._SOFFICE_EXTENSIONS), there's
+    nothing to fall back TO here; these formats were entirely
+    unsupported before this class existed, so requiring soffice isn't
+    a regression for anyone.
+
+    sniff() deliberately never touches qlmanage (unlike
+    OfficeDocument._probe_preview()) - both because it's known not to
+    work for any of these extensions, and because it would risk
+    reproducing the .odt crash above just to classify a file.
+
+    -c/--continuous has no effect here: soffice always paginates for
+    real, and - unlike OfficeDocument._render_office_pages()'s
+    qlmanage-based variants - there's no screenshot-based single-page
+    rendering to fall back to instead.
+
+    .ods (Calc) carries the same print-area/page-setup pagination
+    caveat as Excel (see _SOFFICE_EXTENSIONS's docstring - confirmed
+    by hand: a real 4-sheet workbook came out as 8 soffice pages, with
+    a chart split across two of them) - but unlike Excel, there's no
+    working qlmanage fallback to prefer instead, so it's included here
+    anyway rather than left entirely unsupported.
+
+    .vsdx hasn't been verified by hand (no local sample was
+    available) - LibreOffice's Visio import filter (libvisio) handles
+    both .vsd and .vsdx through the same code, so the same behavior is
+    expected, but only .vsd has actually been confirmed to render
+    correctly."""
+
+    _SOFFICE_ONLY_EXTENSIONS = (".odt", ".odp", ".odg", ".ods", ".vsd", ".vsdx", ".wmf")
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        if not path.lower().endswith(cls._SOFFICE_ONLY_EXTENSIONS):
+            return None
+        if find_soffice() is None:
+            return None
+        return cls(path)
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        soffice_pages = self._try_soffice_pages(self.path, tmpdir, debug, progress)
+        if soffice_pages is None:
+            return None
+        return self._remember_pages(soffice_pages)
+
+
+class SvgDocument(OfficeDocument):
+    """A standalone SVG file, rendered to a real PDF via headless
+    Chrome directly - no Quick Look or LibreOffice involved at all.
+    Quick Look's own preview for an SVG is just a Preview.url redirect
+    back to the file (confirmed by hand - the same dead end WMF hits;
+    see SofficeOnlyDocument), not a proper HTML bundle to build on, so
+    there's nothing to reuse from the qlmanage/Chrome pipeline here.
+    Chrome was chosen over soffice's Draw import (both were compared
+    by hand on a complex real SVG - embedded raster photos plus vector
+    line art - and came out visually equivalent) since Chrome is
+    already a hard requirement for every other Office kind, so this
+    doesn't add a new soffice dependency just to view an SVG.
+
+    The SVG is embedded via a plain <img>, which is what lets
+    _capture_html_pdf()'s existing @page-injection machinery work
+    unmodified (an SVG file has no <head>/<body> of its own for that
+    to target safely) - confirmed by hand that the vector parts of a
+    complex SVG survive print-to-pdf as real vector PDF content, not
+    a flattened bitmap (checked via pdfimages -list: only the source
+    SVG's own embedded raster images showed up there, nothing for the
+    vector line art). The one real cost of this approach: <img> always
+    strips interactivity, so a hyperlink inside the SVG itself can't
+    be clickable here the way one in a Word document is."""
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        if not path.lower().endswith(".svg"):
+            return None
+        if find_chrome() is None:
+            return None
+        return cls(path)
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        name = os.path.basename(self.path)
+        chrome = find_chrome()
+        if chrome is None:
+            return None
+        tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        wrapper_path = os.path.join(tmpdir, f"svg-wrap-{tag}.html")
+
+        # There's no plist (unlike a Quick Look preview) to read a
+        # width from up front, and an SVG's own intrinsic size varies
+        # in both dimensions - so the natural size has to be measured
+        # first, the same "auto" page sizing isn't supported reasoning
+        # as _measure_content_height() (see _measure_svg_natural_size()).
+        progress.update(f"{name}: measuring size...")
+        self._write_svg_wrapper(wrapper_path, self.path, None, None)
+        with _DebugTimer(debug, f"{name}: measure SVG size"):
+            size = _measure_svg_natural_size(chrome, wrapper_path)
+        width, height = size if size else (OFFICE_DEFAULT_WIDTH, OFFICE_DEFAULT_HEIGHT)
+        self._write_svg_wrapper(wrapper_path, self.path, width, height)
+
+        out_pdf = os.path.join(tmpdir, f"svg-capture-{tag}.pdf")
+        label = f"{name}: rendering to PDF"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            ok = _capture_html_pdf(chrome, wrapper_path, width, height, out_pdf)
+        npages = _pdf_page_count_safe(out_pdf) if ok else None
+        if not npages:
+            if os.path.exists(out_pdf):
+                os.unlink(out_pdf)
+            return None
+        return self._remember_pages(("pdf", out_pdf, npages))
+
+    @staticmethod
+    def _write_svg_wrapper(wrapper_path, svg_path, width, height):
+        """A minimal HTML page embedding `svg_path` as a plain <img> -
+        see this class's docstring for why <img> rather than
+        navigating to the SVG directly. `width`/`height` (CSS px), if
+        given, are set explicitly so the rendered page size matches
+        exactly what _capture_html_pdf()'s own @page injection expects
+        - left unset (None) for the first, size-finding pass (see
+        build_pages()), which needs the image at its own natural size
+        instead."""
+        style = f"width:{width}px;height:{height}px;" if width and height else ""
+        html = (
+            "<!DOCTYPE html><html><head></head><body style=\"margin:0\">"
+            f'<img id="svg" style="display:block;{style}" '
+            f'src="file://{os.path.abspath(svg_path)}"></body></html>'
+        )
+        with open(wrapper_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
 # The order main()'s classification loop tries these in - RtfOfficeDocument
 # and RtfDocument (both RTF - the former tried first, see their own
-# docstrings) before the generic TextDocument, since all three would
-# otherwise match the same file (RTF is plain ASCII text); OfficeDocument
-# last since it's the most expensive check (shells out to qlmanage).
+# docstrings) and SvgDocument before the generic TextDocument, since all
+# would otherwise match the same file (RTF and SVG are both plain text -
+# SvgDocument falls through to TextDocument's raw-XML-source rendering
+# when Chrome isn't installed, the same way RtfOfficeDocument falls
+# through to RtfDocument without textutil); SofficeOnlyDocument before
+# OfficeDocument since it covers formats OfficeDocument's own qlmanage
+# probe can't handle at all; OfficeDocument last since it's the most
+# expensive check (shells out to qlmanage).
 HANDLER_CLASSES = [
-    PdfDocument, ImageDocument, RtfOfficeDocument, RtfDocument, TextDocument,
-    OfficeDocument,
+    PdfDocument, ImageDocument, RtfOfficeDocument, RtfDocument, SvgDocument,
+    TextDocument, SofficeOnlyDocument, OfficeDocument,
 ]
 
 

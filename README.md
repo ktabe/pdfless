@@ -87,19 +87,24 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
   pictures embedded in a Quick Look preview file (Word/Excel/
   PowerPoint/etc.); not required at all if you only ever open plain
   image files.
-- macOS + a local Chrome/Chromium install - only needed for opening
-  Office/Keynote/Pages/etc. files via Quick Look; a file like that is
-  skipped with a warning if either is missing.
+- macOS + a local Chrome/Chromium install - needed for opening
+  Office/Keynote/Pages/etc. files via Quick Look, and also (Chrome
+  alone, no Quick Look involved) for opening an SVG file directly; a
+  file like that is skipped with a warning if the dependency it needs
+  is missing.
 - [LibreOffice](https://www.libreoffice.org) (`soffice`) - optional;
-  when installed, Word (`.doc`/`.docx`), RTF, and PowerPoint
-  (`.ppt`/`.pptx`) files render through it instead of the Quick Look +
-  Chrome pipeline, for real page breaks and higher-fidelity output
-  (see the Office/iWork table below). Falls back to Quick Look +
-  Chrome when it isn't installed. Deliberately not used for Excel:
-  soffice paginates a spreadsheet by its print area/page setup, which
-  for a workbook never tuned for printing can fragment one sheet
-  across several oddly-cut pages, unlike Quick Look's one-page-per-
-  sheet view.
+  when installed, Word (`.doc`/`.docx`/`.docm`), RTF, and PowerPoint
+  (`.ppt`/`.pptx`/`.pptm`) files render through it instead of the
+  Quick Look + Chrome pipeline, for real page breaks and
+  higher-fidelity output (see the Office/iWork table below). Falls
+  back to Quick Look + Chrome when it isn't installed. Deliberately
+  not used for Excel (`.xls`/`.xlsx`/`.xlsm`): soffice paginates a
+  spreadsheet by its print area/page setup, which for a workbook
+  never tuned for printing can fragment one sheet across several
+  oddly-cut pages, unlike Quick Look's one-page-per-sheet view.
+  Required (with no fallback) for OpenDocument (`.odt`/`.odp`/`.odg`/
+  `.ods`), Visio (`.vsd`/`.vsdx`), and WMF, since macOS has no Quick
+  Look generator for any of these at all.
 - Python 3.9+
 - [uv](https://docs.astral.sh/uv/)
 
@@ -257,29 +262,68 @@ offer at all. Without `soffice`, PowerPoint falls back to the
 screenshot-based rendering it always used before, unlike Word/RTF
 (which always end up as a real PDF either way, just via Chrome
 instead). Excel is deliberately excluded from this - see Requirements
-above.
+above. Macro-enabled Word/PowerPoint (`.docm`/`.pptm`) are treated
+exactly like `.docx`/`.pptx` throughout, since macOS's Quick Look
+generator doesn't distinguish them.
+
+A second group of formats - OpenDocument (`.odt`/`.odp`/`.odg`/
+`.ods`), Visio (`.vsd`/`.vsdx`), and WMF - has no Quick Look generator
+on macOS at all (confirmed by hand: qlmanage either crashes outright
+or produces no preview whatsoever for any of these), so they're
+previewable only when `soffice` is installed, with no qlmanage-based
+fallback to speak of; `-c`/`--continuous` has no effect on them
+either, since soffice's own real pagination can't be collapsed back
+into one page. `.ods` carries the same print-area/page-setup
+pagination caveat Excel has (see Requirements above) - but unlike
+Excel there's no working alternative, so it's supported anyway rather
+than left unsupported. `.vsdx` specifically hasn't been verified by
+hand (no sample was available), though LibreOffice's Visio import
+handles `.vsd`/`.vsdx` through the same code.
+
+SVG is the one exception that needs neither Quick Look nor `soffice`:
+it renders via a real PDF produced by headless Chrome directly (which
+`pdfless` already requires for everything else above), embedding the
+SVG as an `<img>` and printing that to PDF - confirmed by hand that
+this keeps the SVG's vector content as real vector PDF content, not a
+flattened bitmap, so it stays sharp at any zoom like Word's PDF does.
+The one limitation this approach has: a hyperlink inside the SVG
+itself can't be clickable, since an `<img>` always strips
+interactivity. Without a local Chrome, an SVG falls back to being
+shown as its own raw XML source instead (the same as before this
+feature existed).
 
 | Format | Extensions | Paging | Text mode | Notes |
 | --- | --- | --- | --- | --- |
-| Word | `.doc`, `.docx` | Real page breaks | Yes | Renders to a PDF (see above) - via `soffice` when installed, else Chrome's `--print-to-pdf` |
-| Excel | `.xls`, `.xlsx` | One page per sheet | No | |
-| PowerPoint | `.ppt`, `.pptx` | One page per slide | With `soffice` | With `soffice` installed, renders to a real PDF (see above); otherwise the original screenshot-based rendering, with no extractable text |
+| Word | `.doc`, `.docx`, `.docm` | Real page breaks | Yes | Renders to a PDF (see above) - via `soffice` when installed, else Chrome's `--print-to-pdf` |
+| Excel | `.xls`, `.xlsx`, `.xlsm` | One page per sheet | No | |
+| PowerPoint | `.ppt`, `.pptx`, `.pptm` | One page per slide | With `soffice` | With `soffice` installed, renders to a real PDF (see above); otherwise the original screenshot-based rendering, with no extractable text |
 | RTF | `.rtf` | Real page breaks with `soffice`, otherwise always continuous | Yes | With `soffice` installed, rendered natively (real page breaks) the same as Word; otherwise converted to `.docx` via macOS's own `textutil` first (Quick Look has no HTML preview of its own for RTF), then rendered the same way as Word but always as one continuous page, since a converted RTF's page-height metadata doesn't correspond to anything in the original file |
 | Pages | `.pages` | Always continuous | No | No page-boundary marker in Pages' Quick Look preview |
 | Numbers | `.numbers` | Only the first sheet is shown | No | Numbers' Quick Look tab strip is marked up differently from Excel's and isn't recognized yet - a known gap, not a deliberate design choice |
 | Keynote | `.key` | Always continuous | No | Unlike PowerPoint, Keynote's Quick Look preview exposes no slide-boundary marker at all - a known gap |
+| OpenDocument Text | `.odt` | Real page breaks | Yes | Needs `soffice` - no Quick Look generator exists for this at all |
+| OpenDocument Presentation | `.odp` | One page per slide | Yes | Needs `soffice` - same as `.odt` |
+| OpenDocument Drawing | `.odg` | One page per Draw page | Yes | Needs `soffice` - same as `.odt` |
+| OpenDocument Spreadsheet | `.ods` | Pages follow print layout | Yes | Needs `soffice`; carries the same print-area pagination caveat as Excel (see above), but unlike Excel has no alternative |
+| Visio | `.vsd`, `.vsdx` | One page per Visio page | Yes | Needs `soffice` - no Quick Look generator exists for this at all; `.vsdx` unverified by hand |
+| WMF | `.wmf` | Single page | Yes | Needs `soffice` - Quick Look can't preview it and no browser can decode it either |
+| SVG | `.svg` | Single page | Yes | Renders via Chrome directly (see above), not `soffice` or Quick Look; falls back to raw XML source without a local Chrome |
 
-Text mode (`t`) comes from macOS's own `textutil`, which only
-understands Word-family documents (`.doc`/`.docx`/`.rtf`) - it has
-nothing to say about a spreadsheet, slide deck, or Apple's own iWork
-bundle formats (Pages/Numbers/Keynote), so `t` reports no text there
-even though the image view still works.
+Text mode (`t`) comes from macOS's own `textutil` for a Word-family
+document without a real PDF behind it (`.doc`/`.docx`/`.docm`/`.rtf`)
+- it has nothing to say about a spreadsheet, slide deck, or Apple's
+own iWork bundle formats (Pages/Numbers/Keynote), so `t` reports no
+text there even though the image view still works. Any format backed
+by a real PDF (see above) instead gets its text straight from that
+PDF, page by page.
 
-A file in any of these formats is skipped with a warning if `qlmanage`
-or a local Chrome/Chromium isn't available. `-s`/`--rendering-scale`
-controls how sharp the rendered pages look when zoomed in for the
-formats that don't render to a real PDF (see above); see
-[Usage](#usage) for both options.
+A file needing Quick Look (most formats above) is skipped with a
+warning if `qlmanage` or a local Chrome/Chromium isn't available. A
+file needing only `soffice` (OpenDocument/Visio/WMF) or only Chrome
+(SVG) is skipped only if that one dependency is missing.
+`-s`/`--rendering-scale` controls how sharp the rendered pages look
+when zoomed in for the formats that don't render to a real PDF (see
+above); see [Usage](#usage) for both options.
 
 ## Keys
 

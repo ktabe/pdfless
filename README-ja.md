@@ -61,8 +61,8 @@
 
 - iTerm2のインラインイメージプロトコルに対応した端末 — [iTerm2](https://iterm2.com) と [WezTerm](https://wezterm.org) で動作確認済み。このプロトコルに非対応の端末では何も表示されません。
 - [poppler](https://poppler.freedesktop.org)（`pdftoppm`/`pdfinfo`/`pdftocairo`）— PDFを直接見るとき、およびQuick Lookプレビューファイル（Word/Excel/PowerPointなど）に埋め込まれた画像をラスタライズするときに必要です。画像ファイルしか開かないなら不要です。
-- macOS + ローカルのChrome/Chromium — Office/Keynote/PagesなどをQuick Look経由で開くときだけ必要です。どちらかがなければ、そのファイルは警告を出してスキップされます。
-- [LibreOffice](https://www.libreoffice.org)（`soffice`）— 任意。インストールされていれば、Word（`.doc`/`.docx`）・RTF・PowerPoint（`.ppt`/`.pptx`）ファイルはQuick Look + Chromeの代わりにこちらでレンダリングされ、実際のページ分割・より高忠実度な出力になります（詳細は後述のOffice/iWork対応表を参照）。未インストールならQuick Look + Chromeにフォールバックします。Excelは意図的に対象外です:sofficeはExcelの印刷設定(改ページ・印刷範囲)に従ってページ分割するため、印刷用に整えられていない実際のシートでは列の途中で不自然に分割されることがあり、Quick Lookの「1シート=1ページ」表示とは異なる挙動になります。
+- macOS + ローカルのChrome/Chromium — Office/Keynote/PagesなどをQuick Look経由で開くときと、SVGファイルを直接開くとき(Quick Lookは使わずChromeのみ)に必要です。必要な依存が無ければ、そのファイルは警告を出してスキップされます。
+- [LibreOffice](https://www.libreoffice.org)（`soffice`）— 任意。インストールされていれば、Word（`.doc`/`.docx`/`.docm`）・RTF・PowerPoint（`.ppt`/`.pptx`/`.pptm`）ファイルはQuick Look + Chromeの代わりにこちらでレンダリングされ、実際のページ分割・より高忠実度な出力になります（詳細は後述のOffice/iWork対応表を参照）。未インストールならQuick Look + Chromeにフォールバックします。Excel（`.xls`/`.xlsx`/`.xlsm`）は意図的に対象外です:sofficeはExcelの印刷設定(改ページ・印刷範囲)に従ってページ分割するため、印刷用に整えられていない実際のシートでは列の途中で不自然に分割されることがあり、Quick Lookの「1シート=1ページ」表示とは異なる挙動になります。OpenDocument（`.odt`/`.odp`/`.odg`/`.ods`）・Visio（`.vsd`/`.vsdx`）・WMFは、macOSにそもそもQuick Lookのジェネレータが存在しないため、`soffice`が(代替手段無しで)必須です。
 - Python 3.9以上
 - [uv](https://docs.astral.sh/uv/)
 
@@ -186,21 +186,32 @@ macOSでローカルにChrome/Chromiumがインストールされていれば、
 
 Word・RTFは、内部で実PDFとしてレンダリングされます。そのため、他の形式と違い、通常のPDFと同じようにどのズーム倍率でもシャープなままで、元の文書内のハイパーリンクも本物のPDFと同様にクリック可能です。[LibreOffice](https://www.libreoffice.org)（`soffice`）がインストールされていれば、そちらを使ってネイティブに、かつより高忠実度で（実際のページ分割が元の文書と一致し、埋め込まれた画像もどの形式でも正しくレンダリングされる）PDF化します。インストールされていなければ、Quick Lookプレビューを(スクリーンショットではなく)Chromeのheadless `--print-to-pdf`でレンダリングする方式にフォールバックし、ページ送りはChromeの印刷エンジンが実際のコンテンツの流れに沿って自然に行います(通常の印刷と同じ、Quick Look側のページ境界情報——そもそもWordのプレビューにはこれがない——は使いません)。`-c`/`--continuous`を指定すれば、どちらの場合でもいつでも1枚の連続スクロール表示に戻せます。
 
-PowerPointも`soffice`がインストールされていれば同様に実PDF化されます（1スライド=1PDFページで、既存の「スライドごとに1ページ」というページ送りと完全に一致）。これによりズームでのシャープさ・ハイパーリンクのクリックだけでなく、Quick Lookのスクリーンショット方式では不可能だったテキストモード・実検索も新たに使えるようになります。`soffice`が無い場合は、従来通りのスクリーンショットベースのレンダリングにフォールバックします（Word・RTFと違い、こちらは常に実PDF化されるわけではありません）。Excelは意図的に対象外です（理由は前述の「必要なもの」参照）。
+PowerPointも`soffice`がインストールされていれば同様に実PDF化されます（1スライド=1PDFページで、既存の「スライドごとに1ページ」というページ送りと完全に一致）。これによりズームでのシャープさ・ハイパーリンクのクリックだけでなく、Quick Lookのスクリーンショット方式では不可能だったテキストモード・実検索も新たに使えるようになります。`soffice`が無い場合は、従来通りのスクリーンショットベースのレンダリングにフォールバックします（Word・RTFと違い、こちらは常に実PDF化されるわけではありません）。Excelは意図的に対象外です（理由は前述の「必要なもの」参照）。マクロ入りのWord/PowerPoint（`.docm`/`.pptm`）は、macOSのQuick Lookジェネレータが`.docx`/`.pptx`と区別しないため、そのまま同じ扱いになります。
+
+もう一つのグループ——OpenDocument形式（`.odt`/`.odp`/`.odg`/`.ods`）、Visio（`.vsd`/`.vsdx`）、WMF——は、macOSにそもそもQuick Lookのジェネレータが存在しません（実機確認: qlmanageがクラッシュするか、プレビューを一切生成しない）。そのため`soffice`がインストールされている場合のみ開けます（qlmanageベースのフォールバックは存在しません）。`-c`/`--continuous`もこれらには効果がありません（sofficeの実際のページ分割を1ページへ戻す手段が無いため）。`.ods`は前述のExcelと同じ印刷ページ分割の制約を持ちますが（実機確認済み）、Excelと違って代替手段が無いため、この制約込みで対応しています。`.vsdx`は手元にサンプルが無く実機未検証ですが、LibreOfficeのVisioインポートは`.vsd`/`.vsdx`共通のコードで処理されます。
+
+SVGだけは例外で、Quick Lookもsofficeも使わず、headless Chrome(pdflessがもともと必須としているもの)で直接実PDF化します。SVGを`<img>`として埋め込んでPDF印刷する方式で、SVG内のベクター部分は本物のベクターPDFとして残ることを確認済みです（Wordの実PDF化と同様、どのズームでもシャープなまま）。この方式の唯一の制限は、`<img>`要素がインタラクティブ性を無効化するため、SVG内部のハイパーリンクはクリックできなくなることです。ローカルにChromeが無い場合は、この機能が無かった頃と同じく、SVGの生のXMLソースとして表示されます。
 
 | 形式 | 拡張子 | ページ送り | テキストモード | 備考 |
 | --- | --- | --- | --- | --- |
-| Word | `.doc`, `.docx` | 実際のページ分割 | ○ | 実PDFとしてレンダリング(上記参照)。`soffice`があればそちらを使用、なければChromeの`--print-to-pdf` |
-| Excel | `.xls`, `.xlsx` | シートごとに1ページ | × | |
-| PowerPoint | `.ppt`, `.pptx` | スライドごとに1ページ | `soffice`があれば○ | `soffice`があれば実PDFとしてレンダリング(上記参照)。なければ従来通りのスクリーンショット方式で、抽出できるテキストは無い |
+| Word | `.doc`, `.docx`, `.docm` | 実際のページ分割 | ○ | 実PDFとしてレンダリング(上記参照)。`soffice`があればそちらを使用、なければChromeの`--print-to-pdf` |
+| Excel | `.xls`, `.xlsx`, `.xlsm` | シートごとに1ページ | × | |
+| PowerPoint | `.ppt`, `.pptx`, `.pptm` | スライドごとに1ページ | `soffice`があれば○ | `soffice`があれば実PDFとしてレンダリング(上記参照)。なければ従来通りのスクリーンショット方式で、抽出できるテキストは無い |
 | RTF | `.rtf` | `soffice`があれば実際のページ分割、なければ常に連続表示 | ○ | `soffice`がインストールされていれば、Wordと同様にネイティブにレンダリング(実際のページ分割)。なければまずmacOSの`textutil`で`.docx`に変換してから（Quick Look自体はRTF用のHTMLプレビューを持たないため）、Wordと同じ扱いでレンダリングされる——ただし常に1枚の連続表示（変換後のdocxのページ高さ情報は元のRTFのページとは対応しないため） |
 | Pages | `.pages` | 常に連続表示 | × | PagesのQuick Lookプレビューにはページ境界を示す情報がない |
 | Numbers | `.numbers` | 最初のシートしか表示されない | × | NumbersのQuick Lookのタブ切り替え部分はExcelとマークアップが異なり、現状認識できていない（意図した仕様ではなく、既知の制限） |
 | Keynote | `.key` | 常に連続表示 | × | PowerPointと異なり、KeynoteのQuick Lookプレビューにはスライド境界を示す情報が一切ない（既知の制限） |
+| OpenDocument Text | `.odt` | 実際のページ分割 | ○ | `soffice`が必要——そもそもQuick Lookのジェネレータが存在しない |
+| OpenDocument Presentation | `.odp` | スライドごとに1ページ | ○ | `soffice`が必要——`.odt`と同様 |
+| OpenDocument Drawing | `.odg` | Draw内のページごとに1ページ | ○ | `soffice`が必要——`.odt`と同様 |
+| OpenDocument Spreadsheet | `.ods` | 印刷レイアウトに従ったページ送り | ○ | `soffice`が必要。Excelと同じ印刷ページ分割の制約があるが、Excelと違い代替手段が無い |
+| Visio | `.vsd`, `.vsdx` | Visioのページごとに1ページ | ○ | `soffice`が必要——そもそもQuick Lookのジェネレータが存在しない。`.vsdx`は実機未検証 |
+| WMF | `.wmf` | 単一ページ | ○ | `soffice`が必要——Quick Lookでプレビューできず、ブラウザもこの形式を読めない |
+| SVG | `.svg` | 単一ページ | ○ | Chromeで直接レンダリング(上記参照)。`soffice`もQuick Lookも使わない。ローカルにChromeが無ければ生のXMLソースとして表示 |
 
-テキストモード（`t`）はmacOSの`textutil`によるもので、これはWord系の文書（`.doc`/`.docx`/`.rtf`）しか理解できません——表計算・スライド・Apple独自のiWork形式（Pages/Numbers/Keynote）については何もテキストを返せないため、`t`は「テキストなし」と表示します（画像表示自体は問題なく使えます）。
+テキストモード（`t`）は、実PDFを持たないWord系の文書（`.doc`/`.docx`/`.docm`/`.rtf`）ではmacOSの`textutil`によるものです——表計算・スライド・Apple独自のiWork形式（Pages/Numbers/Keynote）については何もテキストを返せないため、`t`は「テキストなし」と表示します（画像表示自体は問題なく使えます）。実PDFを持つ形式（上記参照）は、そのPDFからページごとに直接テキストを取得します。
 
-`qlmanage`やローカルのChrome/Chromiumが使えない場合、これらの形式のファイルは警告を出してスキップされます。`-s`/`--rendering-scale`は実PDFとしてレンダリングされない形式(上記参照)でのみ、レンダリング時の鮮明さ（ズームイン時の見え方）を調整できます——どちらのオプションも[使い方](#使い方)を参照してください。
+Quick Lookが必要な形式(上記のほとんど)は、`qlmanage`やローカルのChrome/Chromiumが使えない場合、警告を出してスキップされます。`soffice`だけが必要な形式(OpenDocument/Visio/WMF)や、Chromeだけが必要な形式(SVG)は、その一つが無い場合のみスキップされます。`-s`/`--rendering-scale`は実PDFとしてレンダリングされない形式(上記参照)でのみ、レンダリング時の鮮明さ（ズームイン時の見え方）を調整できます——どちらのオプションも[使い方](#使い方)を参照してください。
 
 ## キー操作
 
