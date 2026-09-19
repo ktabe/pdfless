@@ -129,6 +129,32 @@ brew install poppler
 sudo apt install poppler-utils
 ```
 
+Optionally, install [LibreOffice](https://www.libreoffice.org) for
+higher-fidelity Word/RTF/PowerPoint rendering, and for OpenDocument/
+Visio/WMF support, which needs it (see Requirements above):
+
+```sh
+# macOS (Homebrew)
+brew install --cask libreoffice
+
+# Ubuntu/Debian (apt)
+sudo apt install libreoffice
+```
+
+Optionally, for rendered Markdown previews, install the system
+libraries [WeasyPrint](https://doc.courtbouillon.org/weasyprint/) needs
+(Cairo/Pango/GLib/GDK-Pixbuf) - the `markdown`/`weasyprint` Python
+packages themselves are already declared as dependencies below, so `uv`
+installs those automatically:
+
+```sh
+# macOS (Homebrew)
+brew install cairo pango gdk-pixbuf libffi
+
+# Ubuntu/Debian (apt)
+sudo apt install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0
+```
+
 `pdfless.py` is a self-contained [PEP 723](https://peps.python.org/pep-0723/)
 script — its Python dependencies are declared inline, so
 [`uv`](https://docs.astral.sh/uv/) will install them automatically on
@@ -160,7 +186,7 @@ Without `uv`, install its Python dependencies yourself and run it with
 `python3` directly:
 
 ```sh
-pip install pillow pypdf
+pip install pillow pypdf markdown weasyprint
 python3 pdfless.py some.pdf
 ```
 
