@@ -26,13 +26,13 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
   switch between them with `:n`/`:p`, `less(1)`-style
 - Also opens a plain text file directly, shown straight in that same
   text mode and searchable the same way a PDF is
-- With [pandoc](https://pandoc.org) and a local Chrome/Chromium install,
-  also opens Markdown files as a rendered preview - see
-  [Markdown Support (Experimental)](#markdown-support-experimental)
-  below
 - On macOS, with a local Chrome/Chromium install, also opens
   Word/Excel/PowerPoint/Keynote/Pages/RTF files and more - see
   [Office Document Support (Experimental)](#office-document-support-experimental)
+  below
+- With [pandoc](https://pandoc.org) and a local Chrome/Chromium install,
+  also opens Markdown files as a rendered preview - see
+  [Markdown Support (Experimental)](#markdown-support-experimental)
   below
 - Works the same way over SSH, since it's just a terminal program - no
   need for VNC/Remote Desktop or to copy the file to your local machine
@@ -226,34 +226,6 @@ from a build script, a LaTeX watch loop, or a script re-rendering a PNG) —
 With multiple files open, it only watches whichever one is currently
 displayed, switching what it watches along with `:n`/`:p`.
 
-## Markdown Support (Experimental)
-
-With [pandoc](https://pandoc.org) and a local Chrome/Chromium install,
-`pdfless` can also open Markdown files (`.md`, `.markdown`, `.mdown`,
-`.mkd`) as a rendered HTML preview — pandoc converts the file to
-standalone HTML, then a headless Chrome screenshot turns that into page
-images (the same capture path used for Office previews, but without
-Quick Look or macOS).
-
-This is experimental. By default the render is split into US-letter-sized
-pages so `n`/`p` and jumping straight to page N work the same as for a
-PDF; `-c`/`--continuous` keeps one long scroll instead. Markdown has no
-real print page breaks, so the split points are fixed-height slices and
-may cut through a paragraph or heading.
-
-| Feature | Details |
-| --- | --- |
-| Extensions | `.md`, `.markdown`, `.mdown`, `.mkd` |
-| Paging | Letter-sized slices by default; `-c` for one continuous scroll |
-| Text mode | Yes — the raw Markdown source (`t`); search works there, not in the rendered image |
-| Embedded images | Relative paths are resolved from the `.md` file's own directory |
-
-If pandoc or Chrome isn't available, a `.md` file falls back to plain
-text mode (raw source), the same as any other text file.
-
-`-s`/`--rendering-scale` and `-c`/`--continuous` apply to Markdown
-previews too; see [Usage](#usage).
-
 ## Office Document Support (Experimental)
 
 On macOS, with a local Chrome/Chromium install, `pdfless` can also open
@@ -287,6 +259,34 @@ A file in any of these formats is skipped with a warning if `qlmanage`
 or a local Chrome/Chromium isn't available. `-s`/`--rendering-scale`
 controls how sharp the rendered pages look when zoomed in; see
 [Usage](#usage) for both options.
+
+## Markdown Support (Experimental)
+
+With [pandoc](https://pandoc.org) and a local Chrome/Chromium install,
+`pdfless` can also open Markdown files (`.md`, `.markdown`, `.mdown`,
+`.mkd`) as a rendered HTML preview — pandoc converts the file to
+standalone HTML, then a headless Chrome screenshot turns that into page
+images (the same capture path used for Office previews, but without
+Quick Look or macOS).
+
+This is experimental. By default the render is split into US-letter-sized
+pages so `n`/`p` and jumping straight to page N work the same as for a
+PDF; `-c`/`--continuous` keeps one long scroll instead. Markdown has no
+real print page breaks, so the split points are fixed-height slices and
+may cut through a paragraph or heading.
+
+| Feature | Details |
+| --- | --- |
+| Extensions | `.md`, `.markdown`, `.mdown`, `.mkd` |
+| Paging | Letter-sized slices by default; `-c` for one continuous scroll |
+| Text mode | Yes — the raw Markdown source (`t`); search works there, not in the rendered image |
+| Embedded images | Relative paths are resolved from the `.md` file's own directory |
+
+If pandoc or Chrome isn't available, a `.md` file falls back to plain
+text mode (raw source), the same as any other text file.
+
+`-s`/`--rendering-scale` and `-c`/`--continuous` apply to Markdown
+previews too; see [Usage](#usage).
 
 ## Keys
 
