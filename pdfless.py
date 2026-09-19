@@ -1103,6 +1103,112 @@ def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
         return None
 
 
+_SCROLL_HEIGHT_MEASURE_SCRIPT = (
+    "<script>"
+    "function _pdflessMeasure(){"
+    "document.title = String(Math.ceil(Math.max("
+    "document.documentElement.scrollHeight, document.body.scrollHeight)));"
+    "}"
+    "var _pdflessImgs = Array.from(document.images);"
+    "var _pdflessPending = _pdflessImgs.filter(function(i){return !i.complete;}).length;"
+    "if (_pdflessPending === 0) { _pdflessMeasure(); }"
+    "else {"
+    "_pdflessImgs.forEach(function(img){"
+    "if (img.complete) return;"
+    "var done = function(){ _pdflessPending--; if (_pdflessPending <= 0) _pdflessMeasure(); };"
+    "img.addEventListener('load', done);"
+    "img.addEventListener('error', done);"
+    "});"
+    "}"
+    "</script>"
+)
+
+# Extra logical px below document.body.scrollHeight when screenshotting
+# Markdown - a little room for descenders/shadows without the huge
+# over-capture FlowingText needs for Quick Look HTML.
+MARKDOWN_CAPTURE_PADDING = 16
+
+
+def _measure_html_scroll_height(chrome, html_path, width):
+    """Ask Chrome for a standalone HTML document's total scroll height
+    (logical CSS px at `width`), after embedded images load. Used by
+    MarkdownDocument so it can capture once at the right height instead
+    of FlowingText's grow-and-trim loop, which mis-reads pandoc's plain
+    white viewport fill as "content still reaching the bottom". Returns
+    None if measurement failed."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+
+    idx = content.rfind("</body>")
+    instrumented = (
+        content[:idx] + _SCROLL_HEIGHT_MEASURE_SCRIPT + content[idx:]
+        if idx != -1 else content + _SCROLL_HEIGHT_MEASURE_SCRIPT
+    )
+    measure_path = os.path.join(os.path.dirname(html_path), "pdfless-scroll-measure.html")
+    try:
+        with open(measure_path, "w", encoding="utf-8") as f:
+            f.write(instrumented)
+        r = subprocess.run(
+            [
+                chrome, "--headless", "--no-sandbox",
+                f"--window-size={width},1080",
+                "--dump-dom", "--virtual-time-budget=8000",
+                f"file://{os.path.abspath(measure_path)}",
+            ],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        if os.path.exists(measure_path):
+            os.unlink(measure_path)
+
+    m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
+    if not m:
+        return None
+    try:
+        height = float(html.unescape(m.group(1)))
+    except ValueError:
+        return None
+    return height if height > 0 else None
+
+
+def _capture_markdown_html(
+    chrome, html_path, width, total_height, tag, name, tmpdir, debug, render_scale, progress,
+):
+    """Screenshot pandoc HTML once at `total_height` (+ padding), crop to
+    that height in device pixels, and return a one-page PNG list."""
+    if render_scale == OFFICE_RENDER_SCALE:
+        render_scale = OFFICE_RENDER_SCALE_FLOWING
+    padded = min(
+        OFFICE_MAX_CAPTURE_HEIGHT,
+        max(1, round(total_height) + MARKDOWN_CAPTURE_PADDING),
+    )
+    out_png = os.path.join(tmpdir, f"markdown-capture-{tag}.png")
+    label = f"{name}: rendering ({width * render_scale:.0f}x{padded * render_scale:.0f})"
+    try:
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            _capture_html_screenshot(
+                chrome, html_path, width, padded, out_png, render_scale,
+            )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    try:
+        img = Image.open(out_png)
+        img.load()
+        crop_h = min(img.height, max(1, round(padded * render_scale)))
+        trimmed = img.crop((0, 0, img.width, crop_h))
+        progress.update(f"{name}: splitting into 1 page(s)...")
+        with _DebugTimer(debug, f"{name}: splitting into 1 page(s)"):
+            return _slice_and_save_pages(trimmed, [0, trimmed.height], tmpdir, tag)
+    finally:
+        if os.path.exists(out_png):
+            os.unlink(out_png)
+
+
 def _slice_and_save_pages(trimmed, bounds, tmpdir, tag):
     """Crop `trimmed` at each consecutive pair in `bounds` (a list of Y
     pixel offsets, first always 0, last always trimmed.height) and save
@@ -2591,14 +2697,24 @@ class MarkdownDocument(OfficeDocument):
                 return None
 
             width = OFFICE_DEFAULT_WIDTH
-            height = OFFICE_DEFAULT_HEIGHT
             tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
-            variant = FlowingText(chrome, html_path, width, height, tag, name)
-            # No page boundaries in a Markdown render - always one
-            # continuous scroll, same as Word (see README-ja.md).
-            page_paths = variant.build_pages(
-                tmpdir, debug, render_scale, progress, continuous=True,
-            )
+            progress.update(f"{name}: measuring document height...")
+            with _DebugTimer(debug, f"{name}: measure scroll height"):
+                total_height = _measure_html_scroll_height(chrome, html_path, width)
+            if total_height is not None:
+                page_paths = _capture_markdown_html(
+                    chrome, html_path, width, total_height, tag, name,
+                    tmpdir, debug, render_scale, progress,
+                )
+            else:
+                # Fallback: FlowingText's grow-and-trim loop (slower, and
+                # can leave trailing blank on pandoc HTML - see above).
+                variant = FlowingText(
+                    chrome, html_path, width, OFFICE_DEFAULT_HEIGHT, tag, name,
+                )
+                page_paths = variant.build_pages(
+                    tmpdir, debug, render_scale, progress, continuous=True,
+                )
             if page_paths is None:
                 return None
             if debug:
