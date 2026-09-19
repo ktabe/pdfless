@@ -1,318 +1,285 @@
 # pdfless
 
-*([English](README.md))*
+[English](README.md)
 
-[iTerm2](https://iterm2.com) のインラインイメージプロトコルに対応した端末上で動作する、PDFと画像ファイルのための `less(1)` ライクなフルスクリーンページャです。iTerm2 と [WezTerm](https://wezterm.org) での動作を確認しています。
+`less(1)`と同様のキー操作でPDFや画像を閲覧できる，全画面表示のページャです．
+ローカルでもSSH経由でも，ターミナル上で直接文書を閲覧できます．
 
-- `less(1)` とほぼ同じキーバインド(行単位/半ページ・1ページ単位のスクロール、ページジャンプなど)で、ターミナル上にそのままPDF(あるいはPNG・JPEGなど[Pillow](https://python-pillow.org)が対応する画像ファイル)を表示
-- ズームイン/アウト、パンに対応。マウスホイールでのスクロールも可能
-- スクロールバー — 端末の右端の1列に文書全体における現在位置を表示(画像モード・テキストモードどちらでも)。クリックやドラッグでその位置へジャンプ可能
-- PDFの場合、プレーンテキストモードでページからテキストを抽出して表示 — テキストをコピーしたいときに便利。`t` で画像モードとテキストモードをいつでも切り替え可能
-- 正規表現によるPDF全体の検索。画像モード・テキストモードのどちらでも使える
-- PDF内のハイパーリンクは画像モードでクリックして開ける — 外部URL(システムのブラウザで開く)・文書内の他ページへのリンクのどちらにも対応
-- 複数のファイルを一度に開くことも可能(`pdfless a.pdf b.png ...`)。`less(1)`と同じように`:n`/`:p`でファイル間を切り替え
-- プレーンテキストファイルもそのまま開ける。最初からテキスト表示になり、PDFと同じように検索も使える
-- macOSでローカルにChrome/Chromiumがインストールされていれば、Word・Excel・PowerPoint・Keynote・Pages・RTFなどのファイルも開ける——詳しくは後述の[Office文書対応(実験的機能)](#office文書対応実験的機能)を参照
-- 単なるターミナルプログラムなので、SSHでログインしている環境でも同じように使える——VNC/リモートデスクトップは不要で、ファイルを手元のマシンにコピーする必要もない
+`pdfless`には，[iTerm2](https://iterm2.com)のインライン画像プロトコルに対応したターミナルが必要です．
+[iTerm2](https://iterm2.com)と[WezTerm](https://wezterm.org)で動作確認済みです．
+
+- キーボードやマウスによるスクロール，拡大・縮小，表示位置の移動．
+- PDF内のテキスト検索と，外部・内部リンクへの移動．
+- テキストモードに切り替えて，抽出したテキストを閲覧・コピー．
+- 複数のファイルを開いて切り替え．
+- 表示中のファイルが更新された際の自動再読み込み（`-F`/`--follow`指定時）．
+- プレーンテキストファイルの表示．追加のソフトウェアを導入すれば，Office文書，SVG，Markdownにも対応．
 
 ## スクリーンショット
 
-<p align="center">
-  <img src="docs/screenshots/pdfless-width-fit.png" alt="横幅に合わせる"><br>
-  <em>横幅に合わせる（デフォルト）</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/pdfless-height-fit.png" alt="縦幅に合わせる"><br>
-  <em>縦幅に合わせる（<code>-h</code>）</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/pdfless-zoom.png" alt="ズームイン"><br>
-  <em>ズームイン + パン</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/pdfless-search-pdf-mode.png" alt="PDFモードでの検索"><br>
-  <em>検索 — PDFモード（枠でマーク）</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/pdfless-search-text-mode.png" alt="テキストモードでの検索"><br>
-  <em>検索 — テキストモード（ハイライト表示）</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/pdfless-hyperlinks.png" alt="クリック可能なハイパーリンク"><br>
-  <em>クリック可能なハイパーリンク — 外部URL・文書内ジャンプ</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/pdfless-image.png" alt="画像ファイル"><br>
-  <em>画像ファイル（PNG・JPEGなど）</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/pdfless-help.png" alt="ヘルプ表示"><br>
-  <em>ヘルプ（<code>F1 / :h</code>）</em>
-</p>
-
-## 必要なもの
-
-- iTerm2のインラインイメージプロトコルに対応した端末 — [iTerm2](https://iterm2.com) と [WezTerm](https://wezterm.org) で動作確認済み。このプロトコルに非対応の端末では何も表示されません。
-- [poppler](https://poppler.freedesktop.org)（`pdftoppm`/`pdfinfo`/`pdftocairo`）— PDFを直接見るとき、およびQuick Lookプレビューファイル（Word/Excel/PowerPointなど）に埋め込まれた画像をラスタライズするときに必要です。画像ファイルしか開かないなら不要です。
-- macOS + ローカルのChrome/Chromium — Office/Keynote/PagesなどをQuick Look経由で開くときと、SVGファイルを直接開くとき(Quick Lookは使わずChromeのみ)に必要です。必要な依存が無ければ、そのファイルは警告を出してスキップされます。
-- [LibreOffice](https://www.libreoffice.org)（`soffice`）— 任意。インストールされていれば、Word（`.doc`/`.docx`/`.docm`）・RTF・PowerPoint（`.ppt`/`.pptx`/`.pptm`）ファイルはQuick Look + Chromeの代わりにこちらでレンダリングされ、実際のページ分割・より高忠実度な出力になります（詳細は後述のOffice/iWork対応表を参照）。未インストールならQuick Look + Chromeにフォールバックします。Excel（`.xls`/`.xlsx`/`.xlsm`）は意図的に対象外です:sofficeはExcelの印刷設定(改ページ・印刷範囲)に従ってページ分割するため、印刷用に整えられていない実際のシートでは列の途中で不自然に分割されることがあり、Quick Lookの「1シート=1ページ」表示とは異なる挙動になります。OpenDocument（`.odt`/`.odp`/`.odg`/`.ods`）・Visio（`.vsd`/`.vsdx`）・WMFは、macOSにそもそもQuick Lookのジェネレータが存在しないため、`soffice`が(代替手段無しで)必須です。
-- Markdown（`.md`/`.markdown`）用: `markdown`と`weasyprint`というPythonパッケージ(下記に依存関係として明記済みで`uv`が自動インストール)。ただし`weasyprint`はさらにCairo/Pango/GLib/HarfBuzzといったシステムライブラリを必要とし、これは`pip`/`uv`だけでは入りません(例: macOSなら`brew install cairo pango gdk-pixbuf libffi`)。`weasyprint`が動かない場合、Markdownファイルは他の任意レンダラーと同様、生のソースとして表示されます。
-- Python 3.9以上
-- [uv](https://docs.astral.sh/uv/)
+| 表示 | スクリーンショット |
+| --- | --- |
+| 幅に合わせて表示 | ![幅に合わせて表示](docs/screenshots/pdfless-width-fit.png) |
+| 高さに合わせて表示 | ![高さに合わせて表示](docs/screenshots/pdfless-height-fit.png) |
+| 拡大と表示位置の移動 | ![拡大と表示位置の移動](docs/screenshots/pdfless-zoom.png) |
+| 画像モードでの検索 | ![画像モードでの検索](docs/screenshots/pdfless-search-pdf-mode.png) |
+| テキストモードでの検索 | ![テキストモードでの検索](docs/screenshots/pdfless-search-text-mode.png) |
+| PDFのハイパーリンク | ![PDFのハイパーリンク](docs/screenshots/pdfless-hyperlinks.png) |
+| 画像ファイル | ![画像ファイル](docs/screenshots/pdfless-image.png) |
+| キー操作のヘルプ | ![キー操作のヘルプ](docs/screenshots/pdfless-help.png) |
 
 ## インストール
 
-`pdfless`が内部で呼び出す `pdftoppm`/`pdfinfo` を提供する poppler をインストールします:
+Python 3.9以降，[uv](https://docs.astral.sh/uv/)，および対応するターミナルが必要です．
+PDFの表示には[Poppler](https://poppler.freedesktop.org)も必要です．
+通常の画像ファイルのみを表示する場合，Popplerは不要です．
+
+必要なソフトウェアをインストールします．
 
 ```sh
 # macOS (Homebrew)
-brew install poppler
+brew install uv poppler
 
-# Ubuntu/Debian (apt)
+# Ubuntu / Debian
 sudo apt install poppler-utils
-```
-
-任意で、[LibreOffice](https://www.libreoffice.org)もインストールすると、Word/RTF/PowerPointがより高忠実度でレンダリングされ、OpenDocument/Visio/WMF（これらは必須——前述の「必要なもの」参照）にも対応できます:
-
-```sh
-# macOS (Homebrew)
-brew install --cask libreoffice
-
-# Ubuntu/Debian (apt)
-sudo apt install libreoffice
-```
-
-任意で、Markdownのレンダリングプレビューを使うなら、[WeasyPrint](https://doc.courtbouillon.org/weasyprint/)が必要とするシステムライブラリ(Cairo/Pango/GLib/GDK-Pixbuf)もインストールします——`markdown`/`weasyprint`というPythonパッケージ自体は後述の依存関係に含まれているため`uv`が自動インストールします:
-
-```sh
-# macOS (Homebrew)
-brew install cairo pango gdk-pixbuf libffi
-
-# Ubuntu/Debian (apt)
-sudo apt install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0
-```
-
-`pdfless.py` は [PEP 723](https://peps.python.org/pep-0723/) 形式の単体スクリプトです。Pythonの依存パッケージはスクリプト内に宣言されているので、[`uv`](https://docs.astral.sh/uv/) を使えば初回実行時に自動でインストールされます:
-
-```sh
-# macOS (Homebrew)
-brew install uv
-
-# Ubuntu/Debianなど Linux (aptにはuvがないため公式インストーラを使う)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+リポジトリをクローンして，ファイルを開きます．
+初回実行時に，`uv`が必要なPythonパッケージを自動的にインストールします．
 
 ```sh
 git clone https://github.com/ktabe/pdfless.git
 cd pdfless
-./pdfless.py some.pdf
+./pdfless.py document.pdf
 ```
 
-または `$PATH` の通ったところに置きます:
+`pdfless`というコマンド名で実行するには，`PATH`に含まれる書き込み可能なディレクトリにスクリプトをコピーします．
 
 ```sh
 cp pdfless.py /usr/local/bin/pdfless
 chmod +x /usr/local/bin/pdfless
-pdfless some.pdf
 ```
 
-`uv` を使わない場合は、自分でPythonの依存パッケージをインストールして `python3` で直接実行します:
+Pythonパッケージを自分でインストールすれば，`uv`を使わずに実行することもできます．
 
 ```sh
 pip install pillow pypdf markdown weasyprint
-python3 pdfless.py some.pdf
+python3 pdfless.py document.pdf
 ```
+
+その他の文書形式については[追加の対応形式（実験的機能）](#追加の対応形式実験的機能)を，
+tmux内での利用については[注意事項](#注意事項)を参照してください．
 
 ## 使い方
 
-```
-usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [-B] [-S]
-               [-E] [-N] [--no-scrollbar] [--no-incremental-scroll] [-F]
-               [--wheel-scroll-step N]
-               [file ...]
-
-positional arguments:
-  file                  PDF・画像・テキスト・Quick Lookでプレビュー可能な
-                        ファイルへのパス（複数可）。1つも指定しない場合
-                        （あるいは"-"を指定した場合）は標準入力から読み込む
-
-options:
-  --help                このヘルプメッセージを表示して終了
-  -v, --version         バージョン番号を表示して終了
-  -p, --page PAGE       最初のファイルの開始ページ（デフォルト: 1）
-  -d, --debug           Quick Lookプレビュー生成の各段階（qlmanage、pdftocairo、
-                        計測、レンダリング、ページ分割）にかかった時間を
-                        標準エラー出力に表示する
-  -s, --rendering-scale N
-                        Quick Lookプレビュー（Excel/PowerPoint/Keynote/Pages
-                        など、macOSのみ）をレンダリングする際のデバイスピク
-                        セル比。大きくするとズームイン時に鮮明になるが、レン
-                        ダリングが遅くなる（デフォルト: 1）。Word/RTFには効
-                        果なし——これらは実PDFとしてレンダリングされ、ズーム
-                        しても常にシャープ
-  -c, --continuous      Quick Lookプレビューファイル（macOSのみ）を、常に
-                        連続スクロール表示に強制する
-  -k, --keep            終了時 (q または ^C) に端末画面を復元せず、
-                        最後に表示していたページを画面に残す
-  -h, --fit-height      各ページを端末の横幅いっぱいではなく、
-                        縦幅いっぱいに合わせる（デフォルト: 横幅に合わせる）
-  -B, --no-border       テキストモード（t）でページの外枠の罫線を表示しない
-                        （デフォルトは表示——ただしプレーンテキストファイル
-                        はこの指定に関わらず最初から非表示。Bキーでいつでも
-                        切り替え可能）
-  -S, --chop-long-lines
-                        テキストモードで長い行を折り返さない——代わりに
-                        h/l/H/Lで横スクロールする（less(1)と同様）。
-                        プレーンテキストファイル以外はすでにこれが
-                        デフォルト（プレーンテキストファイルは通常は
-                        折り返す）。-Sと入力すればいつでも切り替え可能
-  -E, --no-eol-mark     テキストモードで実際の改行位置に印（↵）を
-                        表示しない——デフォルトでは表示する（-S/
-                        --chop-long-linesの指定に関わらず）。折り返し/
-                        横スクロールで単に端末幅で途切れただけの箇所と、
-                        本当の行末を区別できる
-  -N, --line-numbers    テキストモードで行番号を表示する（less(1)と同様）
-                        ——デフォルトはOFF。#（または-N、less(1)との
-                        互換性のために残してある）でいつでも切り替え可能
-  --no-scrollbar        スクロールバー（端末の右端に現在位置を示す列）を
-                        表示しない——デフォルトでは画像モード・テキスト
-                        モードどちらでも表示する。rでいつでも切り替え可能
-  --no-incremental-scroll
-                        スクロール時に常にページ画像全体を再描画する
-                        ——本来は端末上の既存の表示内容をずらし、新しく
-                        見えるようになった帯だけを送信する。この近道
-                        （iTerm2/WezTerm限定、tmux使用時はすでに無効）が
-                        正しく描画されない端末向けのフォールバック
-  -F, --follow          ファイルを監視し、更新されたら自動的に読み直す
-                        （3秒おきにチェック。同じページ・同じモードのまま）
-  --wheel-scroll-step N
-                        マウスホイール1ステップあたりのスクロール行数
-                        （画像モードのみ。デフォルト: 2）
+```sh
+pdfless document.pdf           # PDFを開く
+pdfless image.png              # 画像を開く
+pdfless notes.txt              # テキストファイルを開く
+pdfless report.pdf chart.png   # 複数のファイルを開く
+pdfless -p 10 document.pdf     # 10ページ目から表示
+pdfless -h slides.pdf          # 各ページをターミナルの高さに合わせて表示
+pdfless -F document.pdf        # ファイルの更新時に再読み込み
+cat document.pdf | pdfless     # 標準入力から読み込む
 ```
 
-`-F`/`--follow` は、ビルドスクリプトやLaTeXのwatchループ、PNGを再生成するスクリプトなどでPDFや画像を編集・再生成している最中に便利です — 再ビルドされるたびに、表示位置を保ったまま自動的に読み直されます。複数ファイルを開いている場合は、今表示中のファイルだけを監視し、`:n`/`:p`でファイルを切り替えると監視対象もそれに追従します。
+デフォルトでは，ページをターミナルの幅に合わせて表示します．
+`j` / `k`でスクロール，`Space` / `b`で1画面分移動，`n` / `p`でページを切り替えます．
+`+` / `-`で拡大・縮小，`/`で検索，`t`でテキストモードへの切り替え，`q`で終了します．
+`F1`または`:h`でキー操作のヘルプを表示します．
 
-## Office文書対応（実験的機能）
+複数のファイルを開いている場合は，`:n` / `:p`でファイルを切り替えます．
+ファイル名を省略するか，ファイル名として`-`を指定すると，標準入力から読み込みます．
 
-macOSでローカルにChrome/Chromiumがインストールされていれば、`pdfless` はWord・Excel・PowerPoint・Keynote・Pages・RTFなど、MacのQuick Lookジェネレータがプレビューできるファイルも開けます（poppler/pypdfの代わりに、Quick Lookのプレビューを裏で起動したヘッドレスChromeでレンダリングする仕組みです）。
+### 検索とテキストの選択
 
-これは実験的な機能です——ページ送りがどこまでうまくいくかは、各形式のQuick Lookジェネレータが何を提供するか次第で大きく変わります（詳しくは下表）。ページ送りできない形式は、代わりに1枚の連続スクロール画像として表示されます（プレーンな画像ファイルと同じ、また`-c`/`--continuous`が強制するのと同じ表示方法です）。
+検索では大文字と小文字を区別せず，[Pythonの正規表現](https://docs.python.org/3/library/re.html)を使用できます．
+無効な正規表現は，入力した文字列そのものとして扱います．
+一致箇所は，PDFの画像モードでは枠で囲まれ，テキストモードでは強調表示されます．
 
-Word・RTFは、内部で実PDFとしてレンダリングされます。そのため、他の形式と違い、通常のPDFと同じようにどのズーム倍率でもシャープなままで、元の文書内のハイパーリンクも本物のPDFと同様にクリック可能です。[LibreOffice](https://www.libreoffice.org)（`soffice`）がインストールされていれば、そちらを使ってネイティブに、かつより高忠実度で（実際のページ分割が元の文書と一致し、埋め込まれた画像もどの形式でも正しくレンダリングされる）PDF化します。インストールされていなければ、Quick Lookプレビューを(スクリーンショットではなく)Chromeのheadless `--print-to-pdf`でレンダリングする方式にフォールバックし、ページ送りはChromeの印刷エンジンが実際のコンテンツの流れに沿って自然に行います(通常の印刷と同じ、Quick Look側のページ境界情報——そもそもWordのプレビューにはこれがない——は使いません)。`-c`/`--continuous`を指定すれば、どちらの場合でもいつでも1枚の連続スクロール表示に戻せます。
+検索中は，`n` / `p`でページではなく一致箇所の間を移動します．
+検索にはテキストが必要です．テキストを抽出できるPDF，プレーンテキストファイル，
+およびPDFに変換して表示する対応形式で利用できます．
+通常の画像や，テキストを抽出できないプレビューでは利用できません．
 
-PowerPointも`soffice`がインストールされていれば同様に実PDF化されます（1スライド=1PDFページで、既存の「スライドごとに1ページ」というページ送りと完全に一致）。これによりズームでのシャープさ・ハイパーリンクのクリックだけでなく、Quick Lookのスクリーンショット方式では不可能だったテキストモード・実検索も新たに使えるようになります。`soffice`が無い場合は、従来通りのスクリーンショットベースのレンダリングにフォールバックします（Word・RTFと違い、こちらは常に実PDF化されるわけではありません）。Excelは意図的に対象外です（理由は前述の「必要なもの」参照）。マクロ入りのWord/PowerPoint（`.docm`/`.pptm`）は、macOSのQuick Lookジェネレータが`.docx`/`.pptx`と区別しないため、そのまま同じ扱いになります。
+テキストをコピーするには，`t`を押してから`C`を押し，罫線，行番号，行末マーカー，スクロールバーを非表示にします．
+その後，ターミナルの通常の選択操作でテキストを選択します．
+もう一度`C`を押すと，元の表示設定に戻ります．
 
-もう一つのグループ——OpenDocument形式（`.odt`/`.odp`/`.odg`/`.ods`）、Visio（`.vsd`/`.vsdx`）、WMF——は、macOSにそもそもQuick Lookのジェネレータが存在しません（実機確認: qlmanageがクラッシュするか、プレビューを一切生成しない）。そのため`soffice`がインストールされている場合のみ開けます（qlmanageベースのフォールバックは存在しません）。`-c`/`--continuous`もこれらには効果がありません（sofficeの実際のページ分割を1ページへ戻す手段が無いため）。`.ods`は前述のExcelと同じ印刷ページ分割の制約を持ちますが（実機確認済み）、Excelと違って代替手段が無いため、この制約込みで対応しています。`.vsdx`は手元にサンプルが無く実機未検証ですが、LibreOfficeのVisioインポートは`.vsd`/`.vsdx`共通のコードで処理されます。
+### オプション
 
-SVGだけは例外で、Quick Lookもsofficeも使わず、headless Chrome(pdflessがもともと必須としているもの)で直接実PDF化します。SVGを`<img>`として埋め込んでPDF印刷する方式で、SVG内のベクター部分は本物のベクターPDFとして残ることを確認済みです（Wordの実PDF化と同様、どのズームでもシャープなまま）。この方式の唯一の制限は、`<img>`要素がインタラクティブ性を無効化するため、SVG内部のハイパーリンクはクリックできなくなることです。ローカルにChromeが無い場合は、この機能が無かった頃と同じく、SVGの生のXMLソースとして表示されます。
-
-Markdown（`.md`/`.markdown`）も実PDF化されますが、Quick Look・Chrome・sofficeのいずれも使いません——`markdown`と`weasyprint`というPythonライブラリ(前述の「必要なもの」参照)でHTMLを経由して直接実PDFに変換します。ブラウザやOfficeスイートを経由するより大幅に高速です(実機確認: 1秒未満、ブラウザ起動だけで1〜2秒かかるのと比べて桁違い)。WeasyPrintは本物のCSSページネーションエンジンを持つため、SVG/Wordのように事前に高さを測る必要もありません。文中のリンクも本物のクリック可能なPDFリンクとして残ります。これらのライブラリ(またはWeasyPrintが必要とするシステムライブラリ)が無い場合は、Markdownファイルは生のソースとして表示されます。
-
-| 形式 | 拡張子 | ページ送り | テキストモード | 備考 |
-| --- | --- | --- | --- | --- |
-| Word | `.doc`, `.docx`, `.docm` | 実際のページ分割 | ○ | 実PDFとしてレンダリング(上記参照)。`soffice`があればそちらを使用、なければChromeの`--print-to-pdf` |
-| Excel | `.xls`, `.xlsx`, `.xlsm` | シートごとに1ページ | × | |
-| PowerPoint | `.ppt`, `.pptx`, `.pptm` | スライドごとに1ページ | `soffice`があれば○ | `soffice`があれば実PDFとしてレンダリング(上記参照)。なければ従来通りのスクリーンショット方式で、抽出できるテキストは無い |
-| RTF | `.rtf` | `soffice`があれば実際のページ分割、なければ常に連続表示 | ○ | `soffice`がインストールされていれば、Wordと同様にネイティブにレンダリング(実際のページ分割)。なければまずmacOSの`textutil`で`.docx`に変換してから（Quick Look自体はRTF用のHTMLプレビューを持たないため）、Wordと同じ扱いでレンダリングされる——ただし常に1枚の連続表示（変換後のdocxのページ高さ情報は元のRTFのページとは対応しないため） |
-| Pages | `.pages` | 常に連続表示 | × | PagesのQuick Lookプレビューにはページ境界を示す情報がない |
-| Numbers | `.numbers` | 最初のシートしか表示されない | × | NumbersのQuick Lookのタブ切り替え部分はExcelとマークアップが異なり、現状認識できていない（意図した仕様ではなく、既知の制限） |
-| Keynote | `.key` | 常に連続表示 | × | PowerPointと異なり、KeynoteのQuick Lookプレビューにはスライド境界を示す情報が一切ない（既知の制限） |
-| OpenDocument Text | `.odt` | 実際のページ分割 | ○ | `soffice`が必要——そもそもQuick Lookのジェネレータが存在しない |
-| OpenDocument Presentation | `.odp` | スライドごとに1ページ | ○ | `soffice`が必要——`.odt`と同様 |
-| OpenDocument Drawing | `.odg` | Draw内のページごとに1ページ | ○ | `soffice`が必要——`.odt`と同様 |
-| OpenDocument Spreadsheet | `.ods` | 印刷レイアウトに従ったページ送り | ○ | `soffice`が必要。Excelと同じ印刷ページ分割の制約があるが、Excelと違い代替手段が無い |
-| Visio | `.vsd`, `.vsdx` | Visioのページごとに1ページ | ○ | `soffice`が必要——そもそもQuick Lookのジェネレータが存在しない。`.vsdx`は実機未検証 |
-| WMF | `.wmf` | 単一ページ | ○ | `soffice`が必要——Quick Lookでプレビューできず、ブラウザもこの形式を読めない |
-| SVG | `.svg` | 単一ページ | ○ | Chromeで直接レンダリング(上記参照)。`soffice`もQuick Lookも使わない。ローカルにChromeが無ければ生のXMLソースとして表示 |
-| Markdown | `.md`, `.markdown` | 実際のページ分割 | ○ | `markdown` + `weasyprint`でレンダリング(上記参照)。Chrome・`soffice`・Quick Lookのいずれも使わない。これらのライブラリが無ければ生のMarkdownソースとして表示 |
-
-テキストモード（`t`）は、実PDFを持たないWord系の文書（`.doc`/`.docx`/`.docm`/`.rtf`）ではmacOSの`textutil`によるものです——表計算・スライド・Apple独自のiWork形式（Pages/Numbers/Keynote）については何もテキストを返せないため、`t`は「テキストなし」と表示します（画像表示自体は問題なく使えます）。実PDFを持つ形式（上記参照）は、そのPDFからページごとに直接テキストを取得します。
-
-Quick Lookが必要な形式(上記のほとんど)は、`qlmanage`やローカルのChrome/Chromiumが使えない場合、警告を出してスキップされます。`soffice`だけが必要な形式(OpenDocument/Visio/WMF)や、Chromeだけが必要な形式(SVG)は、その一つが無い場合のみスキップされます。`-s`/`--rendering-scale`は実PDFとしてレンダリングされない形式(上記参照)でのみ、レンダリング時の鮮明さ（ズームイン時の見え方）を調整できます——どちらのオプションも[使い方](#使い方)を参照してください。
-
-## キー操作
-
-ナビゲーションは `less(1)` に準拠しています:
-
-| キー | 動作 |
+| オプション | 説明 |
 | --- | --- |
-| `e` `^E` `j` `^N` `Enter` `Down` | 1行進む |
-| `y` `^Y` `k` `^K` `^P` `Up` | 1行戻る |
-| `f` `^F` `^V` `Space` `PageDown` | 1画面進む |
-| `b` `^B` `Esc-v` `PageUp` | 1画面戻る |
-| `d` `^D` | 半画面進む |
-| `u` `^U` | 半画面戻る |
-| `g` / `G` | 現在ページの先頭 / 末尾へ（テキストモードでは先に数字を打つとその行番号へ直接ジャンプ。例: `10g` → 10行目） |
-| `<` / `>` / `Home` / `End` | 文書の最初 / 最後のページへ（先に数字を打つとそのページ番号へ直接ジャンプ。例: `10<` → 10ページ目） |
-| `n` / `p` | 次 / 前のページへ（検索中の別の役割については後述） |
-| `:n` / `:p` | 次 / 前のファイルへ（コマンドラインで複数ファイルを指定したとき） |
-| `x` / `X` | ファイルリストの先頭 / 末尾へジャンプ |
-| `<N> x` | ファイル番号 `N` へジャンプ |
+| `--help` | コマンドラインのヘルプを表示します． |
+| `-v`, `--version` | バージョンを表示します． |
+| `-p`, `--page PAGE` | 最初のファイルの指定ページから表示します（デフォルト：1）． |
+| `-h`, `--fit-height` | ページをターミナルの幅ではなく高さに合わせて表示します． |
+| `-k`, `--keep` | 終了時に，最後に表示したページを画面に残します． |
+| `-F`, `--follow` | 表示中のファイルの更新を3秒ごとに確認し，ページと表示モードを維持して再読み込みします． |
+| `-N`, `--line-numbers` | テキストモードで行番号を表示します． |
+| `-S`, `--chop-long-lines` | テキストモードで長い行を折り返さず，横方向に移動して表示します． |
+| `-B`, `--no-border` | テキストモードでページの罫線を非表示にします． |
+| `-E`, `--no-eol-mark` | テキストモードで行末マーカーを非表示にします． |
+| `--no-scrollbar` | スクロールバーを非表示にします． |
+| `--wheel-scroll-step N` | 画像モードでのマウスホイール1ステップあたりのスクロール量をN行に設定します（デフォルト：2）． |
+| `-s`, `--rendering-scale N` | 画像として表示するQuick Lookプレビューの描画倍率を設定します（デフォルト：1）．値を大きくすると鮮明になりますが，描画に時間がかかります． |
+| `-c`, `--continuous` | Quick Lookプレビューを連続表示します． |
+| `--no-incremental-scroll` | スクロールのたびにページ画像全体を再描画します． |
+| `-d`, `--debug` | デバッグ情報を標準エラー出力に出力します． |
 
-ズームとパン:
+`-h`は**高さに合わせて表示**するオプションです．コマンドラインのヘルプには`--help`を使用してください．
+`--follow`で監視するのは，現在表示中のファイルのみです．
 
-| キー | 動作 |
+## キーボードとマウスの操作
+
+`^`はCtrlを表します．多くの操作で`less(1)`と同じキーを使用できます．
+
+### 移動
+
+| キー | 操作 |
 | --- | --- |
-| `+` / `-` | ズームイン / アウト |
-| `0` | ズームとパンをリセット |
-| `m` / `M` | ページを端末の縦幅 / 横幅いっぱいに合わせる |
-| `h` / `l` / `Left` / `Right` | 左 / 右にパン（ズームイン時） |
-| `H` / `L` / `Shift-Left` / `Shift-Right` | 左端 / 右端にジャンプ |
-| `K` / `U` / `Shift-Up` | 現在のページの先頭へ（`g`と同じ） |
-| `J` / `D` / `Shift-Down` | 現在のページの末尾へ（`G`と同じ） |
+| `e`, `^E`, `j`, `^N`, `Enter`, `Down` | 下に1行スクロールします． |
+| `y`, `^Y`, `k`, `^K`, `^P`, `Up` | 上に1行スクロールします． |
+| `f`, `^F`, `^V`, `Space`, `PageDown` | 下に1画面分スクロールします． |
+| `b`, `^B`, `Esc-v`, `PageUp` | 上に1画面分スクロールします． |
+| `d`, `^D` / `u`, `^U` | 下／上に半画面分スクロールします． |
+| `g` / `G` | 現在のページの先頭／末尾に移動します．テキストモードでは，先に数値を入力すると指定行に移動します（例：`10g`）． |
+| `<`, `Home` / `>`, `End` | 最初／最後のページに移動します．先に数値を入力すると指定ページに移動します（例：`10<`）． |
+| `n` / `p` | 次／前のページに移動します．検索中は次／前の一致箇所に移動します． |
+| `:n` / `:p` | 次／前のファイルに移動します． |
+| `x` / `X` | 最初／最後のファイルに移動します．`x`の前に数値を入力すると，その番号のファイルを選択します． |
 
-検索は、PDFとプレーンテキストファイルでは常に使えます。実PDFとしてレンダリングされたWord・RTF・PowerPoint（前述のOffice文書対応を参照）でも、本物のPDFと同様に`t`を押さなくても画像モードのまま直接使えます。それ以外のQuick Lookプレビューファイル（Excel、または実PDFが使えないWord/RTF/PowerPoint）では、`t`でテキストモードに切り替えた後のみ使えます——レンダリングされたページ画像自体を検索する手段はないためです。画像ファイルでは検索できません。抽出したテキスト（またはファイル本文）に対して、大文字小文字を区別しない[Python正規表現](https://docs.python.org/ja/3/library/re.html)で検索します。対象は現在のページだけでなく文書全体です。パターンが正規表現として不正な場合（例: `C++`）は、リテラルな部分一致検索にフォールバックします。マッチへジャンプすると、その位置までスクロールし、PDFページ画像上なら枠線で、テキストならハイライトで表示します:
+### 拡大・縮小と表示位置の移動
 
-| キー | 動作 |
+| キー | 操作 |
 | --- | --- |
-| `/<正規表現>` `Enter` | 文書全体から`<正規表現>`を検索し、現在位置以降で最初のマッチへ移動 |
-| `?<正規表現>` `Enter` | 同じ検索だが、現在位置より前で最後のマッチへ移動（`less(1)`の後方検索） |
-| `/` `Enter` / `?` `Enter` | 検索文字列を入力せずに確定すると、前回の検索文字列で前方/後方検索を繰り返す |
-| `N` / `P` | 次 / 前のマッチへジャンプ |
-| `n` / `p` | 検索がアクティブな間は上の`N`/`P`と同じ（そうでなければ次 / 前のページ） |
+| `+`, `=` / `-` | 拡大／縮小します． |
+| `0` | 拡大率と表示位置をリセットします． |
+| `m` / `M` | 高さ／幅に合わせて表示します． |
+| `h`, `Left` / `l`, `Right` | 表示位置を左／右に移動します． |
+| `H`, `Shift-Left` / `L`, `Shift-Right` | 左端／右端に移動します． |
+| `K`, `U`, `Shift-Up` / `J`, `D`, `Shift-Down` | 現在のページの先頭／末尾に移動します． |
 
-その他:
+### 検索
 
-| キー | 動作 |
+| キー | 操作 |
 | --- | --- |
-| クリック / ドラッグ | （PDF画像モードのみ、テキストモードでは無効）スクロールバー上ならクリックした位置へジャンプし、そのままドラッグして移動もできる。それ以外はポインタ位置のPDFハイパーリンクを開く — URLならシステムのブラウザで開き、文書内リンクならそのジャンプ先のページ/位置へ移動する |
-| マウスホイール | 上下スクロール — PDF画像モードでは2行単位（`--wheel-scroll-step`で変更可能）。テキストモードでは1行単位 |
-| `[` / `]` | 文書内リンクでジャンプした位置履歴を、戻る / 進む |
-| `t` | プレーンテキスト表示に切り替え——PDF、または実PDFとしてレンダリングされたWord/RTF/PowerPoint（前述のOffice文書対応を参照）なら現在のページから抽出したテキスト、それ以外のWord系ファイル（`.doc`/`.docx`/`.rtf`）ならmacOSの`textutil`による文書全体のテキスト。画像・表計算・実PDFが使えないスライドには抽出できるテキストがないため何もしない |
-| `B` | （テキストモード）ページの外枠の罫線表示を切り替え。デフォルトは表示（`--no-border`/`-B` で最初から非表示にできる）。プレーンテキストファイルは、この指定に関わらず最初から非表示。折り返し中は`B`の設定に関わらず罫線は表示されない（`-S`で先に折り返しを解除） |
-| `s` / `-S` | （テキストモード）長い行を折り返すか、`h`/`l`/`H`/`L`で横スクロールするかを切り替え。プレーンテキストファイルはデフォルトで折り返し、それ以外はデフォルトで折り返さない（`-S`/`--chop-long-lines`で最初から折り返さないようにできる） |
-| `E` | （テキストモード）行末に印（↵）を表示するかどうかを切り替え。デフォルトで表示（`-E`/`--no-eol-mark`で最初から非表示にできる） |
-| `#` / `-N` | （テキストモード）行番号欄を表示するかどうかを切り替え。デフォルトはOFF（`-N`/`--line-numbers`で最初からONにできる） |
-| `C` | （テキストモード）コピペしやすいように、EOLマーク・罫線・スクロールバー・行番号をまとめてOFFにする（ドラッグで選択したときに本文だけを拾えるようになる）。もう一度押すと元の状態に復元される（元からOFFだったものはOFFのまま） |
-| `r` | スクロールバーを表示するかどうかを切り替え。デフォルトで表示（`--no-scrollbar`で最初から非表示にできる）。テキストモードでは端末自身のクリック＆ドラッグによるテキスト選択を残すため表示のみ |
-| `^L` | 画面を再描画 |
-| `F1` / `:h` | キーバインドのヘルプを表示（`q` で閉じる） |
-| `q` / `:q` / `^C` | 終了 |
+| `/pattern` `Enter` | 順方向に検索します． |
+| `?pattern` `Enter` | 逆方向に検索します． |
+| `/` `Enter` / `?` `Enter` | 前回のパターンで順方向／逆方向に検索します． |
+| `N` / `P` | 次／前の一致箇所に移動します． |
+
+### 表示とその他の操作
+
+| キー・マウス操作 | 動作 |
+| --- | --- |
+| `t` | テキスト抽出に対応した形式で，テキストモードを切り替えます． |
+| `B` | テキストモードでページの罫線を切り替えます（デフォルトで表示．ただし，プレーンテキストファイルでは常に非表示）．行の折り返し中は罫線を表示しません． |
+| `s`, `-S` | テキストモードで行の折り返しを切り替えます．デフォルトではプレーンテキストファイルのみ折り返し，その他の形式では折り返しません． |
+| `E` | テキストモードで行末マーカーを切り替えます（デフォルトで表示）． |
+| `#`, `-N` | テキストモードで行番号を切り替えます（デフォルトで非表示）． |
+| `C` | コピー用に表示を簡素化します．もう一度押すと元の表示設定に戻ります． |
+| `r` | スクロールバーを切り替えます（デフォルトで表示）． |
+| PDFのリンクをクリック | URLをシステムのブラウザで開くか，内部リンクの移動先に移動します． |
+| `[` / `]` | 内部リンクの移動履歴を戻る／進む操作を行います． |
+| スクロールバーをクリック・ドラッグ | 画像モードで文書内の指定位置に移動します．テキストモードではスクロールバーは位置の表示のみです． |
+| マウスホイール | 画像モードでは2行（変更可能），テキストモードでは1行ずつスクロールします． |
+| `^L` | 画面を再描画します． |
+| `F1`, `:h` | キー操作のヘルプを表示します．`q`で閉じます． |
+| `q`, `:q`, `^C` | 終了します． |
+
+## 追加の対応形式（実験的機能）
+
+PNG，JPEGなど，[Pillow](https://python-pillow.org)が対応する画像形式はそのまま開けます．
+以下の形式には追加のソフトウェアが必要です．PDFに変換して表示する場合はPopplerも必要です．
+
+### 追加の依存ソフトウェア
+
+- **LibreOffice**：OpenDocument，Visio，WMFの表示に必要です．インストールされている場合は，Word，RTF，PowerPointの描画にも優先して使用します．
+- **macOSのQuick LookとChrome/Chromium**：ExcelとiWorkのプレビューに必要です．LibreOfficeがない場合は，Word，RTF，PowerPointの表示にも使用します．
+- **Chrome/Chromium**：SVGの描画に使用します．Quick Lookは不要です．
+- **WeasyPrintが必要とするシステムライブラリ**：Markdownの描画に必要です．Pythonパッケージの`markdown`と`weasyprint`は，他のPython依存パッケージとともにインストールされます．
+
+```sh
+# macOS (Homebrew)
+brew install --cask libreoffice
+brew install cairo pango gdk-pixbuf libffi
+
+# Ubuntu / Debian
+sudo apt install libreoffice
+sudo apt install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0
+```
+
+Quick LookプレビューまたはSVGの描画を利用する場合は，ChromeまたはChromiumを別途インストールしてください．
+
+### 形式ごとの対応状況と制限
+
+プレビューの品質やページ分割は，形式と利用可能な描画ソフトウェアによって異なります．
+
+| 形式 | 拡張子 | 必要なソフトウェアと動作 |
+| --- | --- | --- |
+| Word | `.doc`, `.docx`, `.docm` | LibreOfficeを優先し，なければQuick Look + Chromeを使用します．テキストモードと検索に対応します．代替の描画方法ではページ分割が異なる場合があります． |
+| Excel | `.xls`, `.xlsx`, `.xlsm` | Quick Look + Chromeが必要です．1シートを1ページとして表示します．テキストモードと検索には対応しません． |
+| PowerPoint | `.ppt`, `.pptx`, `.pptm` | LibreOfficeを優先し，なければQuick Look + Chromeを使用します．1スライドを1ページとして表示します．テキストモードと検索にはLibreOfficeが必要です． |
+| RTF | `.rtf` | LibreOfficeでは改ページを維持し，代替のQuick Look + Chromeでは連続表示します．テキストモードと検索に対応し，描画できない場合はプレーンテキストとして表示します． |
+| Pages | `.pages` | Quick Look + Chromeが必要です．連続表示します．テキストモードと検索には対応しません． |
+| Numbers | `.numbers` | Quick Look + Chromeが必要です．最初のシートのみ表示します．テキストモードと検索には対応しません． |
+| Keynote | `.key` | Quick Look + Chromeが必要です．通常は連続表示ですが，一部のプレビューではスライド単位のページ表示に対応します．テキストモードと検索には対応しません． |
+| OpenDocument | `.odt`, `.odp`, `.odg`, `.ods` | LibreOfficeが必要です．テキストモードと検索に対応します．表計算文書のページ分割は印刷レイアウトに従います． |
+| Visio | `.vsd`, `.vsdx` | LibreOfficeが必要です．Visioの各ページを1ページとして表示します．`.vsdx`の対応は手動では未検証です． |
+| WMF | `.wmf` | LibreOfficeが必要です．1ページとして表示します． |
+| SVG | `.svg` | Chrome/Chromiumを使用します．拡大・縮小に対応しますが，SVG内のリンクはクリックできません．Chromeがない場合はXMLソースを表示します． |
+| Markdown | `.md`, `.markdown` | WeasyPrintとそのシステムライブラリを使用します．ページ単位の表示，テキストモード，検索，クリック可能なリンクに対応します．描画できない場合はMarkdownソースを表示します． |
+
+PDFに変換して表示する形式では，変換後のPDFにテキストが含まれていれば，テキスト抽出と検索を利用できます．
+画像として表示するQuick Lookプレビューでは利用できません．
+
+画像として表示するQuick Lookプレビューの解像度を上げるには`-s`を，
+Quick Look文書を連続スクロールで表示するには`-c`を使用します．
+これらのオプションは，LibreOfficeのみで対応する形式やMarkdownのページ分割・解像度には影響しません．
+ExcelはLibreOfficeの印刷レイアウトではなく，Quick Lookのシート単位の表示を使用します．
 
 ## 注意事項
 
-- tmux内では、パススルーを有効にしない限り（tmux 3.3以降）何も表示されません: `~/.tmux.conf` に `set -g allow-passthrough on` を追加して読み直してください（例: `tmux source-file ~/.tmux.conf`）。これがないと、tmuxはデフォルトでインライン画像のエスケープシーケンスを破棄します。
-- tmuxではもう一点: `pdfless`を表示しているペインからフォーカスを外すと、そのペインが真っ白になることがあります。tmux自身の画面モデルはパススルーされた画像の中身を把握していないため、フォーカスが外れた際の内部的な再描画で画像なしの状態に上書きしてしまうためです。`pdfless`はそのペインに再びフォーカスが戻った瞬間に自動で再描画してこれを直しますが、そのためにはtmux側にもフォーカスイベントを転送させる設定が必要です: `~/.tmux.conf` に `set -g focus-events on` も追加してください。手動で直したい場合は`^L`でいつでも再描画できます。(フォーカスを失った瞬間にそのペイン自身が直すことはできません——その時点でtmuxはすでに実端末側の唯一のカーソルをフォーカスが移った先のペインへ動かしてしまっており、同じタイミングで再描画してもそちらに描画されてしまうためです。)
+### tmux
 
-## テスト
+tmux 3.3以降で画像を表示するには，`~/.tmux.conf`に以下を追加します．
+
+```tmux
+set -g allow-passthrough on
+set -g focus-events on
+```
+
+設定を再読み込みします．
+
+```sh
+tmux source-file ~/.tmux.conf
+```
+
+パススルーを有効にすると画像を出力できます．無効のままでは，tmux内で画像は表示されません．
+
+`pdfless`を実行しているペインから別のペインに切り替えると，元のペインが空白になることがあります．
+これは，tmuxがパススルーで出力された画像を含めずにペインを再描画するためです．
+フォーカスイベントを有効にしておくと，そのペインに戻った際に`pdfless`が自動的に再描画します．
+必要に応じて，`Ctrl-L`で手動で再描画することもできます．
+
+## 開発
+
+テストスイートを実行するには，以下を使用します．
 
 ```sh
 cd tests
 uv run --with pytest --with pytest-timeout --with pillow --with pypdf --with markdown --with weasyprint python -m pytest
 ```
 
-大半は高速なユニットテスト（ファイル分類・ページキャッシュ関連）です。一部は実際に`pdfless.py`を擬似端末（pty）経由で起動し、Viewer自体のクラッシュを検出します（実端末でしか再現しない挙動があるため）。`qlmanage`とローカルのChrome/Chromiumが両方使える環境でなければ、`.docx`（Quick Lookプレビュー経由）のテストは自動的にスキップされます。
+テストスイートには，単体テストとターミナルを使用する統合テストが含まれます．
+macOSのQuick Look + Chrome/Chromium，LibreOffice（`soffice`），WeasyPrintに依存するテストは，
+対応する依存ソフトウェアが利用できない場合に自動的にスキップされます．
 
 ## 謝辞
 
-本プログラムのコードは [Claude Code](https://claude.com/claude-code) が書きました。
+このプログラムのコードは[Claude Code](https://claude.com/claude-code)によって書かれました．
 
 ## ライセンス
 
