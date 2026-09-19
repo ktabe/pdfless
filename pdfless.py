@@ -1176,11 +1176,25 @@ def _measure_html_scroll_height(chrome, html_path, width):
     return height if height > 0 else None
 
 
+def _markdown_page_bounds(trimmed_height, page_height, render_scale, continuous):
+    """How to slice one tall Markdown capture into page PNGs - either
+    one continuously-scrollable page (-c/--continuous) or fixed-height
+    slices at `page_height` logical px (OFFICE_DEFAULT_HEIGHT, i.e. a
+    US-letter page at 96dpi - the same rule FlowingText uses for Word)."""
+    if continuous:
+        return [0, trimmed_height]
+    page_px = max(1, round(page_height * render_scale))
+    npages = max(1, -(-trimmed_height // page_px))  # ceil division
+    return [min(trimmed_height, i * page_px) for i in range(npages + 1)]
+
+
 def _capture_markdown_html(
     chrome, html_path, width, total_height, tag, name, tmpdir, debug, render_scale, progress,
+    page_height=OFFICE_DEFAULT_HEIGHT, continuous=False,
 ):
     """Screenshot pandoc HTML once at `total_height` (+ padding), crop to
-    that height in device pixels, and return a one-page PNG list."""
+    that height in device pixels, then split into page-sized PNGs unless
+    continuous=True (-c/--continuous)."""
     if render_scale == OFFICE_RENDER_SCALE:
         render_scale = OFFICE_RENDER_SCALE_FLOWING
     padded = min(
@@ -1201,9 +1215,11 @@ def _capture_markdown_html(
         img.load()
         crop_h = min(img.height, max(1, round(padded * render_scale)))
         trimmed = img.crop((0, 0, img.width, crop_h))
-        progress.update(f"{name}: splitting into 1 page(s)...")
-        with _DebugTimer(debug, f"{name}: splitting into 1 page(s)"):
-            return _slice_and_save_pages(trimmed, [0, trimmed.height], tmpdir, tag)
+        bounds = _markdown_page_bounds(trimmed.height, page_height, render_scale, continuous)
+        npages = len(bounds) - 1
+        progress.update(f"{name}: splitting into {npages} page(s)...")
+        with _DebugTimer(debug, f"{name}: splitting into {npages} page(s)"):
+            return _slice_and_save_pages(trimmed, bounds, tmpdir, tag)
     finally:
         if os.path.exists(out_png):
             os.unlink(out_png)
@@ -2645,12 +2661,13 @@ class RtfOfficeDocument(OfficeDocument):
 
 class MarkdownDocument(OfficeDocument):
     """A Markdown file, rendered as an image by converting it to HTML
-    via pandoc and screenshotting that HTML with a local Chrome/Chromium
-    (FlowingText OfficeVariant - one continuously-scrollable page, like
-    Word). Tried before TextDocument (see HANDLER_CLASSES) so a .md
-    file with pandoc+Chrome available opens in rendered image mode rather
-    than as raw source; falls through to TextDocument when either tool
-    is missing."""
+    via pandoc and screenshotting that HTML with a local Chrome/Chromium.
+    By default the capture is split into US-letter-sized pages (same
+    height rule as Word's FlowingText pagination) so n/p/g/G work; -c/
+    --continuous keeps one long scroll instead. Tried before
+    TextDocument (see HANDLER_CLASSES) so a .md file with pandoc+Chrome
+    available opens in rendered image mode rather than as raw source;
+    falls through to TextDocument when either tool is missing."""
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
@@ -2705,6 +2722,7 @@ class MarkdownDocument(OfficeDocument):
                 page_paths = _capture_markdown_html(
                     chrome, html_path, width, total_height, tag, name,
                     tmpdir, debug, render_scale, progress,
+                    page_height=OFFICE_DEFAULT_HEIGHT, continuous=continuous,
                 )
             else:
                 # Fallback: FlowingText's grow-and-trim loop (slower, and
@@ -2713,7 +2731,7 @@ class MarkdownDocument(OfficeDocument):
                     chrome, html_path, width, OFFICE_DEFAULT_HEIGHT, tag, name,
                 )
                 page_paths = variant.build_pages(
-                    tmpdir, debug, render_scale, progress, continuous=True,
+                    tmpdir, debug, render_scale, progress, continuous=continuous,
                 )
             if page_paths is None:
                 return None
