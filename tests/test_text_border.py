@@ -13,7 +13,6 @@ import termios
 import tempfile
 
 import pdfless
-from conftest import requires_office_support
 
 
 def make_viewer(handler, border=True):
@@ -52,12 +51,3 @@ def test_pdf_text_mode_border_default_unaffected(sample_pdf):
     viewer2 = make_viewer(pdfless.PdfDocument(sample_pdf), border=False)
     assert viewer2.enter_text_mode() is True
     assert viewer2.text_border is False  # --no-border still respected as before
-
-
-@requires_office_support
-def test_office_document_text_mode_border_default_unaffected(sample_docx):
-    viewer = make_viewer(pdfless.OfficeDocument(sample_docx), border=True)
-    assert viewer.enter_text_mode() is True
-    assert viewer.text_border is True  # unchanged, matches the pre-existing PDF behavior
-    viewer.toggle_text_border()
-    assert viewer.text_border is False

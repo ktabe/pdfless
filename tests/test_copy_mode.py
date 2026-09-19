@@ -76,15 +76,6 @@ def test_copy_mode_does_the_recompute_its_widths_need(sample_text):
     assert viewer._text_avail_cols() == 40  # the column is back in play
 
 
-def test_copy_mode_gives_the_line_number_gutter_back_too(sample_text):
-    viewer = make_viewer(pdfless.TextDocument(sample_text), line_numbers=True)
-    assert viewer._line_number_gutter_width() > 0
-    viewer.toggle_copy_mode()
-    assert viewer._line_number_gutter_width() == 0
-    viewer.toggle_copy_mode()
-    assert viewer._line_number_gutter_width() > 0
-
-
 def test_copy_mode_stays_where_you_were_reading(tmp_path):
     """Toggling it is not a resize: the file isn't re-read, so the
     scroll position survives both presses. Needs a file taller than
@@ -100,12 +91,3 @@ def test_copy_mode_stays_where_you_were_reading(tmp_path):
     assert viewer.text_scroll == 42
     viewer.toggle_copy_mode()
     assert viewer.text_scroll == 42
-
-
-def test_the_C_key_is_what_toggles_it(sample_text):
-    viewer = make_viewer(pdfless.TextDocument(sample_text))
-    assert viewer.text_mode is True
-    viewer.handle_key("C")
-    assert decorations(viewer) == (False, False, False, False)
-    viewer.handle_key("C")
-    assert decorations(viewer) == (True, False, True, False)

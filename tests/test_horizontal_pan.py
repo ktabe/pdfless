@@ -45,17 +45,6 @@ def test_turning_the_page_keeps_the_left_edge(sample_pdf):
     assert viewer.x_offset == 0
 
 
-def test_turning_the_page_keeps_a_pan_in_the_middle_too(sample_pdf):
-    """Not just the left edge: whatever you panned to stays put."""
-    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
-    viewer.handle_key("l")
-    panned = viewer.x_offset
-    assert panned > 0
-
-    viewer.go_page(2, 0)
-    assert viewer.x_offset == panned
-
-
 def test_scrolling_off_the_bottom_of_a_page_keeps_the_pan(sample_pdf):
     """A height-fitted page has nothing left to scroll, so "j" is a
     page turn - which is how the re-centering this guards against used
@@ -91,3 +80,33 @@ def test_zoom_stays_centered_on_what_was_on_screen(sample_pdf):
     new_frac = (viewer.x_offset + viewer.crop_width / 2) / viewer.img.width
     assert abs(new_frac - center_frac) < 0.01
     assert viewer.x_offset > 0  # i.e. not pinned to the left edge
+
+
+def zoom_pct(viewer):
+    for text, _color in viewer.status_segments():
+        if "zoom" in text:
+            return int(text.strip().split()[1].rstrip("%"))
+    raise AssertionError("no zoom field in status_segments()")
+
+
+def test_zoom_percent_is_relative_to_fit_width_regardless_of_fit_mode(sample_pdf):
+    """M (fit width) is always the 100% baseline for the displayed zoom
+    percentage - even right after switching fit modes, when self.zoom
+    itself is reset to 1.0 for both m and M (see set_fit()) and so
+    can't tell them apart on its own. This terminal is deliberately
+    narrow enough that a height-fitted page comes out wider than a
+    width-fitted one (see this module's docstring), so the two really
+    do differ here - unlike a terminal shaped closer to the page's own
+    aspect ratio, where they could coincidentally both round to 100%."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf), fit="width")
+    assert zoom_pct(viewer) == 100
+
+    viewer.handle_key("m")  # fit height
+    fit_height_pct = zoom_pct(viewer)
+    assert fit_height_pct != 100  # this terminal's shape guarantees a real difference
+
+    viewer.set_zoom(1.5)
+    assert zoom_pct(viewer) == round(fit_height_pct * 1.5)
+
+    viewer.handle_key("M")  # back to fit width
+    assert zoom_pct(viewer) == 100

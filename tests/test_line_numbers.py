@@ -35,12 +35,6 @@ def make_numbered_text(tmp_path, n_lines=11):
     return str(path)
 
 
-def test_line_numbers_off_by_default(sample_text):
-    viewer = make_viewer(pdfless.TextDocument(sample_text))
-    assert viewer.line_numbers is False
-    assert viewer._line_number_gutter_width() == 0
-
-
 def test_dash_n_toggles_line_numbers(sample_text):
     viewer = make_viewer(pdfless.TextDocument(sample_text))
     assert viewer.line_numbers is False

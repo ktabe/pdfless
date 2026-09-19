@@ -139,11 +139,3 @@ def test_capability_matrix_matches_expectations(
     )
 
 
-@requires_office_support
-def test_rtf_office_document_capabilities_match_office_document(sample_rtf, tmp_path):
-    rtf = classify(sample_rtf, tmp_path)
-    assert (rtf.supports_text_mode(), rtf.supports_search(), rtf.text_mode_is_paginated()) == (
-        True, False, False,
-    )
-
-

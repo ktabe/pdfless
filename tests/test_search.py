@@ -40,23 +40,36 @@ def make_viewer(handler):
 
 
 @requires_office_support
-def test_office_document_search_only_works_in_text_mode(sample_docx):
+def test_docx_search_uses_pdf_bbox_index_in_both_modes(sample_docx):
+    """Word now renders via a real PDF (soffice, or Chrome's
+    --print-to-pdf as a fallback - see OfficeDocument._pdf_delegate,
+    _try_soffice_pages()), so - like a native PdfDocument (see
+    test_pdf_search_uses_bbox_index_in_both_modes below) -
+    doc_handler.supports_search() is already True before ever entering
+    text mode, and search uses the real per-page/bbox index
+    (build_search_index()/find_search_matches()) in both image and
+    text mode, rather than the line-based text_lines search a
+    non-PDF-backed Office variant (Excel/PowerPoint/etc.) falls back
+    to (see test_image_document_never_supports_search for that
+    gating condition's other branch)."""
     viewer = make_viewer(pdfless.OfficeDocument(sample_docx))
     assert isinstance(viewer.doc_handler, pdfless.OfficeDocument)
+    assert viewer.doc_handler._pdf_delegate is not None
+    assert viewer.doc_handler.supports_search() is True
 
-    # Not yet in text mode: doc_handler.supports_search() alone
-    # (OfficeDocument's) is False, matching the '/' key handler's
-    # gating condition (`viewer.text_mode or doc_handler.supports_search()`).
-    assert viewer.doc_handler.supports_search() is False
+    viewer.start_search("Hello")
+    assert viewer.search_matches
+    assert len(viewer.search_matches[0]) == 5  # (page, xmin, ymin, xmax, ymax)
+
+    viewer.start_search("ThisTextDoesNotAppearAnywhere")
+    assert viewer.search_matches == []
 
     assert viewer.enter_text_mode() is True
     assert viewer.text_mode is True
 
     viewer.start_search("Hello")
-    assert viewer.search_matches == [(0, 0, 5)]
-
-    viewer.start_search("ThisTextDoesNotAppearAnywhere")
-    assert viewer.search_matches == []
+    assert viewer.search_matches
+    assert len(viewer.search_matches[0]) == 5
 
 
 def test_plain_text_file_search_works(sample_text):

@@ -87,9 +87,32 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
   pictures embedded in a Quick Look preview file (Word/Excel/
   PowerPoint/etc.); not required at all if you only ever open plain
   image files.
-- macOS + a local Chrome/Chromium install - only needed for opening
-  Office/Keynote/Pages/etc. files via Quick Look; a file like that is
-  skipped with a warning if either is missing.
+- macOS + a local Chrome/Chromium install - needed for opening
+  Office/Keynote/Pages/etc. files via Quick Look, and also (Chrome
+  alone, no Quick Look involved) for opening an SVG file directly; a
+  file like that is skipped with a warning if the dependency it needs
+  is missing.
+- [LibreOffice](https://www.libreoffice.org) (`soffice`) - optional;
+  when installed, Word (`.doc`/`.docx`/`.docm`), RTF, and PowerPoint
+  (`.ppt`/`.pptx`/`.pptm`) files render through it instead of the
+  Quick Look + Chrome pipeline, for real page breaks and
+  higher-fidelity output (see the Office/iWork table below). Falls
+  back to Quick Look + Chrome when it isn't installed. Deliberately
+  not used for Excel (`.xls`/`.xlsx`/`.xlsm`): soffice paginates a
+  spreadsheet by its print area/page setup, which for a workbook
+  never tuned for printing can fragment one sheet across several
+  oddly-cut pages, unlike Quick Look's one-page-per-sheet view.
+  Required (with no fallback) for OpenDocument (`.odt`/`.odp`/`.odg`/
+  `.ods`), Visio (`.vsd`/`.vsdx`), and WMF, since macOS has no Quick
+  Look generator for any of these at all.
+- For Markdown (`.md`/`.markdown`): the `markdown` and `weasyprint`
+  Python packages, both declared as dependencies below so `uv`
+  installs them automatically - but `weasyprint` also needs
+  Cairo/Pango/GLib/HarfBuzz as system libraries, which `pip`/`uv`
+  can't install by themselves (e.g. `brew install cairo pango
+  gdk-pixbuf libffi` on macOS). Without a working `weasyprint`, a
+  Markdown file falls back to being shown as its own raw source, the
+  same as any other optional renderer here.
 - Python 3.9+
 - [uv](https://docs.astral.sh/uv/)
 
@@ -104,6 +127,32 @@ brew install poppler
 
 # Ubuntu/Debian (apt)
 sudo apt install poppler-utils
+```
+
+Optionally, install [LibreOffice](https://www.libreoffice.org) for
+higher-fidelity Word/RTF/PowerPoint rendering, and for OpenDocument/
+Visio/WMF support, which needs it (see Requirements above):
+
+```sh
+# macOS (Homebrew)
+brew install --cask libreoffice
+
+# Ubuntu/Debian (apt)
+sudo apt install libreoffice
+```
+
+Optionally, for rendered Markdown previews, install the system
+libraries [WeasyPrint](https://doc.courtbouillon.org/weasyprint/) needs
+(Cairo/Pango/GLib/GDK-Pixbuf) - the `markdown`/`weasyprint` Python
+packages themselves are already declared as dependencies below, so `uv`
+installs those automatically:
+
+```sh
+# macOS (Homebrew)
+brew install cairo pango gdk-pixbuf libffi
+
+# Ubuntu/Debian (apt)
+sudo apt install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0
 ```
 
 `pdfless.py` is a self-contained [PEP 723](https://peps.python.org/pep-0723/)
@@ -137,7 +186,7 @@ Without `uv`, install its Python dependencies yourself and run it with
 `python3` directly:
 
 ```sh
-pip install pillow pypdf
+pip install pillow pypdf markdown weasyprint
 python3 pdfless.py some.pdf
 ```
 
@@ -161,9 +210,11 @@ options:
   -d, --debug           print some debug information to stderr
   -s, --rendering-scale N
                         device-pixel-ratio to render Quick Look preview files
-                        (Word/Excel/PowerPoint/etc., macOS only) at - higher
-                        looks sharper when zoomed in but is slower to render
-                        (default: 1)
+                        (Excel/PowerPoint/Keynote/Pages/etc., macOS only) at -
+                        higher looks sharper when zoomed in but is slower to
+                        render (default: 1). No effect on Word/RTF, which
+                        render to a real PDF instead and are always sharp
+                        regardless of zoom
   -c, --continuous      for a Quick Look preview file (macOS only), force
                         continuous scrolling instead of paginating
   -k, --keep            leave the last page on screen when quitting (q or ^C)
@@ -221,26 +272,105 @@ see the table below. A format that can't be paged is shown as one long
 scrollable image instead (the same as a plain image file, or as
 `-c`/`--continuous` forces for any of these).
 
+Word and RTF render to a real PDF under the hood, so - like a normal
+PDF, and unlike the other formats below - they stay sharp at any zoom
+level, and a hyperlink in the original document is clickable, the same
+as a real PDF's. When [LibreOffice](https://www.libreoffice.org)
+(`soffice`) is installed, it's used to produce that PDF, natively and
+with higher fidelity (real page breaks matching the original document,
+correctly rendered embedded pictures of any format); otherwise it
+falls back to rendering the Quick Look preview through headless
+Chrome's `--print-to-pdf`, with paging coming from Chrome's own print
+engine breaking real content flow across pages, rather than a
+screen-mode page-boundary marker (which Word's Quick Look preview
+doesn't have in the first place). `-c`/`--continuous` still collapses
+any of these back to a single scrollable page, e.g. for a document
+whose real page breaks land somewhere unhelpful.
+
+PowerPoint gets the same soffice-rendered-PDF treatment when
+`soffice` is installed (one slide per PDF page, matching the existing
+one-page-per-slide paging exactly), gaining the same crisp-zoom/
+clickable-hyperlink treatment, plus working text mode and real
+search - neither of which Quick Look's own screenshot rendering can
+offer at all. Without `soffice`, PowerPoint falls back to the
+screenshot-based rendering it always used before, unlike Word/RTF
+(which always end up as a real PDF either way, just via Chrome
+instead). Excel is deliberately excluded from this - see Requirements
+above. Macro-enabled Word/PowerPoint (`.docm`/`.pptm`) are treated
+exactly like `.docx`/`.pptx` throughout, since macOS's Quick Look
+generator doesn't distinguish them.
+
+A second group of formats - OpenDocument (`.odt`/`.odp`/`.odg`/
+`.ods`), Visio (`.vsd`/`.vsdx`), and WMF - has no Quick Look generator
+on macOS at all (confirmed by hand: qlmanage either crashes outright
+or produces no preview whatsoever for any of these), so they're
+previewable only when `soffice` is installed, with no qlmanage-based
+fallback to speak of; `-c`/`--continuous` has no effect on them
+either, since soffice's own real pagination can't be collapsed back
+into one page. `.ods` carries the same print-area/page-setup
+pagination caveat Excel has (see Requirements above) - but unlike
+Excel there's no working alternative, so it's supported anyway rather
+than left unsupported. `.vsdx` specifically hasn't been verified by
+hand (no sample was available), though LibreOffice's Visio import
+handles `.vsd`/`.vsdx` through the same code.
+
+SVG is the one exception that needs neither Quick Look nor `soffice`:
+it renders via a real PDF produced by headless Chrome directly (which
+`pdfless` already requires for everything else above), embedding the
+SVG as an `<img>` and printing that to PDF - confirmed by hand that
+this keeps the SVG's vector content as real vector PDF content, not a
+flattened bitmap, so it stays sharp at any zoom like Word's PDF does.
+The one limitation this approach has: a hyperlink inside the SVG
+itself can't be clickable, since an `<img>` always strips
+interactivity. Without a local Chrome, an SVG falls back to being
+shown as its own raw XML source instead (the same as before this
+feature existed).
+
+Markdown (`.md`/`.markdown`) is rendered to a real PDF too, but
+through neither Quick Look, Chrome, nor `soffice` - the `markdown`
+and `weasyprint` Python libraries (see Requirements above) convert it
+to HTML and then to a real PDF directly, dramatically faster than any
+browser/office-suite round trip (confirmed by hand: comfortably under
+a second, against a browser's own ~1-2s process startup alone) since
+WeasyPrint has a real CSS pagination engine of its own - no measuring
+step needed the way SVG/Word's Chrome path requires. A plain link
+survives as a real, clickable PDF link the same way. Without those
+libraries (or the system libraries WeasyPrint itself needs), a
+Markdown file falls back to being shown as its own raw source instead.
+
 | Format | Extensions | Paging | Text mode | Notes |
 | --- | --- | --- | --- | --- |
-| Word | `.doc`, `.docx` | Always continuous | Yes | No page-boundary marker in Word's Quick Look preview |
-| Excel | `.xls`, `.xlsx` | One page per sheet | No | |
-| PowerPoint | `.ppt`, `.pptx` | One page per slide | No | The most reliably paginated of any format here |
-| RTF | `.rtf` | Always continuous | Yes | Converted to `.docx` via macOS's own `textutil` first (Quick Look has no HTML preview of its own for RTF), then rendered the same way as Word |
-| Pages | `.pages` | Always continuous | No | Same limitation as Word - no page-boundary marker |
+| Word | `.doc`, `.docx`, `.docm` | Real page breaks | Yes | Renders to a PDF (see above) - via `soffice` when installed, else Chrome's `--print-to-pdf` |
+| Excel | `.xls`, `.xlsx`, `.xlsm` | One page per sheet | No | |
+| PowerPoint | `.ppt`, `.pptx`, `.pptm` | One page per slide | With `soffice` | With `soffice` installed, renders to a real PDF (see above); otherwise the original screenshot-based rendering, with no extractable text |
+| RTF | `.rtf` | Real page breaks with `soffice`, otherwise always continuous | Yes | With `soffice` installed, rendered natively (real page breaks) the same as Word; otherwise converted to `.docx` via macOS's own `textutil` first (Quick Look has no HTML preview of its own for RTF), then rendered the same way as Word but always as one continuous page, since a converted RTF's page-height metadata doesn't correspond to anything in the original file |
+| Pages | `.pages` | Always continuous | No | No page-boundary marker in Pages' Quick Look preview |
 | Numbers | `.numbers` | Only the first sheet is shown | No | Numbers' Quick Look tab strip is marked up differently from Excel's and isn't recognized yet - a known gap, not a deliberate design choice |
 | Keynote | `.key` | Always continuous | No | Unlike PowerPoint, Keynote's Quick Look preview exposes no slide-boundary marker at all - a known gap |
+| OpenDocument Text | `.odt` | Real page breaks | Yes | Needs `soffice` - no Quick Look generator exists for this at all |
+| OpenDocument Presentation | `.odp` | One page per slide | Yes | Needs `soffice` - same as `.odt` |
+| OpenDocument Drawing | `.odg` | One page per Draw page | Yes | Needs `soffice` - same as `.odt` |
+| OpenDocument Spreadsheet | `.ods` | Pages follow print layout | Yes | Needs `soffice`; carries the same print-area pagination caveat as Excel (see above), but unlike Excel has no alternative |
+| Visio | `.vsd`, `.vsdx` | One page per Visio page | Yes | Needs `soffice` - no Quick Look generator exists for this at all; `.vsdx` unverified by hand |
+| WMF | `.wmf` | Single page | Yes | Needs `soffice` - Quick Look can't preview it and no browser can decode it either |
+| SVG | `.svg` | Single page | Yes | Renders via Chrome directly (see above), not `soffice` or Quick Look; falls back to raw XML source without a local Chrome |
+| Markdown | `.md`, `.markdown` | Real pagination | Yes | Renders via `markdown` + `weasyprint` (see above), not Chrome, `soffice`, or Quick Look; falls back to raw Markdown source without those libraries |
 
-Text mode (`t`) comes from macOS's own `textutil`, which only
-understands Word-family documents (`.doc`/`.docx`/`.rtf`) - it has
-nothing to say about a spreadsheet, slide deck, or Apple's own iWork
-bundle formats (Pages/Numbers/Keynote), so `t` reports no text there
-even though the image view still works.
+Text mode (`t`) comes from macOS's own `textutil` for a Word-family
+document without a real PDF behind it (`.doc`/`.docx`/`.docm`/`.rtf`)
+- it has nothing to say about a spreadsheet, slide deck, or Apple's
+own iWork bundle formats (Pages/Numbers/Keynote), so `t` reports no
+text there even though the image view still works. Any format backed
+by a real PDF (see above) instead gets its text straight from that
+PDF, page by page.
 
-A file in any of these formats is skipped with a warning if `qlmanage`
-or a local Chrome/Chromium isn't available. `-s`/`--rendering-scale`
-controls how sharp the rendered pages look when zoomed in; see
-[Usage](#usage) for both options.
+A file needing Quick Look (most formats above) is skipped with a
+warning if `qlmanage` or a local Chrome/Chromium isn't available. A
+file needing only `soffice` (OpenDocument/Visio/WMF) or only Chrome
+(SVG) is skipped only if that one dependency is missing.
+`-s`/`--rendering-scale` controls how sharp the rendered pages look
+when zoomed in for the formats that don't render to a real PDF (see
+above); see [Usage](#usage) for both options.
 
 ## Keys
 
@@ -273,10 +403,14 @@ Zoom and pan:
 | `K` / `U` / `Shift-Up` | jump to top of the current page (same as `g`) |
 | `J` / `D` / `Shift-Down` | jump to bottom of the current page (same as `G`) |
 
-Search always works for PDFs and plain text files; for a Quick Look
-preview file (Word/Excel/PowerPoint/etc.) only once switched into text
-mode with `t`, since there's no way to search its rendered page image
-directly; not available at all for a plain image. It's a
+Search always works for PDFs and plain text files, and for a Word/
+RTF/PowerPoint document rendered via a real PDF (see Office Document
+Support below) - directly in image mode, the same as a native PDF,
+without needing `t` first. For any other Quick Look preview file
+(Excel, or Word/RTF/PowerPoint without a real PDF available) it only
+works once switched into text mode with `t`, since there's no way to
+search its rendered page image directly; not available at all for a
+plain image. It's a
 case-insensitive [Python regex](https://docs.python.org/3/library/re.html)
 against the extracted/file text, across the whole document (not just
 the current page) - falling back to a literal substring match if the
@@ -298,7 +432,7 @@ Misc:
 | click / drag | (page image, not text mode) on the scrollbar, jump to the position clicked - and keep following the pointer while you drag; otherwise open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
 | mouse wheel | scroll up / down - in the page image, two lines at a time (`--wheel-scroll-step` to change that); in text mode, one line at a time |
 | `[` / `]` | back / forward, through the positions internal links have jumped from |
-| `t` | toggle plain-text view - the page's extracted text for a PDF, or the whole document's for a Word-family file (`.doc`/`.docx`/`.rtf`/...); a no-op for an image, spreadsheet, or slide deck, which have no text to extract |
+| `t` | toggle plain-text view - the current page's extracted text for a PDF, or a Word/RTF/PowerPoint file rendered via a real PDF (see Office Document Support); otherwise the whole document's text for a Word-family file (`.doc`/`.docx`/`.rtf`), via macOS's `textutil`; a no-op for an image, spreadsheet, or a slide deck with no real PDF available, which have no text to extract |
 | `B` | (text mode) toggle a border around the page's edges - on by default (`--no-border`/`-B` to start with it off); a plain text file starts with it off regardless; no border while wrapped, regardless of `B` (`-S` to unwrap first) |
 | `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped) |
 | `E` | (text mode) toggle marking a real end-of-line (↵) - on by default (`-E`/`--no-eol-mark` to start without it) |
@@ -330,7 +464,7 @@ Misc:
 
 ```sh
 cd tests
-uv run --with pytest --with pytest-timeout --with pillow --with pypdf python -m pytest
+uv run --with pytest --with pytest-timeout --with pillow --with pypdf --with markdown --with weasyprint python -m pytest
 ```
 
 Most of the suite is fast (file-classification/caching unit tests); a

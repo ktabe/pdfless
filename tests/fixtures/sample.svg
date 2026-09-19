@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="220">
+  <rect x="10" y="10" width="180" height="80" fill="lightblue" stroke="black"/>
+  <text x="20" y="55" font-size="16">サンプル図形</text>
+  <circle cx="300" cy="60" r="45" fill="lightgreen" stroke="black"/>
+  <text x="255" y="65" font-size="14">日本語テキスト</text>
+  <text x="20" y="140" font-size="14">This SVG mixes English and 日本語 labels</text>
+  <text x="20" y="170" font-size="14">作成日: 2026年9月19日</text>
+</svg>

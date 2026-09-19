@@ -53,6 +53,16 @@ def sample_docx():
 
 
 @pytest.fixture
+def sample_twopage_rtf():
+    """A 2-page RTF file (an explicit \\page break between two
+    paragraphs) - unlike sample_rtf, real enough to confirm soffice's
+    native RTF pagination (see OfficeDocument._try_soffice_pages())
+    lands on the real page count, the same way sample_twopage_docx
+    does for Word."""
+    return os.path.join(FIXTURES_DIR, "sample_twopage.rtf")
+
+
+@pytest.fixture
 def sample_multisheet_xlsx():
     """A 3-sheet workbook (Alpha/Beta/Gamma), each with distinct
     content in A1 - built via openpyxl (see the fixture-generation
@@ -85,6 +95,32 @@ def sample_twopage_docx():
 
 
 @pytest.fixture
+def sample_docx_with_link():
+    """A Word document with one real external hyperlink ("click me" ->
+    https://example.com/hello) - built via python-docx (its w:hyperlink
+    XML written by hand, since python-docx has no built-in helper for
+    it). Used to confirm a Word document's own hyperlinks survive
+    Chrome's --print-to-pdf as real, clickable PDF link annotations
+    (see OfficeDocument.get_page_image()'s PdfDocument delegate)."""
+    return os.path.join(FIXTURES_DIR, "sample_with_link.docx")
+
+
+@pytest.fixture
+def sample_docx_with_internal_link():
+    """A Word document with an internal hyperlink ("jump to target") to
+    a w:bookmark ~80 filler paragraphs further down - built via
+    python-docx (bookmarkStart/bookmarkEnd and an anchor-based
+    w:hyperlink, both written by hand). Since FlowingText always
+    renders as a single continuous page (see its class docstring), a
+    genuine same-document jump like this resolves to the *same* page
+    with a different scroll target, not a different page - confirmed
+    by hand that it survives Chrome's --print-to-pdf as a real PDF
+    /GoTo link annotation pypdf resolves to {"kind": "page", "page": 1,
+    "top_pt": ...}, the same as a real PDF's own internal links."""
+    return os.path.join(FIXTURES_DIR, "sample_with_internal_link.docx")
+
+
+@pytest.fixture
 def sample_twopage_doc():
     """Same document as sample_twopage_docx, converted to the legacy
     binary format via `soffice --headless --convert-to doc`."""
@@ -100,8 +136,8 @@ def sample_twopage_pages():
 
 @pytest.fixture
 def sample_twoslide_pptx():
-    """A 2-slide PowerPoint deck ("Slide one/two content" text boxes)
-    - built via python-pptx."""
+    """A 2-slide PowerPoint deck (a title plus lorem-ipsum/Japanese
+    bullet text on each slide) - built via python-pptx."""
     return os.path.join(FIXTURES_DIR, "sample_twoslide.pptx")
 
 
@@ -119,6 +155,92 @@ def sample_twoslide_key():
     return os.path.join(FIXTURES_DIR, "sample_twoslide.key")
 
 
+@pytest.fixture
+def sample_twopage_docm():
+    """Same 2-page content as sample_twopage_docx (2 paragraphs of
+    mixed Japanese/English body text, an explicit page break between
+    them) but built via python-docx into a plain .docx first, then
+    converted to the macro-enabled format with `soffice --convert-to
+    docm` - confirmed by hand that macOS's Office.qlgenerator already
+    classifies a .docm the same way it does a .docx (Preview.html and
+    all), so this only needs OfficeDocument._SOFFICE_EXTENSIONS to
+    also include it."""
+    return os.path.join(FIXTURES_DIR, "sample_twopage.docm")
+
+
+@pytest.fixture
+def sample_twopage_odt():
+    """Same source content as sample_twopage_docm, converted to
+    OpenDocument Text instead (`soffice --convert-to odt`) - unlike
+    .docm, macOS Quick Look has no generator for .odt at all (confirmed
+    by hand: qlmanage crashes outright), so this only classifies at
+    all via SofficeOnlyDocument, not OfficeDocument."""
+    return os.path.join(FIXTURES_DIR, "sample_twopage.odt")
+
+
+@pytest.fixture
+def sample_twoslide_pptm():
+    """Same 2-slide content as sample_twoslide_pptx (a title + a couple
+    of mixed Japanese/English bullet lines per slide) but converted to
+    the macro-enabled format with `soffice --convert-to pptm` -
+    confirmed by hand that Quick Look already classifies a .pptm the
+    same way it does a .pptx."""
+    return os.path.join(FIXTURES_DIR, "sample_twoslide.pptm")
+
+
+@pytest.fixture
+def sample_twoslide_odp():
+    """Same source content as sample_twoslide_pptm, converted to
+    OpenDocument Presentation instead (`soffice --convert-to odp`) -
+    like .odt, Quick Look has no generator for .odp at all, so this
+    only classifies via SofficeOnlyDocument."""
+    return os.path.join(FIXTURES_DIR, "sample_twoslide.odp")
+
+
+@pytest.fixture
+def sample_multisheet_ods():
+    """Same 3-sheet structure as sample_multisheet_xlsx (each sheet
+    has a Japanese header row plus a few rows of mixed Japanese/English
+    data) but converted to OpenDocument Spreadsheet (`soffice
+    --convert-to ods`) - confirmed by hand this simple workbook still
+    comes out as exactly 3 soffice PDF pages (one per sheet); a
+    real-world spreadsheet with print areas/page breaks configured can
+    fragment a single sheet across several pages instead (see
+    SofficeOnlyDocument's docstring), which this fixture is
+    deliberately too simple to exercise."""
+    return os.path.join(FIXTURES_DIR, "sample_multisheet.ods")
+
+
+@pytest.fixture
+def sample_odg():
+    """A small OpenDocument Drawing (a rectangle and a circle, each
+    with a Japanese text label, plus two lines of standalone text) -
+    built as an SVG first and converted with `soffice --convert-to
+    odg`, since ODG has no convenient Python-library writer the way
+    docx/pptx/xlsx do."""
+    return os.path.join(FIXTURES_DIR, "sample.odg")
+
+
+@pytest.fixture
+def sample_wmf():
+    """Same shapes/labels as sample_odg, converted to a WMF vector
+    metafile instead (`soffice --convert-to wmf`) - confirmed by hand
+    that Quick Look only ever produces a Preview.url dead end for WMF
+    (see SvgDocument's docstring for the same issue with SVG), so this
+    only renders at all via SofficeOnlyDocument."""
+    return os.path.join(FIXTURES_DIR, "sample.wmf")
+
+
+@pytest.fixture
+def sample_svg():
+    """The hand-written source SVG sample_odg/sample_wmf were both
+    converted from - a rectangle and a circle with Japanese text
+    labels, plus two standalone lines of mixed Japanese/English text -
+    used directly (not converted) to test SvgDocument's own
+    Chrome-based rendering."""
+    return os.path.join(FIXTURES_DIR, "sample.svg")
+
+
 def office_support_available():
     return (
         shutil.which("qlmanage") is not None
@@ -130,6 +252,28 @@ requires_office_support = pytest.mark.skipif(
     not office_support_available(),
     reason="needs macOS Quick Look (qlmanage) + a local Chrome/Chromium",
 )
+
+
+requires_soffice = pytest.mark.skipif(
+    pdfless.find_soffice() is None,
+    reason="needs a local LibreOffice (soffice) install",
+)
+
+
+requires_markdown_rendering = pytest.mark.skipif(
+    not pdfless._markdown_rendering_available(),
+    reason="needs the markdown and weasyprint Python libraries (and weasyprint's own Cairo/Pango system libraries)",
+)
+
+
+@pytest.fixture
+def sample_md():
+    """A Markdown file with a title, lorem-ipsum/Japanese body text,
+    a bulleted list, a fenced code block, a blockquote, and a link -
+    long enough (see the "追加セクション" padding sections) to span 2
+    real WeasyPrint-paginated pages, so MarkdownDocument's pagination
+    (not just single-page rendering) gets exercised."""
+    return os.path.join(FIXTURES_DIR, "sample.md")
 
 
 class PtySession:

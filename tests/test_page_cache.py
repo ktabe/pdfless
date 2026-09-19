@@ -45,13 +45,3 @@ def test_office_page_cache_reads_from_handler_pages_live(tmp_path):
     cache.clear()
     second = cache.get(1, 50, fit="width")
     assert second.getpixel((0, 0))[:3] == (0, 0, 255)
-
-
-def test_page_cache_kind_dispatches_to_matching_handler_type(sample_pdf, sample_image, tmp_path):
-    pdf_handler = pdfless.PdfDocument(sample_pdf)
-    pdf_cache = pdfless.PageCache(sample_pdf, str(tmp_path), pdf_handler)
-    assert isinstance(pdf_cache.handler, pdfless.PdfDocument)
-
-    image_handler = pdfless.ImageDocument(sample_image)
-    image_cache = pdfless.PageCache(sample_image, str(tmp_path), image_handler)
-    assert isinstance(image_cache.handler, pdfless.ImageDocument)

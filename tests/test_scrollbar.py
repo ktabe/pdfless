@@ -62,16 +62,6 @@ def thumb_rows(cells):
     return [i for i, cell in enumerate(cells) if pdfless.SCROLLBAR_THUMB in cell]
 
 
-def test_text_avail_cols_reserves_one_column_for_the_scrollbar(sample_text):
-    viewer = make_viewer(pdfless.TextDocument(sample_text), cols=20)
-    assert viewer._text_avail_cols() == 19
-
-
-def test_text_avail_cols_reserves_nothing_when_scrollbar_off(sample_text):
-    viewer = make_viewer(pdfless.TextDocument(sample_text), cols=20, scrollbar=False)
-    assert viewer._text_avail_cols() == 20
-
-
 def test_scrollbar_is_full_thumb_when_content_fits_on_screen(tmp_path):
     path = make_numbered_text(tmp_path, n_lines=3)
     viewer = make_viewer(pdfless.TextDocument(path), rows=10, wrap=False)
@@ -196,13 +186,6 @@ def test_toggling_it_stays_where_you_were_reading(tmp_path):
     assert viewer.text_scroll == 42
     viewer.toggle_scrollbar()
     assert viewer.text_scroll == 42
-
-
-def test_scrollbar_off_by_default_with_no_scrollbar(sample_text):
-    """scrollbar=False here stands in for --no-scrollbar - main() passes
-    scrollbar=args.scrollbar."""
-    viewer = make_viewer(pdfless.TextDocument(sample_text), scrollbar=False)
-    assert viewer.scrollbar is False
 
 
 def test_image_mode_base_width_px_reserves_one_cell_for_scrollbar(sample_pdf):

@@ -4,6 +4,8 @@
 # dependencies = [
 #     "pillow",
 #     "pypdf",
+#     "markdown",
+#     "weasyprint",
 # ]
 # ///
 """pdfless - a less(1)-like full-screen PDF pager for terminals that
@@ -24,6 +26,7 @@ Look generators can preview - Word, Excel, PowerPoint, Keynote, Pages,
 import argparse
 import base64
 import concurrent.futures
+import contextlib
 import fcntl
 import hashlib
 import html
@@ -566,6 +569,26 @@ def find_chrome():
     return None
 
 
+SOFFICE_CANDIDATES = (
+    "/opt/homebrew/bin/soffice",
+    "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+)
+
+
+def find_soffice():
+    """A local LibreOffice `soffice` binary, for converting Word/RTF
+    documents to a real PDF with higher fidelity than the qlmanage +
+    Chrome --print-to-pdf pipeline (real page breaks, correctly
+    rendered embedded pictures of any format, no reliance on Quick
+    Look at all) - or None if it isn't installed. Optional: callers
+    (see OfficeDocument._try_soffice_pages()) always fall back to the
+    qlmanage/Chrome pipeline when this returns None."""
+    for path in SOFFICE_CANDIDATES:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("soffice")
+
+
 
 
 _IMG_SRC_RE = re.compile(r'(<img\b[^>]*\bsrc=")([^"]+)(")', re.IGNORECASE)
@@ -589,16 +612,17 @@ _TAB_VIEW_ITEM_RE = re.compile(
 _TAG_RE = re.compile(r'<[^>]+>')
 
 
-# A hard ceiling on either dimension of a PDF-embedded picture, once
-# rasterized - regardless of what DPI the math below otherwise settles
-# on. A Numbers/Pages/Keynote sheet can embed its *entire* content (a
-# whole spreadsheet, potentially thousands of points on a side) as one
-# such "picture" (see _rasterize_pdf_img_sources()), and poppler's
-# pdftocairo (see there for why it's used instead of pdftoppm) has its
-# own ceiling on the cairo surface size it'll produce - past that, it
-# fails loudly (a non-zero exit, caught below) rather than silently
-# writing something degenerate. This cap keeps the request comfortably
-# clear of that ceiling.
+# A hard ceiling on either dimension of a broken embedded picture
+# (PDF or TIFF), once rasterized/re-encoded - regardless of what DPI
+# the math below otherwise settles on for a PDF one. A Numbers/Pages/
+# Keynote sheet can embed its *entire* content (a whole spreadsheet,
+# potentially thousands of points on a side) as one such "picture"
+# (see _rasterize_broken_img_sources()), and poppler's pdftocairo (see
+# there for why it's used instead of pdftoppm) has its own ceiling on
+# the cairo surface size it'll produce - past that, it fails loudly (a
+# non-zero exit, caught below) rather than silently writing something
+# degenerate. This cap keeps the request comfortably clear of that
+# ceiling either way.
 OFFICE_EMBEDDED_IMG_MAX_PX = 6000
 
 
@@ -617,43 +641,244 @@ def _pdf_page_size_pt_safe(pdf_path):
     return (float(m.group(1)), float(m.group(2))) if m else None
 
 
-def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
+def _pdf_page_count_safe(pdf_path):
+    """Like PdfDocument._pdf_page_count(), but tolerant of failure
+    (returns None rather than die()ing the whole program) - for reading
+    back how many pages Chrome's --print-to-pdf produced (see
+    FlowingText.build_pages()), where a bad reading just means falling
+    back to the screenshot-based path rather than aborting entirely."""
+    try:
+        out = subprocess.run(
+            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
+    return int(m.group(1)) if m else None
+
+
+def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
+    """Convert `path` (a Word/RTF/PowerPoint document - see
+    OfficeDocument._SOFFICE_EXTENSIONS) to a real PDF via LibreOffice's
+    `soffice --convert-to pdf`, natively - no Quick Look/Chrome
+    involved at all - returning the output PDF's path, or None on any
+    failure (timeout, non-zero exit, or no output file), so callers
+    (see OfficeDocument._try_soffice_pages()) can always fall back to
+    the qlmanage/Chrome pipeline.
+
+    Deliberately does NOT pass --headless: confirmed by hand that
+    --headless breaks CJK (Japanese) font rendering entirely (text
+    comes out blank, though the PDF's own text layer is fine - a pure
+    glyph-resolution bug), while running without it renders correctly,
+    including over SSH.
+
+    -env:UserInstallation points at a profile directory scoped to this
+    `tmpdir` (unique per render), so concurrent soffice invocations
+    (e.g. two files opened around the same time) don't collide over a
+    shared user profile lock."""
+    profile_dir = os.path.join(tmpdir, "soffice-profile")
+    try:
+        subprocess.run(
+            [
+                soffice,
+                f"-env:UserInstallation=file://{profile_dir}",
+                "--convert-to", "pdf",
+                "--outdir", tmpdir,
+                path,
+            ],
+            capture_output=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    base = os.path.splitext(os.path.basename(path))[0]
+    out_pdf = os.path.join(tmpdir, f"{base}.pdf")
+    return out_pdf if os.path.isfile(out_pdf) else None
+
+
+# Minimal styling for MarkdownDocument's rendered pages - just enough
+# that headings/code/quotes are visually distinct, deliberately not
+# trying to imitate any particular Markdown renderer's house style.
+# No @font-face/font-family override: left to whatever WeasyPrint
+# picks as the system default, so CJK text (which needs a real CJK
+# font) renders using whatever's actually installed rather than a
+# Latin-only font silently dropping every Japanese glyph.
+MARKDOWN_CSS = """
+body { line-height: 1.5; padding: 2em; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.2; margin-top: 1em; }
+pre, code { font-family: monospace; background: #f0f0f0; }
+pre { padding: 0.6em; white-space: pre-wrap; }
+code { padding: 0.1em 0.3em; }
+pre code { padding: 0; background: none; }
+blockquote { border-left: 4px solid #ccc; margin-left: 0; padding-left: 1em; color: #555; }
+table { border-collapse: collapse; max-width: 100%; }
+th, td { border: 1px solid #ccc; padding: 0.3em 0.6em; }
+img { max-width: 100%; height: auto; }
+"""
+
+
+def _ensure_homebrew_lib_path_for_weasyprint():
+    """WeasyPrint (via cffi) dlopen()s Cairo/Pango/GLib by their bare
+    library names, relying on the dynamic linker's own default search
+    to find them. Confirmed by hand: that default search does NOT
+    include Homebrew's own lib directory when running under a
+    uv-managed standalone Python build (e.g. a free-threaded 3.14
+    install) - even with those exact libraries installed via Homebrew
+    - while the same import succeeds unmodified under a
+    Homebrew-installed Python on the same machine. Rather than
+    requiring every user hitting this to discover and set
+    DYLD_LIBRARY_PATH by hand (WeasyPrint's own macOS troubleshooting
+    docs suggest exactly that), add Homebrew's lib directory to
+    DYLD_FALLBACK_LIBRARY_PATH before the first import attempt -
+    confirmed by hand this alone is enough to fix the failing case.
+    A *fallback* path (rather than DYLD_LIBRARY_PATH, which is
+    consulted first) can't ever shadow a library some other search
+    step already finds correctly, so this is safe to always do.
+    macOS-only; a no-op everywhere else."""
+    if sys.platform != "darwin":
+        return
+    existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    parts = existing.split(":") if existing else []
+    for lib_dir in ("/opt/homebrew/lib", "/usr/local/lib"):
+        if os.path.isdir(lib_dir) and lib_dir not in parts:
+            parts.append(lib_dir)
+    if parts:
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(parts)
+
+
+def _markdown_rendering_available():
+    """Whether MarkdownDocument can even attempt to render at all -
+    both the `markdown` and `weasyprint` libraries import cleanly.
+    Cheap to call more than once: a successful import is cached by
+    Python itself (sys.modules), so only the first call actually pays
+    for it. See _render_markdown_pdf() for why this has to be a
+    runtime check rather than something assumed from the PEP723
+    dependency list.
+
+    Deliberately catches more than just ImportError: weasyprint's own
+    import chain reaches into cffi to dlopen() the actual Cairo/Pango/
+    GLib shared libraries, and a missing one there raises a plain
+    OSError, not an ImportError (confirmed by hand: "cannot load
+    library 'libgobject-2.0-0'" on a machine without those system
+    libraries installed) - anything going wrong at import time means
+    the same thing here (rendering isn't available), so it's all
+    caught the same way rather than letting a fairly common
+    installation gap crash the whole program on startup.
+
+    Also deliberately swallows whatever weasyprint prints along the
+    way: on that same missing-libraries path, it print()s its own
+    multi-line "could not import some external libraries" notice
+    before the OSError above even reaches here (confirmed by hand).
+    Since this whole function's job is to fail silently and let the
+    caller fall back to plain text, letting that notice through would
+    defeat the point - and pdfless spends most of its life with the
+    terminal in raw mode showing an alternate screen, where a stray
+    print from a library is a corrupted-looking screen, not just
+    unwanted noise."""
+    _ensure_homebrew_lib_path_for_weasyprint()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            import markdown  # noqa: F401
+            import weasyprint  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _render_markdown_pdf(path, out_pdf):
+    """Convert `path` (a Markdown file) to a real PDF via the
+    `markdown` (Markdown -> HTML) and `weasyprint` (HTML+CSS -> PDF)
+    libraries - no headless Chrome or LibreOffice involved at all, and
+    dramatically faster than either (confirmed by hand: a whole
+    conversion takes well under a second, against Chrome's own ~1-2s
+    process startup alone), since WeasyPrint has a real CSS
+    pagination engine of its own - no need for FlowingText/
+    SvgDocument's own "measure the content first, then set an exact
+    @page size" dance; a long document just comes out as however many
+    pages it naturally takes.
+
+    Both libraries are declared PEP723 dependencies (so `uv run`
+    always installs the pip packages), but weasyprint also needs
+    system-level Cairo/Pango/GLib libraries pip can't install by
+    itself - so the import happens lazily, here (via
+    _markdown_rendering_available()), rather than at module load time,
+    and any failure is treated the same as "not installed": returns
+    False, and the caller falls back to plain-text rendering, the
+    same graceful degradation soffice/Chrome already get when they're
+    missing.
+
+    Returns False on any failure (including a missing library) - never
+    raises, so this is always safe for a caller to attempt speculatively."""
+    if not _markdown_rendering_available():
+        return False
+    import markdown
+    from weasyprint import HTML
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except OSError:
+        return False
+    body = markdown.markdown(source, extensions=["extra", "sane_lists"])
+    html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{MARKDOWN_CSS}</style></head><body>{body}</body></html>'
+    # base_url lets a relative-path image reference in the source
+    # (e.g. "![alt](./diagram.png)") resolve against the Markdown
+    # file's own directory, the same as a browser would for a page
+    # loaded from there.
+    base_url = os.path.dirname(os.path.abspath(path)) + "/"
+    try:
+        HTML(string=html, base_url=base_url).write_pdf(out_pdf)
+    except Exception:
+        # WeasyPrint can raise a variety of its own exception types for
+        # a malformed document/CSS - none of them worth the whole
+        # program aborting over; the caller's error-placeholder
+        # fallback handles it the same as any other rendering failure.
+        return False
+    return os.path.exists(out_pdf)
+
+
+def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
     """A Quick Look Office/iWork preview can embed a picture as
-    `<img src="AttachmentN.pdf">` - the relevant generator apparently
-    assumes a renderer that can show a PDF inline as an image, the way
-    Safari/WebKit (Quick Look's own host) does; plain Chrome can't, and
-    just shows a broken-image icon at whatever size the <img> tag's
-    style gives it. Across every picture in a slide deck, that's often
-    enough bogus extra height to throw off later slides' measured
-    positions entirely (see _measure_slide_offsets()).
+    `<img src="AttachmentN.pdf">` or `<img src="AttachmentN.tiff">` -
+    formats the relevant generator apparently assumes a renderer that
+    can show inline as an image, the way Safari/WebKit (Quick Look's
+    own host) does; plain Chrome can't decode either one, and just
+    shows a broken-image icon at whatever size the <img> tag's style
+    gives it (confirmed by hand: a real Word document with a mix of
+    PNG and TIFF pictures showed the PNGs fine and the TIFFs broken,
+    scattered throughout - TIFF has no web-standard decode support at
+    all, unlike PDF, which at least fails the same way in every
+    browser other than Safari/WebKit). Across every picture in a slide
+    deck, that's often enough bogus extra height to throw off later
+    slides' measured positions entirely (see _measure_slide_offsets()).
 
     iWork.qlgenerator (Numbers/Pages/Keynote) additionally splits a
     multi-sheet/page document into one `<iframe src="AttachmentN.html">`
     per sheet rather than embedding everything directly in Preview.html
     the way Office.qlgenerator does - and it's each of *those* files
-    that actually embeds a `<img src="*.pdf">`, not Preview.html itself.
-    So this looks for that pattern recursively, through every local (not
-    http/data/...) iframe target, not just in `html_path` itself.
+    that actually embeds the broken `<img>`, not Preview.html itself.
+    So this looks for that pattern recursively, through every local
+    (not http/data/...) iframe target, not just in `html_path` itself.
 
-    Rewrites each PDF reference found anywhere in that tree to a PNG
-    rasterized from that PDF via poppler's pdftocairo (not pdftoppm -
-    see _convert() below for why), and rewrites each iframe reference
-    to point at its (recursively) patched target. Every patched file is
-    written alongside the original it came from (same directory,
-    different name) rather than elsewhere, so any *other* (non-PDF,
-    non-iframe) relative reference in it keeps resolving exactly as
-    before, untouched.
+    Rewrites each such reference found anywhere in that tree to a PNG -
+    rasterized from a PDF via poppler's pdftocairo (not pdftoppm - see
+    _convert() below for why), or straightforwardly re-encoded via
+    Pillow for a TIFF (already a raster image; no DPI to choose, unlike
+    a PDF) - and rewrites each iframe reference to point at its
+    (recursively) patched target. Every patched file is written
+    alongside the original it came from (same directory, different
+    name) rather than elsewhere, so any *other* (unrelated) relative
+    reference in it keeps resolving exactly as before, untouched.
 
     Returns the path to `html_path`'s own patched copy - or `html_path`
-    unchanged if nothing anywhere in the tree needed patching, or
-    pdftocairo isn't available. `on_progress`, if given, is called as
-    `on_progress(done, total)` after each PDF conversion finishes,
-    `total` counting every one found across the whole tree."""
+    unchanged if nothing anywhere in the tree needed patching.
+    `on_progress`, if given, is called as `on_progress(done, total)`
+    after each conversion finishes, `total` counting every one found
+    across the whole tree."""
     # Phase 1: walk html_path plus every local HTML file it (recursively)
     # embeds via <iframe src>, collecting each file's own content and
-    # its own <img src="*.pdf"> references.
+    # its own <img src="*.pdf"/"*.tiff"/"*.tif"> references.
     file_contents = {}  # path -> content
-    pdf_refs_by_file = {}  # path -> [ref, ...]
+    broken_refs_by_file = {}  # path -> [ref, ...]
     to_visit = [html_path]
     seen = set()
     while to_visit:
@@ -669,28 +894,29 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
             continue
         file_contents[path] = content
         base_dir = os.path.dirname(path)
-        # (ref, declared width, declared height) for every <img src=
-        # "*.pdf"> - the declared size (in CSS px, i.e. ~1:1 with
-        # points) is what lets _convert() below pick a sane DPI instead
-        # of a fixed one that can be wildly wrong for a huge embedded
-        # page. Deduplicated by ref, first occurrence winning, same as
-        # a plain set() would for the src-only info this replaced.
-        pdf_refs = {}
+        # (ref, declared width, declared height) for every broken <img
+        # src=...> - the declared size (in CSS px, i.e. ~1:1 with
+        # points) is what lets _convert() below pick a sane DPI for a
+        # PDF ref instead of a fixed one that can be wildly wrong for a
+        # huge embedded page (moot for a TIFF ref, already a fixed-size
+        # raster). Deduplicated by ref, first occurrence winning, same
+        # as a plain set() would for the src-only info this replaced.
+        broken_refs = {}
         for tag_m in _IMG_TAG_RE.finditer(content):
             tag = tag_m.group(0)
             src_m = _SRC_ATTR_RE.search(tag)
-            if not src_m or not src_m.group(1).lower().endswith(".pdf"):
+            if not src_m or not src_m.group(1).lower().endswith((".pdf", ".tiff", ".tif")):
                 continue
             ref = src_m.group(1)
-            if ref in pdf_refs:
+            if ref in broken_refs:
                 continue
             w_m, h_m = _WIDTH_ATTR_RE.search(tag), _HEIGHT_ATTR_RE.search(tag)
-            pdf_refs[ref] = (
+            broken_refs[ref] = (
                 float(w_m.group(1)) if w_m else None,
                 float(h_m.group(1)) if h_m else None,
             )
-        pdf_refs_by_file[path] = sorted(
-            (ref, w, h) for ref, (w, h) in pdf_refs.items()
+        broken_refs_by_file[path] = sorted(
+            (ref, w, h) for ref, (w, h) in broken_refs.items()
         )
         for m in _IFRAME_SRC_RE.finditer(content):
             src = m.group(2)
@@ -700,64 +926,79 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
             if src.lower().endswith((".html", ".htm")) and os.path.isfile(candidate):
                 to_visit.append(candidate)
 
-    if not shutil.which("pdftocairo"):
-        return html_path
     all_refs = [
         (path, ref, w, h)
-        for path, refs in pdf_refs_by_file.items()
+        for path, refs in broken_refs_by_file.items()
         for ref, w, h in refs
     ]
     if not all_refs:
         return html_path
+    have_pdftocairo = shutil.which("pdftocairo") is not None
 
     def _convert(item):
         path, ref, decl_w, decl_h = item
-        src_pdf = os.path.join(os.path.dirname(path), ref)
-        if not os.path.isfile(src_pdf):
+        src_path = os.path.join(os.path.dirname(path), ref)
+        if not os.path.isfile(src_path):
             return path, ref, None
-
-        # A fixed DPI (this used to always be 300) is wildly wrong for
-        # a picture that's actually an entire spreadsheet/page flattened
-        # into one PDF, sized in the thousands of points on a side - Numbers
-        # in particular does this for a sheet too big to fit its normal
-        # preview. Aim instead for roughly the size the <img> tag is
-        # actually going to display it at (that's in CSS px, and a PDF
-        # point is already ~1 CSS px at 96dpi, so this is close to
-        # 1:1 - not literally 1:1 only because a page's declared point
-        # size can differ slightly from its <img> tag's declared pixel
-        # size), falling back to the old 300 if either the page size or
-        # the declared display size isn't available - then hard-capped
-        # regardless (see OFFICE_EMBEDDED_IMG_MAX_PX).
-        dpi = 300.0
-        page_size = _pdf_page_size_pt_safe(src_pdf)
-        if page_size:
-            page_w_pt, page_h_pt = page_size
-            if decl_w and page_w_pt:
-                dpi = 72.0 * decl_w / page_w_pt
-            elif decl_h and page_h_pt:
-                dpi = 72.0 * decl_h / page_h_pt
-            if page_w_pt:
-                dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_w_pt)
-            if page_h_pt:
-                dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_h_pt)
-        dpi = max(36.0, min(300.0, dpi))
-
-        prefix = os.path.join(tmpdir, f"qlimg-{hashlib.md5(src_pdf.encode()).hexdigest()[:12]}")
-        try:
-            subprocess.run(
-                # pdftocairo (not pdftoppm - it has no -transp option) so a
-                # picture with a transparent background (e.g. a PNG/GIF with
-                # alpha, flattened into this PDF by the Quick Look
-                # generator) keeps its transparency instead of getting
-                # composited onto an opaque white background here, before
-                # Chrome ever gets to draw it over the slide's real
-                # background.
-                ["pdftocairo", "-png", "-transp", "-r", str(round(dpi)), "-singlefile", src_pdf, prefix],
-                capture_output=True, check=True, timeout=20,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            return path, ref, None
+        prefix = os.path.join(tmpdir, f"qlimg-{hashlib.md5(src_path.encode()).hexdigest()[:12]}")
         png_path = prefix + ".png"
+
+        if ref.lower().endswith(".pdf"):
+            if not have_pdftocairo:
+                return path, ref, None
+            # A fixed DPI (this used to always be 300) is wildly wrong for
+            # a picture that's actually an entire spreadsheet/page flattened
+            # into one PDF, sized in the thousands of points on a side - Numbers
+            # in particular does this for a sheet too big to fit its normal
+            # preview. Aim instead for roughly the size the <img> tag is
+            # actually going to display it at (that's in CSS px, and a PDF
+            # point is already ~1 CSS px at 96dpi, so this is close to
+            # 1:1 - not literally 1:1 only because a page's declared point
+            # size can differ slightly from its <img> tag's declared pixel
+            # size), falling back to the old 300 if either the page size or
+            # the declared display size isn't available - then hard-capped
+            # regardless (see OFFICE_EMBEDDED_IMG_MAX_PX).
+            dpi = 300.0
+            page_size = _pdf_page_size_pt_safe(src_path)
+            if page_size:
+                page_w_pt, page_h_pt = page_size
+                if decl_w and page_w_pt:
+                    dpi = 72.0 * decl_w / page_w_pt
+                elif decl_h and page_h_pt:
+                    dpi = 72.0 * decl_h / page_h_pt
+                if page_w_pt:
+                    dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_w_pt)
+                if page_h_pt:
+                    dpi = min(dpi, 72.0 * OFFICE_EMBEDDED_IMG_MAX_PX / page_h_pt)
+            dpi = max(36.0, min(300.0, dpi))
+
+            try:
+                subprocess.run(
+                    # pdftocairo (not pdftoppm - it has no -transp option) so a
+                    # picture with a transparent background (e.g. a PNG/GIF with
+                    # alpha, flattened into this PDF by the Quick Look
+                    # generator) keeps its transparency instead of getting
+                    # composited onto an opaque white background here, before
+                    # Chrome ever gets to draw it over the slide's real
+                    # background.
+                    ["pdftocairo", "-png", "-transp", "-r", str(round(dpi)), "-singlefile", src_path, prefix],
+                    capture_output=True, check=True, timeout=20,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                return path, ref, None
+        else:  # .tiff / .tif - already a raster image, just re-encoded
+            # to a format Chrome can actually decode inline, downscaled
+            # if it's absurdly large (see OFFICE_EMBEDDED_IMG_MAX_PX) -
+            # there's no DPI to choose the way a PDF page needs.
+            try:
+                with Image.open(src_path) as img:
+                    img.load()
+                    if img.width > OFFICE_EMBEDDED_IMG_MAX_PX or img.height > OFFICE_EMBEDDED_IMG_MAX_PX:
+                        img.thumbnail((OFFICE_EMBEDDED_IMG_MAX_PX, OFFICE_EMBEDDED_IMG_MAX_PX), Image.LANCZOS)
+                    img.convert("RGBA" if "A" in img.getbands() else "RGB").save(png_path, "PNG")
+            except Exception:
+                return path, ref, None
+
         if not os.path.isfile(png_path):
             return path, ref, None
         # Defensive: pdftocairo failing outright over OFFICE_EMBEDDED_IMG_MAX_PX
@@ -765,8 +1006,8 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
         # CalledProcessError) - this instead guards a degenerate ~1px
         # output from some other cause (e.g. a wildly wrong declared
         # width/height), treating it as a failure too (leaving the
-        # original <img src="*.pdf"> in place - a broken-image icon -
-        # rather than silently serving a blank picture).
+        # original broken <img src=...> in place rather than silently
+        # serving a blank picture).
         try:
             with Image.open(png_path) as probe:
                 if probe.width <= 2 or probe.height <= 2:
@@ -776,10 +1017,11 @@ def _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=None):
         return path, ref, pathlib.Path(png_path).as_uri()
 
     # A slide deck can embed dozens to a couple hundred of these (one
-    # `pdftocairo` process each) - running them one at a time was most of
-    # this whole function's cost, and each is independent, so a thread
-    # pool (subprocess.run releases the GIL while the child runs) cuts
-    # that down by roughly the number of workers.
+    # pdftocairo/Pillow conversion each) - running them one at a time was
+    # most of this whole function's cost, and each is independent, so a
+    # thread pool (subprocess.run releases the GIL while the child runs,
+    # and Pillow's C decoders release it too) cuts that down by roughly
+    # the number of workers.
     png_by_file_ref = {}  # (path, ref) -> uri
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -879,6 +1121,64 @@ def _capture_html_screenshot(chrome, html_path, width, height, out_png, render_s
         [base_args[0], "--disable-gpu", *base_args[1:]],
         capture_output=True, check=True, timeout=30,
     )
+
+
+def _capture_html_pdf(chrome, html_path, width, height, out_pdf, timeout=20):
+    """Print `html_path` to a real (vector) PDF at an exact `width` x
+    `height` CSS-pixel page size, via Chrome's headless --print-to-pdf -
+    unlike _capture_html_screenshot()'s fixed-resolution PNG, this keeps
+    text as real PDF text (not a bitmap of it), so pdfless can
+    re-rasterize it at whatever DPI the current zoom needs (see
+    PdfDocument.get_page_image()) instead of upscaling one fixed
+    screenshot. Confirmed by hand that Chrome's print engine happily
+    paginates content taller than one `height`-tall page into further
+    real PDF pages, and that a plain `<a href>` survives as a real PDF
+    link annotation (see Viewer._ensure_link_index()).
+
+    The page size is set via an injected `@page` CSS rule, in a scratch
+    copy of html_path that's never written back (same idea as
+    _measure_slide_offsets()'s instrumented copy) - headless Chrome's
+    CLI has no --paper-width/--paper-height flag of its own; this is
+    the only way to reach a custom page size without going through the
+    DevTools protocol (which is what a browser-automation library like
+    Playwright would use instead - not worth the extra dependency just
+    for this one knob).
+
+    Returns True on success, False for anything that went wrong
+    (a too-old Chrome without --print-to-pdf, a bad html_path, ...) -
+    the caller falls back to the screenshot-based path either way, so
+    this never raises."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return False
+
+    style = f"<style>@page {{ size: {width}px {height}px; margin: 0; }}</style>"
+    idx = content.lower().find("</head>")
+    injected = content[:idx] + style + content[idx:] if idx != -1 else style + content
+    print_path = os.path.join(os.path.dirname(html_path), "pdfless-print.html")
+    try:
+        with open(print_path, "w", encoding="utf-8") as f:
+            f.write(injected)
+    except OSError:
+        return False
+
+    try:
+        subprocess.run(
+            [
+                chrome, "--headless", "--disable-gpu", "--no-sandbox",
+                f"--print-to-pdf={out_pdf}", "--print-to-pdf-no-header",
+                f"file://{os.path.abspath(print_path)}",
+            ],
+            capture_output=True, check=True, timeout=timeout,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return False
+    finally:
+        if os.path.exists(print_path):
+            os.unlink(print_path)
+    return os.path.exists(out_pdf)
 
 
 def _sample_background_color(img):
@@ -1099,6 +1399,114 @@ def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
         return None
 
 
+def _measure_content_height(chrome, html_path, width, timeout=30):
+    """document.body.scrollHeight for `html_path` at `width` (logical
+    CSS px) - the same script-injected-title / --dump-dom technique as
+    _measure_slide_offsets() (see there for why dump-dom rather than a
+    screenshot), but for a document's total flowing height rather than
+    per-slide boundaries.
+
+    Used to size FlowingText's single continuous @page height to the
+    document's real content instead of one size-fits-all oversized
+    page regardless of how short the document actually is - CSS's
+    `size: <width> auto` looks like the obvious way to ask a browser's
+    print engine to size a page's height to its content, but confirmed
+    by hand that Chromium doesn't support "auto" here at all (silently
+    falls back to a default Letter page instead), so measuring first
+    and passing an explicit height is the only way. Returns None on
+    any failure - the caller falls back to a fixed cap
+    (OFFICE_MAX_CAPTURE_HEIGHT) instead."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+    script = "<script>document.title = String(Math.ceil(document.body.scrollHeight));</script>"
+    idx = content.rfind("</body>")
+    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
+    measure_path = os.path.join(os.path.dirname(html_path), "pdfless-height-measure.html")
+    try:
+        with open(measure_path, "w", encoding="utf-8") as f:
+            f.write(instrumented)
+    except OSError:
+        return None
+    try:
+        r = subprocess.run(
+            [
+                chrome, "--headless", "--no-sandbox",
+                f"--window-size={width},1080",
+                "--dump-dom", "--virtual-time-budget=8000",
+                f"file://{os.path.abspath(measure_path)}",
+            ],
+            capture_output=True, text=True, timeout=timeout, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        if os.path.exists(measure_path):
+            os.unlink(measure_path)
+    m = re.search(r"<title>(\d+)</title>", r.stdout)
+    return int(m.group(1)) if m else None
+
+
+def _measure_svg_natural_size(chrome, wrapper_path, timeout=20):
+    """(width, height) in CSS px that `wrapper_path`'s <img id="svg">
+    (see SvgDocument._write_svg_wrapper()) naturally renders at - the
+    same script-injected-title / --dump-dom technique
+    _measure_content_height() uses, but reading the image's own
+    naturalWidth/naturalHeight once it finishes loading (via onload,
+    since decoding a local file happens asynchronously) rather than
+    the document's scroll height.
+
+    Needed because an SVG's intrinsic size varies in both dimensions
+    at once - unlike FlowingText/SlideDeck's HTML, where a fixed
+    Quick-Look-reported width is already known up front and only the
+    height needs measuring, an SVG has no such external plist to read
+    a width from; Chrome's print engine still can't size a page to its
+    content on its own either way (see _measure_content_height()).
+
+    Returns None on any failure, including an SVG Chrome couldn't
+    determine a natural size for at all - the caller falls back to a
+    fixed default size."""
+    try:
+        with open(wrapper_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+    script = (
+        '<script>document.getElementById("svg").onload = function() {'
+        'document.title = this.naturalWidth + "x" + this.naturalHeight;'
+        "};</script>"
+    )
+    idx = content.rfind("</body>")
+    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
+    measure_path = os.path.join(os.path.dirname(wrapper_path), "pdfless-svg-measure.html")
+    try:
+        with open(measure_path, "w", encoding="utf-8") as f:
+            f.write(instrumented)
+    except OSError:
+        return None
+    try:
+        r = subprocess.run(
+            [
+                chrome, "--headless", "--no-sandbox",
+                "--dump-dom", "--virtual-time-budget=8000",
+                f"file://{os.path.abspath(measure_path)}",
+            ],
+            capture_output=True, text=True, timeout=timeout, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        if os.path.exists(measure_path):
+            os.unlink(measure_path)
+    m = re.search(r"<title>(\d+)x(\d+)</title>", r.stdout)
+    if not m:
+        return None
+    width, height = int(m.group(1)), int(m.group(2))
+    return (width, height) if width > 0 and height > 0 else None
+
+
 def _slice_and_save_pages(trimmed, bounds, tmpdir, tag):
     """Crop `trimmed` at each consecutive pair in `bounds` (a list of Y
     pixel offsets, first always 0, last always trimmed.height) and save
@@ -1135,7 +1543,11 @@ class OfficeVariant:
 
     def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
         """Returns a list of page PNG paths, or None on failure (a
-        Chrome screenshot subprocess failing)."""
+        Chrome screenshot subprocess failing) - or, for FlowingText
+        specifically, the 3-tuple ("pdf", pdf_path, npages) when a real
+        PDF was captured instead (see FlowingText._build_pdf_pages()
+        and OfficeDocument._render_office_pages(), which turns that
+        into a PdfDocument delegate)."""
         raise NotImplementedError
 
     def _save_pages(self, trimmed, bounds, tmpdir, debug, progress):
@@ -1202,18 +1614,18 @@ class ExcelWorkbook(OfficeVariant):
     def _build_multi_sheet(self, tmpdir, debug, render_scale, progress):
         # Each sheet is an independent render (its own already-
         # rasterized HTML, its own Chrome screenshot subprocess), so -
-        # like _rasterize_pdf_img_sources()'s embedded-image conversion
-        # - run them concurrently rather than one at a time; a workbook
-        # can have dozens of sheets, and each is mostly subprocess wait
-        # (releases the GIL), not CPU time here.
+        # like _rasterize_broken_img_sources()'s embedded-image
+        # conversion - run them concurrently rather than one at a time;
+        # a workbook can have dozens of sheets, and each is mostly
+        # subprocess wait (releases the GIL), not CPU time here.
         sheet_tabs = self.sheet_tabs
         name = self.name
 
         def _render_sheet(i, sheet_name, sheet_html_path):
             with _DebugTimer(
-                debug, f"{name}: sheet {i + 1} ({sheet_name}): pdftocairo (embedded images)"
+                debug, f"{name}: sheet {i + 1} ({sheet_name}): converting embedded images"
             ):
-                sheet_html_path = _rasterize_pdf_img_sources(sheet_html_path, tmpdir)
+                sheet_html_path = _rasterize_broken_img_sources(sheet_html_path, tmpdir)
             page_path = os.path.join(tmpdir, f"office-page-{self.tag}-{i + 1}.png")
             label = f"{name}: sheet {i + 1}/{len(sheet_tabs)} ({sheet_name}): rendering"
             with _DebugTimer(debug, label):
@@ -1310,17 +1722,88 @@ class SlideDeck(OfficeVariant):
 
 class FlowingText(OfficeVariant):
     """A continuously-flowing document with no slide markers (e.g.
-    Word), or one whose measurement simply didn't pan out - its true
-    total content height isn't known up front, so this starts with a
-    guess and doubles it if the content still reaches the bottom edge,
-    up to a hard cap. Renders at OFFICE_RENDER_SCALE_FLOWING rather
-    than the caller's default - these documents are usually short and
-    text-heavy enough that sharpness matters more than the render-time
-    tradeoff the default otherwise makes for a large slide deck -
-    unless the caller (-s/--rendering-scale) asked for a specific scale
-    explicitly."""
+    Word). Tries Chrome's headless --print-to-pdf first (see
+    _build_pdf_pages()) - a real PDF pdfless can re-rasterize crisply at
+    any zoom - and only falls back to the older screenshot-and-slice
+    approach (_build_pages_via_screenshot(), see there for the
+    "grow the capture height and retry" doubling loop, up to a hard
+    cap) if that Chrome build doesn't support it. Renders the fallback
+    at OFFICE_RENDER_SCALE_FLOWING rather than the caller's default -
+    these documents are usually short and text-heavy enough that
+    sharpness matters more than the render-time tradeoff the default
+    otherwise makes for a large slide deck - unless the caller
+    (-s/--rendering-scale) asked for a specific scale explicitly (moot
+    for the PDF path, which is always re-rasterized at whatever DPI the
+    current zoom needs, regardless of any render_scale)."""
 
     def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
+        pdf_pages = self._build_pdf_pages(tmpdir, debug, progress, continuous)
+        if pdf_pages is not None:
+            return pdf_pages
+        return self._build_pages_via_screenshot(tmpdir, debug, render_scale, progress, continuous)
+
+    def _build_pdf_pages(self, tmpdir, debug, progress, continuous):
+        """Real PDF pages via _capture_html_pdf(). Returns ("pdf",
+        path, npages) for OfficeDocument._render_office_pages() to
+        wire up as a PdfDocument delegate, or None to fall back to the
+        screenshot path (an older Chrome without --print-to-pdf, or
+        anything else going wrong).
+
+        Not continuous (the common case): one page's own height
+        (self.height, from the Quick Look preview's own plist) becomes
+        the @page height, and Chrome's print engine paginates the rest
+        on its own - real page breaks driven by the actual content
+        flow, unlike the screenshot path's own bounds logic below,
+        which can only guess at a fixed pixel height after the fact.
+        That's also why this doesn't need SlideDeck's
+        _measure_slide_offsets() dance in the first place: a
+        print-mode page break follows the content wherever it actually
+        flows, so a slightly-off page height just spills part of one
+        page onto the next rather than throwing off every later page's
+        position too (fixed pixel-slicing's boundaries are cumulative
+        - one page's error shifts every one after it; print-mode's
+        aren't, each page break is independent).
+
+        continuous=True (-c/--continuous) instead measures the
+        document's real total height first (_measure_content_height())
+        and requests one oversized page sized to fit it - a
+        continuously-flowing document has no real page boundaries of
+        its own to paginate at in the first place (see the class
+        docstring), so there's nothing for the print engine to do here
+        that measuring wouldn't do more precisely."""
+        out_pdf = os.path.join(tmpdir, f"office-capture-{self.tag}.pdf")
+        if continuous:
+            measure_label = f"{self.name}: measuring content height"
+            with _DebugTimer(debug, measure_label), progress.spin(measure_label + "..."):
+                content_height = _measure_content_height(self.chrome, self.html_path, self.width)
+            if not content_height:
+                # Couldn't measure - rather than guess a one-size-fits-
+                # all OFFICE_MAX_CAPTURE_HEIGHT (a real, if rare, source
+                # of a giant near-blank page under load, where Chrome's
+                # dump-dom measurement is more likely to time out), fall
+                # back to the screenshot path, which doesn't depend on
+                # this measurement at all.
+                return None
+            # A little headroom: print-mode layout can measure a few px
+            # taller than screen-mode's scrollHeight for the same
+            # content (a marginal font-metric difference between the
+            # two rendering paths) - this only has to avoid spilling a
+            # couple of leftover px onto a needless second page, not be
+            # exact.
+            page_height = min(OFFICE_MAX_CAPTURE_HEIGHT, content_height + 40)
+        else:
+            page_height = self.height
+        label = f"{self.name}: rendering to PDF"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            ok = _capture_html_pdf(self.chrome, self.html_path, self.width, page_height, out_pdf)
+        npages = _pdf_page_count_safe(out_pdf) if ok else None
+        if not npages:
+            if os.path.exists(out_pdf):
+                os.unlink(out_pdf)
+            return None
+        return ("pdf", out_pdf, npages)
+
+    def _build_pages_via_screenshot(self, tmpdir, debug, render_scale, progress, continuous):
         if render_scale == OFFICE_RENDER_SCALE:
             render_scale = OFFICE_RENDER_SCALE_FLOWING
         out_png = os.path.join(tmpdir, f"office-capture-{self.tag}.png")
@@ -2048,10 +2531,36 @@ class OfficeDocument(DocumentHandler):
 
     kind = "office"
 
+    # Extensions where soffice's own --convert-to pdf pagination lands
+    # on the same "page" boundary the qlmanage/Chrome pipeline already
+    # uses - a real Word/RTF page break, or one slide per PowerPoint
+    # page (confirmed by hand: soffice's page count matches the
+    # existing qlmanage/Chrome one exactly, both for a small fixture
+    # and for a real 55-slide deck with hidden slides). .docm/.pptm
+    # (macro-enabled Word/PowerPoint) already classify as
+    # OfficeDocument via the same Office.qlgenerator that handles
+    # .docx/.pptx (confirmed by hand), so they get the same treatment.
+    # Deliberately excludes Excel (.xls/.xlsx/.xlsm): soffice
+    # paginates a spreadsheet by its print area/page setup, which for
+    # a workbook never tuned for printing fragments one sheet across
+    # several oddly-cut pages (confirmed by hand on a real 2-sheet
+    # workbook: 9 soffice pages, split mid-column with no header row)
+    # - nothing like qlmanage's "one full sheet per page". See
+    # _soffice_pages_if_eligible().
+    _SOFFICE_EXTENSIONS = (".doc", ".docx", ".docm", ".ppt", ".pptx", ".pptm", ".rtf")
+
     def __init__(self, path):
         super().__init__(path)
         self.pages = None  # [png_path, ...] once rendered - see
         # build_pages()/ensure_pages(); None until the first render.
+        self._pdf_delegate = None  # a PdfDocument wrapping a real,
+        # print-to-pdf-rendered PDF, when FlowingText managed one (see
+        # _render_office_pages()) - get_page_image() forwards to it
+        # instead of treating self.pages as a list of PNGs, so these
+        # pages stay crisp at any zoom the same way a real PDF does.
+        # self.pages is still set (to a same-length placeholder list)
+        # in that case, purely so len(self.pages) keeps working for
+        # Viewer._ensure_office_pages()/reload().
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
@@ -2198,9 +2707,85 @@ class OfficeDocument(DocumentHandler):
 
     def _render_and_remember(self, source_path, tmpdir, **kwargs):
         pages = self._render_office_pages(source_path, tmpdir, **kwargs)
+        return self._remember_pages(pages)
+
+    def _remember_pages(self, pages):
+        """Normalize and remember whatever build_pages()'s underlying
+        rendering produced - either a ("pdf", pdf_path, npages) tuple
+        (FlowingText's own PDF path, or soffice - see
+        _try_soffice_pages()) or a plain list of per-page PNG paths -
+        into self.pages/self._pdf_delegate, and return the same
+        same-length list of paths every caller of build_pages()/
+        ensure_pages() (which only ever does len(pages)) already
+        expects."""
         if pages:
+            if isinstance(pages, tuple) and pages[0] == "pdf":
+                # A real PDF (Chrome's --print-to-pdf or soffice) -
+                # wrap it as a PdfDocument delegate (see
+                # get_page_image()) and normalize back to a
+                # same-length list of paths.
+                _, pdf_path, npages = pages
+                self._pdf_delegate = PdfDocument(pdf_path)
+                pages = [pdf_path] * npages
+            else:
+                self._pdf_delegate = None
             self.pages = pages
         return pages
+
+    def _soffice_pages_if_eligible(self, path, tmpdir, debug, progress, continuous):
+        """The one place that decides whether _try_soffice_pages() is
+        even worth attempting for `path` - both call sites
+        (_render_office_pages(), for Word/PowerPoint, and
+        RtfOfficeDocument.build_pages(), for RTF) delegate here instead
+        of repeating the same two checks:
+
+        - continuous=True is never eligible: soffice always paginates
+          for real (one PDF page per real page/slide), and unlike the
+          qlmanage/Chrome screenshot path, there's no way to collapse
+          that back into a single continuously-scrollable page.
+        - the extension must be one of _SOFFICE_EXTENSIONS - see its
+          comment for why Excel is deliberately excluded.
+
+        Returns the ("pdf", pdf_path, npages) tuple _try_soffice_pages()
+        produces, or None - either because it wasn't eligible to try at
+        all, or because the attempt itself failed - so callers always
+        fall through to their own qlmanage/Chrome-based rendering."""
+        if continuous or not path.lower().endswith(self._SOFFICE_EXTENSIONS):
+            return None
+        return self._try_soffice_pages(path, tmpdir, debug, progress)
+
+    def _try_soffice_pages(self, path, tmpdir, debug, progress):
+        """Render `path` to a real PDF via LibreOffice's `soffice
+        --convert-to pdf` (see _convert_via_soffice() for why
+        --headless is never used) - the mechanism _soffice_pages_if_eligible()
+        decides whether to even attempt. Preferred over the qlmanage/
+        Chrome pipeline when available - soffice paginates natively
+        (real page breaks/slide boundaries matching the original
+        document) and needs no embedded-picture workaround (see
+        _rasterize_broken_img_sources()) at all.
+
+        Returns the same ("pdf", pdf_path, npages) tuple shape
+        FlowingText._build_pdf_pages() already produces, or None if
+        soffice isn't installed or the conversion/page-count reading
+        failed for any reason - callers always fall back to the
+        existing qlmanage/Chrome pipeline in that case."""
+        name = os.path.basename(path)
+        progress.update(f"{name}: looking for LibreOffice...")
+        soffice = find_soffice()
+        if soffice is None:
+            return None
+        if debug:
+            print(f"pdfless: [debug] {name}: using soffice: {soffice}", file=sys.stderr, end="\r\n")
+        label = f"{name}: converting via LibreOffice"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            out_pdf = _convert_via_soffice(soffice, path, tmpdir)
+        if out_pdf is None:
+            return None
+        npages = _pdf_page_count_safe(out_pdf)
+        if not npages:
+            os.unlink(out_pdf)
+            return None
+        return ("pdf", out_pdf, npages)
 
     def _render_office_pages(
         self, path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
@@ -2227,19 +2812,35 @@ class OfficeDocument(DocumentHandler):
         take anywhere from under a second to tens of seconds and would
         otherwise look like pdfless had simply hung.
 
-        Pagination (splitting into distinct page/slide images, so
-        `n`/`p`/`g`/`G` and jumping straight to page N work) is only
-        used when the slide boundaries are known with confidence - i.e.
-        the Quick Look generator's own plist named a PageElementXPath
-        (currently true for PowerPoint and some Keynote decks), and
-        measuring it produced sane (strictly increasing) offsets.
-        Anything else - Word's continuously-flowing text, spreadsheets,
-        and Keynote/Pages variants where the boundary can only be
-        guessed via a content-shape heuristic (see
+        Pagination for a screenshot-sliced variant (splitting into
+        distinct page/slide images, so `n`/`p`/`g`/`G` and jumping
+        straight to page N work) is only used when the slide
+        boundaries are known with confidence - i.e. the Quick Look
+        generator's own plist named a PageElementXPath (currently true
+        for PowerPoint and some Keynote decks), and measuring it
+        produced sane (strictly increasing) offsets. Anything else -
+        spreadsheets, and Keynote/Pages variants where the boundary can
+        only be guessed via a content-shape heuristic (see
         _detect_fallback_page_xpath()) - is rendered as a single,
         continuously-scrollable "page" instead (the same as a plain
         image file), since a guessed boundary has been observed to
-        drift/overflow on some real decks.
+        drift/overflow on some real decks. FlowingText is the one
+        exception to all of this: its own PDF path
+        (_build_pdf_pages()) paginates for real when not continuous,
+        driven by Chrome's print engine rather than any measured/
+        guessed boundary - though RtfOfficeDocument's own qlmanage/
+        Chrome fallback always asks for continuous=True regardless
+        (see its build_pages()), since a converted RTF's page-height
+        metadata doesn't correspond to anything in the original file
+        either way. Word and PowerPoint (see _SOFFICE_EXTENSIONS) try
+        LibreOffice's soffice before any of this (see
+        _soffice_pages_if_eligible(), called at the very top of this
+        method) when it's installed, since it paginates natively and
+        renders with higher fidelity than either of the above; RTF
+        does the same, but from its own build_pages(), against the
+        original .rtf rather than a converted .docx - so it isn't
+        limited to always-continuous the way the qlmanage/Chrome
+        fallback is.
 
         continuous=True (-c/--continuous) forces the single-continuous-
         page behavior even for a document that would otherwise paginate
@@ -2249,6 +2850,10 @@ class OfficeDocument(DocumentHandler):
         name = os.path.basename(path)
         t_start = time.monotonic()
         try:
+            soffice_pages = self._soffice_pages_if_eligible(path, tmpdir, debug, progress, continuous)
+            if soffice_pages is not None:
+                return soffice_pages
+
             progress.update(f"{name}: looking for a local Chrome...")
             chrome = find_chrome()
             if chrome is None:
@@ -2291,8 +2896,8 @@ class OfficeDocument(DocumentHandler):
                 on_img_progress = lambda done, total: progress.update(
                     f"{name}: converting embedded images ({done}/{total})..."
                 )
-                with _DebugTimer(debug, f"{name}: pdftocairo (embedded images)"):
-                    html_path = _rasterize_pdf_img_sources(html_path, tmpdir, on_progress=on_img_progress)
+                with _DebugTimer(debug, f"{name}: converting embedded images"):
+                    html_path = _rasterize_broken_img_sources(html_path, tmpdir, on_progress=on_img_progress)
 
                 # Confident means the Quick Look generator itself named
                 # the page/slide element (page_element_xpath came from
@@ -2343,6 +2948,13 @@ class OfficeDocument(DocumentHandler):
         return self.pages
 
     def extract_text(self, page):
+        if self._pdf_delegate is not None:
+            # A real PDF page (soffice or Chrome's --print-to-pdf) -
+            # use its own per-page text (pdftotext -layout), so page
+            # breaks - lost once extract_office_text()'s textutil
+            # flattens the whole document into one blob - come through
+            # correctly (see also text_mode_is_paginated()).
+            return self._pdf_delegate.extract_text(page)
         # textutil (see extract_office_text()) has no notion of pages -
         # the whole document, or None for a format it can't handle at
         # all (a spreadsheet or slide deck).
@@ -2351,12 +2963,49 @@ class OfficeDocument(DocumentHandler):
     def supports_text_mode(self):
         return True
 
+    def supports_search(self):
+        # Real per-page/bbox search (build_search_index()/
+        # find_search_matches() below) only works against a real PDF -
+        # a screenshot-based OfficeVariant (always true for Excel/
+        # Keynote/Pages/Numbers; for Word/RTF/PowerPoint, only when
+        # neither soffice nor Chrome's --print-to-pdf could be used)
+        # has no such index to search.
+        return self._pdf_delegate is not None
+
+    def text_mode_is_paginated(self):
+        return self._pdf_delegate is not None
+
+    def build_search_index(self):
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.build_search_index()
+        return None
+
+    def find_search_matches(self, index, query):
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.find_search_matches(index, query)
+        return []
+
     def _source_for_page(self, cache, page):
         # One pre-rendered PNG per page (see OfficeDocument._render_office_pages()) -
         # unlike ImageDocument, there's no single fixed path, so this
         # reads self.pages (kept in sync by build_pages()/
         # ensure_pages()) rather than a path fixed at construction time.
+        # Only reached when self._pdf_delegate is None - get_page_image()
+        # (below) forwards to it directly otherwise, without ever
+        # calling this (self.pages holds a same-length placeholder list
+        # in that case, not real per-page paths - see
+        # _render_and_remember()).
         return self.pages[page - 1]
+
+    def get_page_image(self, cache, page, target_px, fit):
+        # A FlowingText document rendered to a real PDF instead of PNGs
+        # (see _render_and_remember()) - re-rasterize it the same way a
+        # real PdfDocument would, at whatever DPI the current zoom
+        # needs, instead of resizing one fixed-resolution screenshot
+        # (the DocumentHandler default this falls back to otherwise).
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.get_page_image(cache, page, target_px, fit)
+        return super().get_page_image(cache, page, target_px, fit)
 
 
 class RtfOfficeDocument(OfficeDocument):
@@ -2415,6 +3064,17 @@ class RtfOfficeDocument(OfficeDocument):
         self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
         progress=None, continuous=False,
     ):
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        # Unlike the textutil-converted-docx path below, soffice reads
+        # the original .rtf natively, so its page breaks correspond to
+        # the real document - no need to force continuous=True just to
+        # dodge untrustworthy converted-page-height metadata (see the
+        # comment below).
+        soffice_pages = self._soffice_pages_if_eligible(self.path, tmpdir, debug, progress, continuous)
+        if soffice_pages is not None:
+            return self._remember_pages(soffice_pages)
+
         docx_path = self._rtf_to_docx(self.path, tmpdir)
         if docx_path is None:
             return None
@@ -2430,20 +3090,224 @@ class RtfOfficeDocument(OfficeDocument):
         )
 
     def extract_text(self, page):
+        if self._pdf_delegate is not None:
+            # soffice rendered the original .rtf natively to a real
+            # PDF (see build_pages()) - use its own per-page text, the
+            # same as OfficeDocument.extract_text() does for Word.
+            return self._pdf_delegate.extract_text(page)
         # textutil already handles RTF directly for plain-text
         # extraction (see extract_office_text()) - no need to go via
         # the .docx conversion just for this.
         return extract_office_text(self.path)
 
 
+class SofficeOnlyDocument(OfficeDocument):
+    """Formats macOS Quick Look has no generator for at all - an ODF
+    document, a Visio drawing, or a WMF vector metafile (confirmed by
+    hand: qlmanage crashes outright on a real .odt, and produces no
+    preview whatsoever - not even a Preview.url - for a real .ods/
+    .odp/.odg/.vsd). Previewable only when soffice is installed, with
+    no qlmanage/Chrome fallback to speak of - unlike Word/RTF/
+    PowerPoint (see OfficeDocument._SOFFICE_EXTENSIONS), there's
+    nothing to fall back TO here; these formats were entirely
+    unsupported before this class existed, so requiring soffice isn't
+    a regression for anyone.
+
+    sniff() deliberately never touches qlmanage (unlike
+    OfficeDocument._probe_preview()) - both because it's known not to
+    work for any of these extensions, and because it would risk
+    reproducing the .odt crash above just to classify a file.
+
+    -c/--continuous has no effect here: soffice always paginates for
+    real, and - unlike OfficeDocument._render_office_pages()'s
+    qlmanage-based variants - there's no screenshot-based single-page
+    rendering to fall back to instead.
+
+    .ods (Calc) carries the same print-area/page-setup pagination
+    caveat as Excel (see _SOFFICE_EXTENSIONS's docstring - confirmed
+    by hand: a real 4-sheet workbook came out as 8 soffice pages, with
+    a chart split across two of them) - but unlike Excel, there's no
+    working qlmanage fallback to prefer instead, so it's included here
+    anyway rather than left entirely unsupported.
+
+    .vsdx hasn't been verified by hand (no local sample was
+    available) - LibreOffice's Visio import filter (libvisio) handles
+    both .vsd and .vsdx through the same code, so the same behavior is
+    expected, but only .vsd has actually been confirmed to render
+    correctly."""
+
+    _SOFFICE_ONLY_EXTENSIONS = (".odt", ".odp", ".odg", ".ods", ".vsd", ".vsdx", ".wmf")
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        if not path.lower().endswith(cls._SOFFICE_ONLY_EXTENSIONS):
+            return None
+        if find_soffice() is None:
+            return None
+        return cls(path)
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        soffice_pages = self._try_soffice_pages(self.path, tmpdir, debug, progress)
+        if soffice_pages is None:
+            return None
+        return self._remember_pages(soffice_pages)
+
+
+class SvgDocument(OfficeDocument):
+    """A standalone SVG file, rendered to a real PDF via headless
+    Chrome directly - no Quick Look or LibreOffice involved at all.
+    Quick Look's own preview for an SVG is just a Preview.url redirect
+    back to the file (confirmed by hand - the same dead end WMF hits;
+    see SofficeOnlyDocument), not a proper HTML bundle to build on, so
+    there's nothing to reuse from the qlmanage/Chrome pipeline here.
+    Chrome was chosen over soffice's Draw import (both were compared
+    by hand on a complex real SVG - embedded raster photos plus vector
+    line art - and came out visually equivalent) since Chrome is
+    already a hard requirement for every other Office kind, so this
+    doesn't add a new soffice dependency just to view an SVG.
+
+    The SVG is embedded via a plain <img>, which is what lets
+    _capture_html_pdf()'s existing @page-injection machinery work
+    unmodified (an SVG file has no <head>/<body> of its own for that
+    to target safely) - confirmed by hand that the vector parts of a
+    complex SVG survive print-to-pdf as real vector PDF content, not
+    a flattened bitmap (checked via pdfimages -list: only the source
+    SVG's own embedded raster images showed up there, nothing for the
+    vector line art). The one real cost of this approach: <img> always
+    strips interactivity, so a hyperlink inside the SVG itself can't
+    be clickable here the way one in a Word document is."""
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        if not path.lower().endswith(".svg"):
+            return None
+        if find_chrome() is None:
+            return None
+        return cls(path)
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        name = os.path.basename(self.path)
+        chrome = find_chrome()
+        if chrome is None:
+            return None
+        tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        wrapper_path = os.path.join(tmpdir, f"svg-wrap-{tag}.html")
+
+        # There's no plist (unlike a Quick Look preview) to read a
+        # width from up front, and an SVG's own intrinsic size varies
+        # in both dimensions - so the natural size has to be measured
+        # first, the same "auto" page sizing isn't supported reasoning
+        # as _measure_content_height() (see _measure_svg_natural_size()).
+        progress.update(f"{name}: measuring size...")
+        self._write_svg_wrapper(wrapper_path, self.path, None, None)
+        with _DebugTimer(debug, f"{name}: measure SVG size"):
+            size = _measure_svg_natural_size(chrome, wrapper_path)
+        width, height = size if size else (OFFICE_DEFAULT_WIDTH, OFFICE_DEFAULT_HEIGHT)
+        self._write_svg_wrapper(wrapper_path, self.path, width, height)
+
+        out_pdf = os.path.join(tmpdir, f"svg-capture-{tag}.pdf")
+        label = f"{name}: rendering to PDF"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            ok = _capture_html_pdf(chrome, wrapper_path, width, height, out_pdf)
+        npages = _pdf_page_count_safe(out_pdf) if ok else None
+        if not npages:
+            if os.path.exists(out_pdf):
+                os.unlink(out_pdf)
+            return None
+        return self._remember_pages(("pdf", out_pdf, npages))
+
+    @staticmethod
+    def _write_svg_wrapper(wrapper_path, svg_path, width, height):
+        """A minimal HTML page embedding `svg_path` as a plain <img> -
+        see this class's docstring for why <img> rather than
+        navigating to the SVG directly. `width`/`height` (CSS px), if
+        given, are set explicitly so the rendered page size matches
+        exactly what _capture_html_pdf()'s own @page injection expects
+        - left unset (None) for the first, size-finding pass (see
+        build_pages()), which needs the image at its own natural size
+        instead."""
+        style = f"width:{width}px;height:{height}px;" if width and height else ""
+        html = (
+            "<!DOCTYPE html><html><head></head><body style=\"margin:0\">"
+            f'<img id="svg" style="display:block;{style}" '
+            f'src="file://{os.path.abspath(svg_path)}"></body></html>'
+        )
+        with open(wrapper_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+class MarkdownDocument(OfficeDocument):
+    """A Markdown file, rendered to a real PDF via the `markdown` +
+    `weasyprint` Python libraries (see _render_markdown_pdf()) - no
+    Quick Look, Chrome, or LibreOffice involved at all, and
+    dramatically faster than either (confirmed by hand: well under a
+    second, against Chrome's own ~1-2s process startup alone), since
+    WeasyPrint paginates for real on its own rather than needing a
+    measured/injected @page size the way FlowingText/SvgDocument do.
+
+    Falls back to plain text (TextDocument, showing the raw Markdown
+    source) if `markdown`/`weasyprint` - or the system libraries
+    WeasyPrint itself needs (Cairo/Pango/GLib, not something pip can
+    install on its own) - aren't available; see sniff().
+
+    -c/--continuous has no effect here, the same as SofficeOnlyDocument
+    and for the same reason: WeasyPrint's real pagination can't be
+    collapsed back into a single page."""
+
+    _MARKDOWN_EXTENSIONS = (".md", ".markdown")
+
+    @classmethod
+    def sniff(cls, path, tmpdir, debug=False):
+        if not path.lower().endswith(cls._MARKDOWN_EXTENSIONS):
+            return None
+        if not _markdown_rendering_available():
+            return None
+        return cls(path)
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None, continuous=False,
+    ):
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        name = os.path.basename(self.path)
+        tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        out_pdf = os.path.join(tmpdir, f"markdown-capture-{tag}.pdf")
+        label = f"{name}: rendering to PDF"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            ok = _render_markdown_pdf(self.path, out_pdf)
+        npages = _pdf_page_count_safe(out_pdf) if ok else None
+        if not npages:
+            if os.path.exists(out_pdf):
+                os.unlink(out_pdf)
+            return None
+        return self._remember_pages(("pdf", out_pdf, npages))
+
+
 # The order main()'s classification loop tries these in - RtfOfficeDocument
 # and RtfDocument (both RTF - the former tried first, see their own
-# docstrings) before the generic TextDocument, since all three would
-# otherwise match the same file (RTF is plain ASCII text); OfficeDocument
-# last since it's the most expensive check (shells out to qlmanage).
+# docstrings), SvgDocument, and MarkdownDocument before the generic
+# TextDocument, since all would otherwise match the same file (RTF,
+# SVG, and Markdown are all plain text - SvgDocument/MarkdownDocument
+# fall through to TextDocument's raw-source rendering when their own
+# dependency isn't installed, the same way RtfOfficeDocument falls
+# through to RtfDocument without textutil); SofficeOnlyDocument before
+# OfficeDocument since it covers formats OfficeDocument's own qlmanage
+# probe can't handle at all; OfficeDocument last since it's the most
+# expensive check (shells out to qlmanage).
 HANDLER_CLASSES = [
-    PdfDocument, ImageDocument, RtfOfficeDocument, RtfDocument, TextDocument,
-    OfficeDocument,
+    PdfDocument, ImageDocument, RtfOfficeDocument, RtfDocument, SvgDocument,
+    MarkdownDocument, TextDocument, SofficeOnlyDocument, OfficeDocument,
 ]
 
 
@@ -4244,7 +5108,20 @@ class Viewer:
                 if self.scroll_max == 0
                 else int(100 * self.scroll / self.scroll_max)
             )
-            mode_field = f" zoom {round(self.zoom * 100)}% "
+            # self.zoom alone isn't comparable across m/M (fit height/
+            # width): it's always "1.0" right after switching fit mode
+            # (see set_fit()), which would show "100%" for either one
+            # even though a fit-height page is rarely the same actual
+            # size as its fit-width rendering. Comparing the page's
+            # current pixel width (self.img.width - fit="height" still
+            # yields a real width, just one implied by the page's
+            # aspect ratio rather than target_px directly - see
+            # get_page_image()) against self.base_width_px (M's own
+            # 100% reference) instead makes the percentage mean the
+            # same thing - "size relative to fit-to-width" - no matter
+            # which fit mode or zoom level produced it.
+            zoom_pct = round(100 * self.img.width / max(1, self.base_width_px))
+            mode_field = f" zoom {zoom_pct}% "
         segments = [(f" {self.name} ", STATUS_COLOR_FILENAME)]
         if len(self.files) > 1:
             segments.append((
@@ -4317,10 +5194,25 @@ class Viewer:
         self._load_page()
         self.scroll = scroll
 
+    def _pdf_source(self):
+        """The PdfDocument to defer to for anything that only makes
+        sense against a real PDF (page_size_pt(), build_link_index()) -
+        either self.doc_handler itself, or the PdfDocument an
+        OfficeDocument rendered to under the hood (see
+        OfficeDocument.get_page_image()'s _pdf_delegate - a plain
+        <a href> in the original Word/RTF document survives
+        Chrome's --print-to-pdf as a real PDF link annotation, so this
+        lets it be treated exactly like a real PDF's hyperlinks
+        wherever this is used), or None if neither applies."""
+        if self.is_pdf:
+            return self.doc_handler
+        return getattr(self.doc_handler, "_pdf_delegate", None)
+
     def _ensure_link_index(self):
         if self._link_index is None:
-            if self.is_pdf:
-                self._link_index = self.doc_handler.build_link_index(self.npages)
+            pdf_source = self._pdf_source()
+            if pdf_source is not None:
+                self._link_index = pdf_source.build_link_index(self.npages)
             else:
                 # No hyperlinks outside a PDF, but a multi-page "office"
                 # preview (or, in principle, a multi-page "image") still
@@ -4503,7 +5395,8 @@ class Viewer:
         if top_pt is None:
             self.scroll = 0
             return
-        _, height_pt = self.doc_handler.page_size_pt(self.page)
+        pdf_source = self._pdf_source()
+        height_pt = pdf_source.page_size_pt(self.page)[1] if pdf_source else None
         if not height_pt:
             self.scroll = 0
             return
@@ -5370,8 +6263,10 @@ def main():
     parser.add_argument(
         "-s", "--rendering-scale", type=float, default=OFFICE_RENDER_SCALE, metavar="N",
         help="device-pixel-ratio to render Quick Look preview files "
-             "(Word/Excel/PowerPoint/etc., macOS only) at - higher looks "
-             "sharper when zoomed in but is slower to render (default: %(default)s)",
+             "(Excel/PowerPoint/Keynote/Pages/etc., macOS only) at - higher "
+             "looks sharper when zoomed in but is slower to render (default: "
+             "%(default)s). No effect on Word/RTF, which render to a "
+             "real PDF instead and are always sharp regardless of zoom",
     )
     parser.add_argument(
         "-c", "--continuous",
