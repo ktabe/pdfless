@@ -1440,6 +1440,38 @@ def is_markdown_file(path):
     return os.path.splitext(path)[1].lower() in MARKDOWN_EXTENSIONS
 
 
+def _rewrite_markdown_html_local_refs(html_path, base_dir):
+    """Pandoc writes the HTML under `tmpdir`, but leaves `<img src>` as
+    paths relative to the Markdown file's directory - Chrome resolves
+    those against the HTML file's location instead, so every local
+    picture shows up as a broken-image icon. Rewrite each relative src
+    to an absolute file:// URI rooted at `base_dir` (the .md's own
+    directory). Remote/data URLs are left alone."""
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return
+
+    def _fix_src(match):
+        prefix, src, suffix = match.group(1), match.group(2), match.group(3)
+        if _ABSOLUTE_SRC_RE.match(src):
+            return match.group(0)
+        candidate = os.path.normpath(os.path.join(base_dir, html.unescape(src)))
+        if not os.path.isfile(candidate):
+            return match.group(0)
+        return prefix + pathlib.Path(candidate).as_uri() + suffix
+
+    new_content = _IMG_SRC_RE.sub(_fix_src, content)
+    if new_content == content:
+        return
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except OSError:
+        pass
+
+
 def _pandoc_markdown_to_html(md_path, tmpdir, debug=False):
     """Convert `md_path` to a standalone HTML file via pandoc, with a
     small readability stylesheet injected via -H. Returns the HTML path,
@@ -1473,7 +1505,10 @@ def _pandoc_markdown_to_html(md_path, tmpdir, debug=False):
                 file=sys.stderr, end="\r\n",
             )
         return None
-    return html_path if os.path.isfile(html_path) else None
+    if not os.path.isfile(html_path):
+        return None
+    _rewrite_markdown_html_local_refs(html_path, base_dir)
+    return html_path
 
 
 def is_rtf_file(path):
