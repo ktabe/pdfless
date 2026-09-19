@@ -26,6 +26,10 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
   switch between them with `:n`/`:p`, `less(1)`-style
 - Also opens a plain text file directly, shown straight in that same
   text mode and searchable the same way a PDF is
+- With [pandoc](https://pandoc.org) and a local Chrome/Chromium install,
+  also opens Markdown files as a rendered preview - see
+  [Markdown Support (Experimental)](#markdown-support-experimental)
+  below
 - On macOS, with a local Chrome/Chromium install, also opens
   Word/Excel/PowerPoint/Keynote/Pages/RTF files and more - see
   [Office Document Support (Experimental)](#office-document-support-experimental)
@@ -87,9 +91,13 @@ Confirmed working on iTerm2 and [WezTerm](https://wezterm.org).
   pictures embedded in a Quick Look preview file (Word/Excel/
   PowerPoint/etc.); not required at all if you only ever open plain
   image files.
-- macOS + a local Chrome/Chromium install - only needed for opening
-  Office/Keynote/Pages/etc. files via Quick Look; a file like that is
-  skipped with a warning if either is missing.
+- [pandoc](https://pandoc.org) - only needed for opening Markdown
+  files as a rendered preview; without it, a `.md` file falls back to
+  plain text mode.
+- A local Chrome/Chromium install - needed for Markdown previews and
+  (on macOS) for opening Office/Keynote/Pages/etc. files via Quick
+  Look; a file that needs Chrome is skipped with a warning if it isn't
+  available.
 - Python 3.9+
 - [uv](https://docs.astral.sh/uv/)
 
@@ -104,6 +112,16 @@ brew install poppler
 
 # Ubuntu/Debian (apt)
 sudo apt install poppler-utils
+```
+
+For Markdown previews, install [pandoc](https://pandoc.org) too:
+
+```sh
+# macOS (Homebrew)
+brew install pandoc
+
+# Ubuntu/Debian (apt)
+sudo apt install pandoc
 ```
 
 `pdfless.py` is a self-contained [PEP 723](https://peps.python.org/pep-0723/)
@@ -150,9 +168,9 @@ usage: pdfless [--help] [-v] [-p PAGE] [-d] [-s N] [-c] [-k] [-h] [-B] [-S]
                [file ...]
 
 positional arguments:
-  file                  path to one or more PDF, image, text, or Quick-Look-
-                        previewable files - reads from stdin instead if none
-                        or "-" are given
+  file                  path to one or more PDF, image, text, Markdown
+                        (.md, ...), or Quick-Look-previewable files -
+                        reads from stdin instead if none or "-" are given
 
 options:
   --help                show this help message and exit
@@ -160,11 +178,11 @@ options:
   -p, --page PAGE       page to start on, in the first file (default: 1)
   -d, --debug           print some debug information to stderr
   -s, --rendering-scale N
-                        device-pixel-ratio to render Quick Look preview files
-                        (Word/Excel/PowerPoint/etc., macOS only) at - higher
+                        device-pixel-ratio to render Markdown and Quick Look
+                        preview files (Word/Excel/PowerPoint/etc.) at - higher
                         looks sharper when zoomed in but is slower to render
                         (default: 1)
-  -c, --continuous      for a Quick Look preview file (macOS only), force
+  -c, --continuous      for a Markdown or Quick Look preview file, force
                         continuous scrolling instead of paginating
   -k, --keep            leave the last page on screen when quitting (q or ^C)
                         instead of restoring the terminal screen
@@ -207,6 +225,34 @@ from a build script, a LaTeX watch loop, or a script re-rendering a PNG) —
 `pdfless` picks up each rebuild automatically, without losing your place.
 With multiple files open, it only watches whichever one is currently
 displayed, switching what it watches along with `:n`/`:p`.
+
+## Markdown Support (Experimental)
+
+With [pandoc](https://pandoc.org) and a local Chrome/Chromium install,
+`pdfless` can also open Markdown files (`.md`, `.markdown`, `.mdown`,
+`.mkd`) as a rendered HTML preview — pandoc converts the file to
+standalone HTML, then a headless Chrome screenshot turns that into page
+images (the same capture path used for Office previews, but without
+Quick Look or macOS).
+
+This is experimental. By default the render is split into US-letter-sized
+pages so `n`/`p` and jumping straight to page N work the same as for a
+PDF; `-c`/`--continuous` keeps one long scroll instead. Markdown has no
+real print page breaks, so the split points are fixed-height slices and
+may cut through a paragraph or heading.
+
+| Feature | Details |
+| --- | --- |
+| Extensions | `.md`, `.markdown`, `.mdown`, `.mkd` |
+| Paging | Letter-sized slices by default; `-c` for one continuous scroll |
+| Text mode | Yes — the raw Markdown source (`t`); search works there, not in the rendered image |
+| Embedded images | Relative paths are resolved from the `.md` file's own directory |
+
+If pandoc or Chrome isn't available, a `.md` file falls back to plain
+text mode (raw source), the same as any other text file.
+
+`-s`/`--rendering-scale` and `-c`/`--continuous` apply to Markdown
+previews too; see [Usage](#usage).
 
 ## Office Document Support (Experimental)
 
@@ -273,10 +319,10 @@ Zoom and pan:
 | `K` / `U` / `Shift-Up` | jump to top of the current page (same as `g`) |
 | `J` / `D` / `Shift-Down` | jump to bottom of the current page (same as `G`) |
 
-Search always works for PDFs and plain text files; for a Quick Look
-preview file (Word/Excel/PowerPoint/etc.) only once switched into text
-mode with `t`, since there's no way to search its rendered page image
-directly; not available at all for a plain image. It's a
+Search always works for PDFs and plain text files; for a Markdown or
+Quick Look preview file (Word/Excel/PowerPoint/etc.) only once switched
+into text mode with `t`, since there's no way to search its rendered
+page image directly; not available at all for a plain image. It's a
 case-insensitive [Python regex](https://docs.python.org/3/library/re.html)
 against the extracted/file text, across the whole document (not just
 the current page) - falling back to a literal substring match if the
@@ -298,7 +344,7 @@ Misc:
 | click / drag | (page image, not text mode) on the scrollbar, jump to the position clicked - and keep following the pointer while you drag; otherwise open a PDF hyperlink under the pointer - a URL in the system browser, or an internal link by jumping to its target page/position |
 | mouse wheel | scroll up / down - in the page image, two lines at a time (`--wheel-scroll-step` to change that); in text mode, one line at a time |
 | `[` / `]` | back / forward, through the positions internal links have jumped from |
-| `t` | toggle plain-text view - the page's extracted text for a PDF, or the whole document's for a Word-family file (`.doc`/`.docx`/`.rtf`/...); a no-op for an image, spreadsheet, or slide deck, which have no text to extract |
+| `t` | toggle plain-text view - the page's extracted text for a PDF, the raw Markdown source for a `.md` file, or the whole document's for a Word-family file (`.doc`/`.docx`/`.rtf`/...); a no-op for an image, spreadsheet, or slide deck, which have no text to extract |
 | `B` | (text mode) toggle a border around the page's edges - on by default (`--no-border`/`-B` to start with it off); a plain text file starts with it off regardless; no border while wrapped, regardless of `B` (`-S` to unwrap first) |
 | `s` / `-S` | (text mode) toggle wrapping long lines instead of panning across them with `h`/`l`/`H`/`L` - on by default for a plain text file, off otherwise (`-S`/`--chop-long-lines` to start unwrapped) |
 | `E` | (text mode) toggle marking a real end-of-line (↵) - on by default (`-E`/`--no-eol-mark` to start without it) |
