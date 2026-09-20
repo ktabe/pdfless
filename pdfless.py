@@ -6141,10 +6141,10 @@ def run_viewer(
             # characters until Enter confirms it, Esc/^C cancels,
             # backspace edits it (or also cancels, if the pattern is
             # already empty), ^B/^F/LEFT/RIGHT move search_cursor within
-            # it, and ^U/^K kill from search_cursor to the start/end -
-            # readline's own bindings for these. Every other key is
-            # swallowed so it can't leak through as a page command while
-            # the prompt is up.
+            # it, ^D deletes the character under search_cursor, and
+            # ^U/^K kill from search_cursor to the start/end - readline's
+            # own bindings for these. Every other key is swallowed so it
+            # can't leak through as a page command while the prompt is up.
             if key in ("\r", "\n"):
                 query = search_buf or last_search_query
                 search_buf = None
@@ -6171,6 +6171,10 @@ def run_viewer(
             elif key in ("\x06", "RIGHT"):  # ^F
                 if search_cursor < len(search_buf):
                     search_cursor += 1
+                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
+            elif key == "\x04":  # ^D: delete the character under search_cursor
+                if search_cursor < len(search_buf):
+                    search_buf = search_buf[:search_cursor] + search_buf[search_cursor + 1:]
                     viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
             elif key == "\x15":  # ^U: kill from search_cursor to the start
                 if search_cursor > 0:
