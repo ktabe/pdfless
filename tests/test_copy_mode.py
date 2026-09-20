@@ -76,6 +76,79 @@ def test_copy_mode_does_the_recompute_its_widths_need(sample_text):
     assert viewer._text_avail_cols() == 40  # the column is back in play
 
 
+def test_clean_text_mode_enters_text_mode_with_decorations_off(sample_pdf):
+    """T (Viewer.toggle_clean_text_mode()): t and C in one press - image
+    mode straight into text mode, already cleared for copying."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf), line_numbers=True)
+    assert viewer.text_mode is False
+
+    assert viewer.toggle_clean_text_mode() is True
+    assert viewer.text_mode is True
+    assert decorations(viewer) == (False, False, False, False)
+
+
+def test_clean_text_mode_second_press_restores_decorations_and_image_mode(sample_pdf):
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf), line_numbers=True)
+    viewer.toggle_clean_text_mode()
+
+    assert viewer.toggle_clean_text_mode() is True
+    assert viewer.text_mode is False
+    assert decorations(viewer) == (True, True, True, True)
+
+
+def test_clean_text_mode_returns_false_without_touching_copy_mode(sample_image):
+    """Same failure case as toggle_text_mode() - a kind with no text
+    mode at all shouldn't have side effects on the decorations either."""
+    viewer = make_viewer(pdfless.ImageDocument(sample_image))
+    before = decorations(viewer)
+
+    assert viewer.toggle_clean_text_mode() is False
+    assert viewer.text_mode is False
+    assert decorations(viewer) == before
+
+
+def test_leaving_text_mode_via_plain_t_still_restores_copy_mode(sample_pdf):
+    """Regression: T (toggle_clean_text_mode()) turns copy mode on, but
+    "t" (toggle_text_mode()) - not "T" - was used to leave text mode
+    again. exit_text_mode() itself has to restore copy mode no matter
+    which key got you out, or the decorations it hid (most importantly
+    the scrollbar, which also applies in image mode) leak into the
+    image view and then stay stuck off on the next entry too, since
+    _copy_mode_saved would still be holding stale values - reported by
+    hand as "T -> t -> t makes the line numbers and EOL mark disappear"."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf), line_numbers=True)
+    original = decorations(viewer)
+    assert original == (True, True, True, True)
+
+    viewer.toggle_clean_text_mode()  # T: in, decorations off
+    assert decorations(viewer) == (False, False, False, False)
+
+    viewer.toggle_text_mode()  # t: out - must restore, not just leave
+    assert viewer.text_mode is False
+    assert decorations(viewer) == original
+    assert viewer._copy_mode_saved is None
+
+    viewer.toggle_text_mode()  # t: back in - must show the real decorations
+    assert viewer.text_mode is True
+    assert decorations(viewer) == original
+
+
+def test_leaving_text_mode_via_t_after_c_also_restores_copy_mode(sample_pdf):
+    """Same bug, reachable without T at all: "C" turns copy mode on
+    inside text mode, and "t" (not a second "C") leaves without
+    restoring it first."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf), line_numbers=True)
+    viewer.enter_text_mode()
+    original = decorations(viewer)
+
+    viewer.toggle_copy_mode()  # C
+    assert decorations(viewer) == (False, False, False, False)
+
+    viewer.toggle_text_mode()  # t: out - must restore first
+    assert decorations(viewer) == original
+    assert viewer._copy_mode_saved is None
+
+
 def test_copy_mode_stays_where_you_were_reading(tmp_path):
     """Toggling it is not a resize: the file isn't re-read, so the
     scroll position survives both presses. Needs a file taller than

@@ -280,6 +280,8 @@ Keys:
                           links have jumped from (PDF only)
                                <TOGGLES>
   t                       toggle plain-text view
+  T                       toggle plain-text view already cleared for
+                          copying, same as t and C together
   B                       (text mode) toggle a border around the page
   s -S                    (text mode) toggle wrapping long lines
   E                       (text mode) toggle marking an end-of-line (↵)
@@ -4066,6 +4068,19 @@ class Viewer:
         return True
 
     def exit_text_mode(self):
+        if self._copy_mode_saved is not None:
+            # Copy mode (however it was turned on - "C" inside text
+            # mode, or "T"'s own combined enter) only makes sense while
+            # in text mode - restore it here, on every way out,
+            # regardless of which key got us into text mode in the
+            # first place. Skipping this would leak the decorations it
+            # hid (most importantly the scrollbar, which also applies
+            # in image mode - see toggle_scrollbar()) into the image
+            # view and leave them stuck off on a later re-entry too,
+            # since _copy_mode_saved would still be holding the
+            # original values from however long ago copy mode was
+            # first turned on.
+            self.toggle_copy_mode()
         self.text_mode = False
         sys.stdout.write(MOUSE_ON)
         self._last_viewport_set = False
@@ -4091,6 +4106,25 @@ class Viewer:
             self.exit_text_mode()
             return True
         return self.enter_text_mode()
+
+    def toggle_clean_text_mode(self):
+        """T: t and C in one press - enter text mode with the copy-mode
+        decorations (border/EOL marks/scrollbar/line numbers) already
+        cleared, and undo both together on a second press, back to a
+        plain image view (exit_text_mode() itself restores copy mode
+        before leaving, however it was turned on - see there). Returns
+        False if there was no text to switch to (same as
+        toggle_text_mode()) - copy mode is left untouched in that
+        case."""
+        if self.text_mode:
+            self.exit_text_mode()  # restores copy mode, then refreshes
+            return True
+        if not self.enter_text_mode():  # refreshes into "undecorated" text mode
+            return False
+        if self._copy_mode_saved is None:
+            self.toggle_copy_mode()  # relayout only - no redraw of its own
+            self.refresh()  # so draw the now-decoration-free view here
+        return True
 
     def _load_text_page(self):
         # For a handler whose text isn't paginated (office/text/rtf),
@@ -6119,6 +6153,21 @@ def run_viewer(
                 viewer.draw_status("this is already a plain text file")
             elif viewer.doc_handler.supports_text_mode():
                 if not viewer.toggle_text_mode():
+                    viewer.draw_status("no text could be extracted from this file")
+            else:
+                viewer.draw_status("text mode isn't available for this file type")
+            continue
+
+        if key == "T":
+            # t and C combined into one press/undo - see
+            # Viewer.toggle_clean_text_mode(). Same eligibility checks
+            # as "t" above; there's no separate image view to enter for
+            # a kind that's always in text mode, so this is a no-op
+            # there too.
+            if viewer.doc_handler.starts_in_text_mode():
+                viewer.draw_status("this is already a plain text file")
+            elif viewer.doc_handler.supports_text_mode():
+                if not viewer.toggle_clean_text_mode():
                     viewer.draw_status("no text could be extracted from this file")
             else:
                 viewer.draw_status("text mode isn't available for this file type")

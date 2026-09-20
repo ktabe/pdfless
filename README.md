@@ -107,9 +107,11 @@ Search requires text: it is available for PDFs with extractable text, plain
 text files, and supported formats rendered to PDF. It is unavailable for
 plain images and previews without extractable text.
 
-To copy text, press `t`, then `C` to hide borders, line numbers, end-of-line
-markers, and the scrollbar. Select text using the terminal's normal selection
-controls. Press `C` again to restore the previous display settings.
+To copy text from image mode, press `T` to switch to text mode with borders,
+line numbers, end-of-line markers, and the scrollbar hidden. You can also
+press `t`, then `C`. If you are already in text mode, use `C` to toggle these
+display elements. Select text using the terminal's normal selection controls;
+press `C` again to restore the previous display settings.
 
 ### Options
 
@@ -133,9 +135,9 @@ controls. Press `C` again to restore the previous display settings.
 | `-d`, `--debug` | Print debugging information to standard error. |
 
 Note that `-h` means **fit to height**; use `--help` for command-line help.
-With `--follow`, only the currently displayed file is watched, and it can
-be toggled on or off at any time with `F` (see below); the status line
-shows `follow` while it's active.
+Follow mode watches only the currently displayed file. Press `F` to toggle
+it on or off at any time, or use `-F`/`--follow` to enable it at startup.
+The status line shows `follow` while the mode is active.
 
 ## Keyboard and mouse controls
 
@@ -181,13 +183,14 @@ shows `follow` while it's active.
 | Keys or gesture | Action |
 | --- | --- |
 | `t` | Toggle text mode where text extraction is supported. |
+| `T` | Toggle text mode with a clean display for copying, combining the functions of `t` and `C`. |
 | `B` | Toggle page borders in text mode (on by default, except for plain text files, which never show one). Borders are hidden while lines wrap. |
 | `s`, `-S` | Toggle line wrapping in text mode. Plain text wraps by default; other formats do not. |
 | `E` | Toggle end-of-line markers in text mode (shown by default). |
 | `#`, `-N` | Toggle line numbers in text mode (hidden by default). |
 | `C` | Toggle a clean text display for copying, restoring previous settings on the second press. |
 | `r` | Toggle the scrollbar (shown by default). |
-| `F` | Toggle follow mode (same as `-F`/`--follow`), off by default. The status line shows `follow` while it's active. |
+| `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-F`/`--follow` is specified. |
 | Click a PDF link | Open a URL in the system browser or follow an internal link. |
 | `[` / `]` | Go back / forward through internal-link navigation history. |
 | Click or drag the scrollbar | Jump to a document position in image mode. In text mode, the scrollbar is display-only. |
