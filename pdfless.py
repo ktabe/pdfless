@@ -3294,6 +3294,12 @@ class MarkdownDocument(OfficeDocument):
     WeasyPrint itself needs (Cairo/Pango/GLib, not something pip can
     install on its own) - aren't available; see sniff().
 
+    Text mode (`t`) always shows the raw Markdown source from disk -
+    not text extracted from the rendered PDF - so you can read or
+    search the `#`/`*` markup while keeping the WeasyPrint preview in
+    image mode. Image-mode search still uses the PDF delegate's own
+    per-page index when one exists.
+
     -c/--continuous has no effect here, the same as SofficeOnlyDocument
     and for the same reason: WeasyPrint's real pagination can't be
     collapsed back into a single page."""
@@ -3326,6 +3332,18 @@ class MarkdownDocument(OfficeDocument):
                 os.unlink(out_pdf)
             return None
         return self._remember_pages(("pdf", out_pdf, npages))
+
+    def extract_text(self, page):
+        return read_plain_text_lines(self.path)
+
+    def text_mode_is_paginated(self):
+        return False
+
+    def default_text_border(self, border_default):
+        return False
+
+    def default_text_wrap(self, wrap_default):
+        return wrap_default
 
 
 # The order main()'s classification loop tries these in - RtfOfficeDocument

@@ -182,7 +182,7 @@ The status line shows `follow` while the mode is active.
 
 | Keys or gesture | Action |
 | --- | --- |
-| `t` | Toggle text mode where text extraction is supported. |
+| `t` | Toggle text mode where text extraction is supported. For Markdown, shows the raw source (`#`, `*`, etc.), not PDF-extracted text. |
 | `T` | Toggle text mode with a clean display for copying, combining the functions of `t` and `C`. |
 | `B` | Toggle page borders in text mode (on by default, except for plain text files, which never show one). Borders are hidden while lines wrap. |
 | `s`, `-S` | Toggle line wrapping in text mode. Plain text wraps by default; other formats do not. |
@@ -246,10 +246,11 @@ Preview quality and pagination depend on the format and available renderer.
 | Visio | `.vsd`, `.vsdx` | LibreOffice required. One page per Visio page. `.vsdx` support has not been manually verified. |
 | WMF | `.wmf` | LibreOffice required. Single-page view. |
 | SVG | `.svg` | Chrome/Chromium. Scalable rendering; links within the SVG are not clickable. Falls back to XML source if Chrome is unavailable. |
-| Markdown | `.md`, `.markdown` | WeasyPrint and its system libraries. Paginated view with text mode, search, and clickable links. Falls back to Markdown source if rendering is unavailable. |
+| Markdown | `.md`, `.markdown` | WeasyPrint and its system libraries. Paginated view with search and clickable links. `t` shows the raw Markdown source; falls back to source-only display if rendering is unavailable. |
 
 Formats rendered to PDF support text extraction and search where the resulting
-PDF contains text. Image-based Quick Look previews do not.
+PDF contains text. Image-based Quick Look previews do not. In Markdown preview
+mode, `/` searches the rendered PDF; press `t` first to search the raw source.
 
 Use `-s` to increase the resolution of image-based Quick Look previews and
 `-c` to request continuous scrolling for Quick Look documents. These options
