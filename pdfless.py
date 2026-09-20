@@ -2058,6 +2058,13 @@ class DocumentHandler:
         textutil)."""
         return False
 
+    def search_resets_on_text_mode_toggle(self):
+        """Whether an active search should be cleared when `t` crosses
+        between image mode and text mode. False for handlers where both
+        views search the same extracted text (e.g. PDF); True when the
+        two modes search different things (MarkdownDocument)."""
+        return False
+
     def starts_in_text_mode(self):
         """Whether this handler has no image view at all - permanently
         "in text mode" from the moment the file opens (a plain text
@@ -3347,6 +3354,9 @@ class MarkdownDocument(OfficeDocument):
     def default_text_wrap(self, wrap_default):
         return wrap_default
 
+    def search_resets_on_text_mode_toggle(self):
+        return True
+
 
 # The order main()'s classification loop tries these in - RtfOfficeDocument
 # and RtfDocument (both RTF - the former tried first, see their own
@@ -4107,6 +4117,8 @@ class Viewer:
         sys.stdout.write(MOUSE_OFF)
         self._last_viewport_set = False
         self._last_marker_bounds = None
+        if self.search_query and self.doc_handler.search_resets_on_text_mode_toggle():
+            self.clear_search()
         self._load_text_page()
         # If there's a search match highlighted/boxed on this same page,
         # follow it across into text mode too, scrolled into view.
@@ -4139,6 +4151,8 @@ class Viewer:
         # - refresh() only reloads it on a resize - so without this it'd
         # redraw whatever page/scroll was last loaded before entering text
         # mode instead of following you back to where you navigated to.
+        if self.search_query and self.doc_handler.search_resets_on_text_mode_toggle():
+            self.clear_search()
         self.scroll = 0
         self._load_page()
         # Symmetric with enter_text_mode(): carry a highlighted match back
@@ -4498,6 +4512,19 @@ class Viewer:
                     results.append((i, m.start(), m.end()))
         return results
 
+    def _text_search_highlight(self):
+        """(line_idx, start, end) to highlight while drawing text mode,
+        or None. Never returns a PDF bbox tuple."""
+        if self.search_pos is None or not self.search_matches:
+            return None
+        match = self.search_matches[self.search_pos]
+        if self._search_uses_text_lines():
+            if len(match) == 3:
+                return match
+            return self._text_highlight_for_match(match)
+        page_match = match if len(match) == 5 else self._active_search_page_match()
+        return self._text_highlight_for_match(page_match)
+
     def _text_highlight_for_match(self, match):
         """(line_idx, start, end) of `match` within self.text_lines, or
         None if the query doesn't appear there at all (a real
@@ -4694,13 +4721,7 @@ class Viewer:
         own to border - it just keeps flowing to fill the width."""
         self._ensure_display_rows()
         avail_rows = self._text_avail_rows()
-        if not self.doc_handler.text_mode_is_paginated():
-            highlight = (
-                self.search_matches[self.search_pos]
-                if self.search_pos is not None else None
-            )
-        else:
-            highlight = self._text_highlight_for_match(self._active_search_page_match())
+        highlight = self._text_search_highlight()
 
         out = [STATUS_COLOR_OFF, "\x1b[H\x1b[2J"]
         n_rows = len(self._display_rows)
@@ -4774,16 +4795,7 @@ class Viewer:
         # below never needs to know it exists.
         gutter_width = self._line_number_gutter_width()
         avail_cols = max(1, self._text_avail_cols() - gutter_width)
-        if not self.doc_handler.text_mode_is_paginated():
-            # No PDF page/bbox structure to reconcile against here - the
-            # match tuple already is (line_idx, start, end), exactly
-            # what a highlight needs, so use it directly.
-            highlight = (
-                self.search_matches[self.search_pos]
-                if self.search_pos is not None else None
-            )
-        else:
-            highlight = self._text_highlight_for_match(self._active_search_page_match())
+        highlight = self._text_search_highlight()
         # Reset text attributes *before* clearing, not after: a
         # still-active SGR state (e.g. a background color left on by
         # draw_search_prompt(), which doesn't reset it since it's
