@@ -387,17 +387,6 @@ OFFICE_RENDER_SCALE = 1  # default device-pixel-ratio; --rendering-scale
 # overrides this - higher gives more headroom to zoom in before it looks
 # pixelated, at the cost of slower rendering (roughly linear in the
 # resulting pixel count) for a large document
-OFFICE_RENDER_SCALE_FLOWING = 2  # default device-pixel-ratio for
-# continuously-flowing text (Word and the like - no slide/page markers
-# at all, so no slide_offsets - see OfficeDocument._render_office_pages()): these are
-# text-heavy and usually short, so favor sharpness over the render-time
-# tradeoff OFFICE_RENDER_SCALE otherwise makes for a many-slide deck -
-# unless --rendering-scale was passed explicitly.
-OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
-OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
-OFFICE_MAX_CAPTURE_HEIGHT = 40000  # logical px cap on how tall a single
-# document's content is allowed to be, to keep a pathological document
-# from trying to rasterize an unbounded amount of image
 
 CHROME_CANDIDATES = (
     # (binary path, bundle id) - the bundle id lets find_chrome() move
@@ -633,18 +622,6 @@ _SRC_ATTR_RE = re.compile(r'\bsrc="([^"]+)"', re.IGNORECASE)
 _WIDTH_ATTR_RE = re.compile(r'\bwidth="([\d.]+)"', re.IGNORECASE)
 _HEIGHT_ATTR_RE = re.compile(r'\bheight="([\d.]+)"', re.IGNORECASE)
 
-# Office.qlgenerator's tab strip for a multi-sheet spreadsheet - see
-# _parse_sheet_tabs(). One <div class="TabViewItem ..."> per sheet, each
-# with a <div class="TabHeader"> (the sheet's own name) and an <a
-# href="..."> pointing at that sheet's already-rendered AttachmentN.html.
-_TAB_VIEW_ITEM_RE = re.compile(
-    r'<div\s+class="TabViewItem[^"]*">\s*'
-    r'<div\s+class="TabHeader">(.*?)</div>\s*'
-    r'<a\s+href="([^"]+)">',
-    re.IGNORECASE | re.DOTALL,
-)
-_TAG_RE = re.compile(r'<[^>]+>')
-
 
 # A hard ceiling on either dimension of a broken embedded picture
 # (PDF or TIFF), once rasterized/re-encoded - regardless of what DPI
@@ -729,146 +706,6 @@ def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
     return out_pdf if os.path.isfile(out_pdf) else None
 
 
-# Minimal styling for MarkdownDocument's rendered pages - just enough
-# that headings/code/quotes are visually distinct, deliberately not
-# trying to imitate any particular Markdown renderer's house style.
-# No @font-face/font-family override: left to whatever WeasyPrint
-# picks as the system default, so CJK text (which needs a real CJK
-# font) renders using whatever's actually installed rather than a
-# Latin-only font silently dropping every Japanese glyph.
-MARKDOWN_CSS = """
-body { line-height: 1.5; padding: 2em; }
-h1, h2, h3, h4, h5, h6 { line-height: 1.2; margin-top: 1em; }
-pre, code { font-family: monospace; background: #f0f0f0; }
-pre { padding: 0.6em; white-space: pre-wrap; }
-code { padding: 0.1em 0.3em; }
-pre code { padding: 0; background: none; }
-blockquote { border-left: 4px solid #ccc; margin-left: 0; padding-left: 1em; color: #555; }
-table { border-collapse: collapse; max-width: 100%; }
-th, td { border: 1px solid #ccc; padding: 0.3em 0.6em; }
-img { max-width: 100%; height: auto; }
-"""
-
-
-def _ensure_homebrew_lib_path_for_weasyprint():
-    """WeasyPrint (via cffi) dlopen()s Cairo/Pango/GLib by their bare
-    library names, relying on the dynamic linker's own default search
-    to find them. Confirmed by hand: that default search does NOT
-    include Homebrew's own lib directory when running under a
-    uv-managed standalone Python build (e.g. a free-threaded 3.14
-    install) - even with those exact libraries installed via Homebrew
-    - while the same import succeeds unmodified under a
-    Homebrew-installed Python on the same machine. Rather than
-    requiring every user hitting this to discover and set
-    DYLD_LIBRARY_PATH by hand (WeasyPrint's own macOS troubleshooting
-    docs suggest exactly that), add Homebrew's lib directory to
-    DYLD_FALLBACK_LIBRARY_PATH before the first import attempt -
-    confirmed by hand this alone is enough to fix the failing case.
-    A *fallback* path (rather than DYLD_LIBRARY_PATH, which is
-    consulted first) can't ever shadow a library some other search
-    step already finds correctly, so this is safe to always do.
-    macOS-only; a no-op everywhere else."""
-    if sys.platform != "darwin":
-        return
-    existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
-    parts = existing.split(":") if existing else []
-    for lib_dir in ("/opt/homebrew/lib", "/usr/local/lib"):
-        if os.path.isdir(lib_dir) and lib_dir not in parts:
-            parts.append(lib_dir)
-    if parts:
-        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(parts)
-
-
-def _markdown_rendering_available():
-    """Whether MarkdownDocument can even attempt to render at all -
-    both the `markdown` and `weasyprint` libraries import cleanly.
-    Cheap to call more than once: a successful import is cached by
-    Python itself (sys.modules), so only the first call actually pays
-    for it. See _render_markdown_pdf() for why this has to be a
-    runtime check rather than something assumed from the PEP723
-    dependency list.
-
-    Deliberately catches more than just ImportError: weasyprint's own
-    import chain reaches into cffi to dlopen() the actual Cairo/Pango/
-    GLib shared libraries, and a missing one there raises a plain
-    OSError, not an ImportError (confirmed by hand: "cannot load
-    library 'libgobject-2.0-0'" on a machine without those system
-    libraries installed) - anything going wrong at import time means
-    the same thing here (rendering isn't available), so it's all
-    caught the same way rather than letting a fairly common
-    installation gap crash the whole program on startup.
-
-    Also deliberately swallows whatever weasyprint prints along the
-    way: on that same missing-libraries path, it print()s its own
-    multi-line "could not import some external libraries" notice
-    before the OSError above even reaches here (confirmed by hand).
-    Since this whole function's job is to fail silently and let the
-    caller fall back to plain text, letting that notice through would
-    defeat the point - and pdfless spends most of its life with the
-    terminal in raw mode showing an alternate screen, where a stray
-    print from a library is a corrupted-looking screen, not just
-    unwanted noise."""
-    _ensure_homebrew_lib_path_for_weasyprint()
-    try:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            import markdown  # noqa: F401
-            import weasyprint  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
-def _render_markdown_pdf(path, out_pdf):
-    """Convert `path` (a Markdown file) to a real PDF via the
-    `markdown` (Markdown -> HTML) and `weasyprint` (HTML+CSS -> PDF)
-    libraries - no headless Chrome or LibreOffice involved at all, and
-    dramatically faster than either (confirmed by hand: a whole
-    conversion takes well under a second, against Chrome's own ~1-2s
-    process startup alone), since WeasyPrint has a real CSS
-    pagination engine of its own - no need for FlowingText/
-    SvgDocument's own "measure the content first, then set an exact
-    @page size" dance; a long document just comes out as however many
-    pages it naturally takes.
-
-    Both libraries are declared PEP723 dependencies (so `uv run`
-    always installs the pip packages), but weasyprint also needs
-    system-level Cairo/Pango/GLib libraries pip can't install by
-    itself - so the import happens lazily, here (via
-    _markdown_rendering_available()), rather than at module load time,
-    and any failure is treated the same as "not installed": returns
-    False, and the caller falls back to plain-text rendering, the
-    same graceful degradation soffice/Chrome already get when they're
-    missing.
-
-    Returns False on any failure (including a missing library) - never
-    raises, so this is always safe for a caller to attempt speculatively."""
-    if not _markdown_rendering_available():
-        return False
-    import markdown
-    from weasyprint import HTML
-
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            source = f.read()
-    except OSError:
-        return False
-    body = markdown.markdown(source, extensions=["extra", "sane_lists"])
-    html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{MARKDOWN_CSS}</style></head><body>{body}</body></html>'
-    # base_url lets a relative-path image reference in the source
-    # (e.g. "![alt](./diagram.png)") resolve against the Markdown
-    # file's own directory, the same as a browser would for a page
-    # loaded from there.
-    base_url = os.path.dirname(os.path.abspath(path)) + "/"
-    try:
-        HTML(string=html, base_url=base_url).write_pdf(out_pdf)
-    except Exception:
-        # WeasyPrint can raise a variety of its own exception types for
-        # a malformed document/CSS - none of them worth the whole
-        # program aborting over; the caller's error-placeholder
-        # fallback handles it the same as any other rendering failure.
-        return False
-    return os.path.exists(out_pdf)
-
 
 def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
     """A Quick Look Office/iWork preview can embed a picture as
@@ -883,7 +720,7 @@ def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
     all, unlike PDF, which at least fails the same way in every
     browser other than Safari/WebKit). Across every picture in a slide
     deck, that's often enough bogus extra height to throw off later
-    slides' measured positions entirely (see _measure_slide_offsets()).
+    slides' measured positions entirely (see OfficeDocument._measure_slide_offsets()).
 
     iWork.qlgenerator (Numbers/Pages/Keynote) additionally splits a
     multi-sheet/page document into one `<iframe src="AttachmentN.html">`
@@ -1120,21 +957,6 @@ def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
     return _patch(html_path)
 
 
-# GPU compositing has a texture-size ceiling that a multi-page/multi-
-# slide document's full-height capture (thousands of px, sometimes tens
-# of thousands) routinely exceeds, and Chrome then just hangs rather
-# than erroring out - confirmed hanging indefinitely with a physical
-# (post device-scale-factor) height anywhere from 24000px up on this
-# machine, well under Chrome's largest documented max-texture-size
-# (16384px on some GPUs) that a naive "keep the safety margin below
-# that" guess would have assumed safe. Software rasterization
-# (--disable-gpu) has no such limit but is noticeably slower, so a
-# capture kept safely under any plausible ceiling still uses the GPU;
-# anything at or beyond it skips straight to software rather than
-# wasting a mostly-guaranteed-to-time-out attempt first.
-OFFICE_GPU_SAFE_PHYSICAL_PX = 12000
-
-
 def _capture_html_screenshot(chrome, html_path, width, height, out_png, render_scale):
     physical_w = width * render_scale
     physical_h = height * render_scale
@@ -1145,7 +967,7 @@ def _capture_html_screenshot(chrome, html_path, width, height, out_png, render_s
         f"--screenshot={out_png}",
         f"file://{os.path.abspath(html_path)}",
     ]
-    if max(physical_w, physical_h) < OFFICE_GPU_SAFE_PHYSICAL_PX:
+    if max(physical_w, physical_h) < OfficeVariant.OFFICE_GPU_SAFE_PHYSICAL_PX:
         try:
             subprocess.run(base_args, capture_output=True, check=True, timeout=8)
             return
@@ -1171,7 +993,7 @@ def _capture_html_pdf(chrome, html_path, width, height, out_pdf, timeout=20):
 
     The page size is set via an injected `@page` CSS rule, in a scratch
     copy of html_path that's never written back (same idea as
-    _measure_slide_offsets()'s instrumented copy) - headless Chrome's
+    OfficeDocument._measure_slide_offsets()'s instrumented copy) - headless Chrome's
     CLI has no --paper-width/--paper-height flag of its own; this is
     the only way to reach a custom page size without going through the
     DevTools protocol (which is what a browser-automation library like
@@ -1330,113 +1152,10 @@ def _detect_fallback_page_xpath(content):
     return "/html/body/div" if matching >= len(top_divs) * 0.9 else None
 
 
-def _measure_slide_offsets(chrome, html_path, page_element_xpath, width):
-    """For a document whose Quick Look preview has distinct page/slide
-    elements (see OfficeDocument._generate_ql_preview()'s page_element_xpath - Word's
-    continuously-flowing text has none, so this is never called for
-    that), ask Chrome for the exact pixel boundary between each one, via
-    a small script injected into a scratch copy of the HTML and read
-    back with `--dump-dom` - real computed layout (offsetTop) rather
-    than a guess. This matters because they can butt right up against
-    each other with no clean gap to detect in a screenshot (e.g. a
-    PowerPoint slide's drop shadow bleeding into the margin before the
-    next one), so slicing by the plist's Height (one page/slide's own
-    height, not counting that margin) drifts out of alignment with the
-    actual boundaries after enough of them.
-
-    Returns (total_height, [offset, ...]) in logical (unscaled) CSS
-    pixels - one offset per page/slide, in document order - or None if
-    page_element_xpath matched nothing, or Chrome/parsing failed.
-
-    Note this still can't guarantee a slide's content never bleeds onto
-    the next one: PowerPoint/Keynote auto-shrink text at display time so
-    it fits its placeholder, but this static HTML preview doesn't
-    reproduce that, so a slide relying on it can render past its box's
-    bottom edge despite the box's own overflow:hidden - that's a
-    limitation of the generator's HTML output itself (also visible in
-    Quick Look proper), not something fixable from here.
-
-    `width` must match the logical width the real screenshot is later
-    taken at (OfficeDocument._render_office_pages()'s own `width`): layout - and so each
-    element's offsetTop - can depend on the viewport's width (e.g. a
-    slide whose content is one `<img width="100%">`, scaling with the
-    container), so measuring at any other width (Chrome's own headless
-    default, if not given explicitly) can silently disagree with the
-    boundaries the real capture ends up with, throwing off every slice
-    from that point on."""
-    try:
-        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError:
-        return None
-
-    if not page_element_xpath:
-        page_element_xpath = _detect_fallback_page_xpath(content)
-        if not page_element_xpath:
-            return None
-
-    idx = content.rfind("</body>")
-    script = _build_slide_measure_script(page_element_xpath)
-    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
-    measure_path = os.path.join(os.path.dirname(html_path), "pdfless-slide-measure.html")
-    with open(measure_path, "w", encoding="utf-8") as f:
-        f.write(instrumented)
-    try:
-        r = subprocess.run(
-            [
-                chrome, "--headless", "--no-sandbox",
-                # Must match the real capture's width (see the
-                # docstring): a tall, arbitrary height is fine since
-                # dump-dom doesn't render/screenshot anything, just
-                # loads and serializes the DOM at that viewport size.
-                f"--window-size={width},1080",
-                # 8s, not 2s: an upper bound on how long the injected
-                # script (see _build_slide_measure_script()) is allowed
-                # to wait for every <img> to finish decoding before
-                # giving up and dumping whatever it's got - it resolves
-                # as soon as they're all ready, so this only matters as
-                # a cap for a deck with many/large embedded images.
-                "--dump-dom", "--virtual-time-budget=8000",
-                f"file://{os.path.abspath(measure_path)}",
-            ],
-            capture_output=True, text=True, timeout=30, check=True,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-        return None
-    finally:
-        os.unlink(measure_path)
-
-    m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
-    if not m:
-        return None
-    try:
-        data = json.loads(html.unescape(m.group(1)))
-        tops = [float(t) for t in data["tops"]]
-        if not tops:
-            return None
-        # Sanity check: a real stack of pages/slides lays out top to
-        # bottom, so each offsetTop should be strictly greater than the
-        # last. Seen in the wild for one Keynote/iWork.qlgenerator
-        # variant: the same shape _detect_fallback_page_xpath() looks
-        # for (a <div> wrapping one full-bleed <img> per slide), but
-        # with every single one reporting offsetTop 0 and a tiny total
-        # scrollHeight - i.e. this generator overlaps them (probably
-        # meant to be shown one at a time via some JS this static
-        # capture doesn't run), not stacked in document flow at all. If
-        # so, slicing by these numbers would compute zero- or negative-
-        # height "pages" - return None and let the caller fall back to
-        # the plain grow-and-trim path instead of acting on bogus data.
-        if any(tops[i + 1] <= tops[i] for i in range(len(tops) - 1)):
-            return None
-        return float(data["total"]), tops
-    except (ValueError, KeyError, TypeError):
-        return None
-
-
 def _measure_content_height(chrome, html_path, width, timeout=30):
     """document.body.scrollHeight for `html_path` at `width` (logical
     CSS px) - the same script-injected-title / --dump-dom technique as
-    _measure_slide_offsets() (see there for why dump-dom rather than a
+    OfficeDocument._measure_slide_offsets() (see there for why dump-dom rather than a
     screenshot), but for a document's total flowing height rather than
     per-slide boundaries.
 
@@ -1449,7 +1168,7 @@ def _measure_content_height(chrome, html_path, width, timeout=30):
     falls back to a default Letter page instead), so measuring first
     and passing an explicit height is the only way. Returns None on
     any failure - the caller falls back to a fixed cap
-    (OFFICE_MAX_CAPTURE_HEIGHT) instead."""
+    (OfficeVariant.OFFICE_MAX_CAPTURE_HEIGHT) instead."""
     try:
         with open(html_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
@@ -1567,6 +1286,24 @@ class OfficeVariant:
     lives in OfficeDocument._render_office_pages() itself, since it has to run before
     any variant can even be chosen."""
 
+    # GPU compositing has a texture-size ceiling that a multi-page/multi-
+    # slide document's full-height capture (thousands of px, sometimes tens
+    # of thousands) routinely exceeds, and Chrome then just hangs rather
+    # than erroring out - confirmed hanging indefinitely with a physical
+    # (post device-scale-factor) height anywhere from 24000px up on this
+    # machine, well under Chrome's largest documented max-texture-size
+    # (16384px on some GPUs) that a naive "keep the safety margin below
+    # that" guess would have assumed safe. Software rasterization
+    # (--disable-gpu) has no such limit but is noticeably slower, so a
+    # capture kept safely under any plausible ceiling still uses the GPU;
+    # anything at or beyond it skips straight to software rather than
+    # wasting a mostly-guaranteed-to-time-out attempt first.
+    OFFICE_GPU_SAFE_PHYSICAL_PX = 12000
+
+    OFFICE_MAX_CAPTURE_HEIGHT = 40000  # logical px cap on how tall a single
+    # document's content is allowed to be, to keep a pathological document
+    # from trying to rasterize an unbounded amount of image
+
     def __init__(self, chrome, html_path, width, height, tag, name):
         self.chrome = chrome
         self.html_path = html_path
@@ -1610,12 +1347,23 @@ class ExcelWorkbook(OfficeVariant):
     selector is pinned to the bottom of the viewport regardless of
     window height, which would defeat that trick)."""
 
+    # Office.qlgenerator's tab strip for a multi-sheet spreadsheet - see
+    # _parse_sheet_tabs(). One <div class="TabViewItem ..."> per sheet, each
+    # with a <div class="TabHeader"> (the sheet's own name) and an <a
+    # href="..."> pointing at that sheet's already-rendered AttachmentN.html.
+    _TAB_VIEW_ITEM_RE = re.compile(
+        r'<div\s+class="TabViewItem[^"]*">\s*'
+        r'<div\s+class="TabHeader">(.*?)</div>\s*'
+        r'<a\s+href="([^"]+)">',
+        re.IGNORECASE | re.DOTALL,
+    )
+    _TAG_RE = re.compile(r'<[^>]+>')
+
     def __init__(self, chrome, html_path, width, height, tag, name):
         super().__init__(chrome, html_path, width, height, tag, name)
         self.sheet_tabs = self._parse_sheet_tabs(html_path)
 
-    @staticmethod
-    def _parse_sheet_tabs(html_path):
+    def _parse_sheet_tabs(self, html_path):
         """For a multi-sheet Excel-like Quick Look preview, return an
         ordered [(sheet_name, absolute_html_path), ...] - one per sheet
         - by reading the tab strip out of `html_path`'s own content
@@ -1629,14 +1377,14 @@ class ExcelWorkbook(OfficeVariant):
             return []
         base_dir = os.path.dirname(html_path)
         tabs = []
-        for m in _TAB_VIEW_ITEM_RE.finditer(content):
+        for m in self._TAB_VIEW_ITEM_RE.finditer(content):
             href = m.group(2)
             if _ABSOLUTE_SRC_RE.match(href):
                 continue  # http(s)/data/... - not a local sibling file
             candidate = os.path.join(base_dir, href)
             if not os.path.isfile(candidate):
                 continue
-            name = html.unescape(_TAG_RE.sub("", m.group(1))).strip()
+            name = html.unescape(self._TAG_RE.sub("", m.group(1))).strip()
             tabs.append((name or f"Sheet {len(tabs) + 1}", candidate))
         return tabs
 
@@ -1705,7 +1453,7 @@ class ExcelWorkbook(OfficeVariant):
 
 class SlideDeck(OfficeVariant):
     """A slide deck (PowerPoint/Keynote) whose page/slide boundaries
-    were measured (see _measure_slide_offsets()) - the exact total
+    were measured (see OfficeDocument._measure_slide_offsets()) - the exact total
     height is already known, so this is captured in one shot rather
     than guessed. `confident` (see OfficeDocument._render_office_pages()) is whether the
     boundary came from the plist's own PageElementXPath, as opposed to
@@ -1722,7 +1470,7 @@ class SlideDeck(OfficeVariant):
 
     def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
         total_height, tops = self.slide_offsets
-        capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(1, round(total_height)))
+        capture_height = min(self.OFFICE_MAX_CAPTURE_HEIGHT, max(1, round(total_height)))
         out_png = os.path.join(tmpdir, f"office-capture-{self.tag}.png")
         label = (
             f"{self.name}: rendering "
@@ -1743,7 +1491,7 @@ class SlideDeck(OfficeVariant):
             else:
                 # Slice at each slide's own measured start, in physical
                 # (scaled) pixels - exact, unlike guessing from the
-                # screenshot itself (see _measure_slide_offsets() for
+                # screenshot itself (see OfficeDocument._measure_slide_offsets() for
                 # why that doesn't work here).
                 bounds = [
                     min(trimmed.height, round(t * render_scale)) for t in tops
@@ -1770,6 +1518,13 @@ class FlowingText(OfficeVariant):
     for the PDF path, which is always re-rasterized at whatever DPI the
     current zoom needs, regardless of any render_scale)."""
 
+    OFFICE_RENDER_SCALE_FLOWING = 2  # default device-pixel-ratio for
+    # continuously-flowing text (Word and the like - no slide/page markers
+    # at all, so no slide_offsets - see OfficeDocument._render_office_pages()): these are
+    # text-heavy and usually short, so favor sharpness over the render-time
+    # tradeoff OFFICE_RENDER_SCALE otherwise makes for a many-slide deck -
+    # unless --rendering-scale was passed explicitly.
+
     def build_pages(self, tmpdir, debug, render_scale, progress, continuous):
         pdf_pages = self._build_pdf_pages(tmpdir, debug, progress, continuous)
         if pdf_pages is not None:
@@ -1790,7 +1545,7 @@ class FlowingText(OfficeVariant):
         flow, unlike the screenshot path's own bounds logic below,
         which can only guess at a fixed pixel height after the fact.
         That's also why this doesn't need SlideDeck's
-        _measure_slide_offsets() dance in the first place: a
+        OfficeDocument._measure_slide_offsets() dance in the first place: a
         print-mode page break follows the content wherever it actually
         flows, so a slightly-off page height just spills part of one
         page onto the next rather than throwing off every later page's
@@ -1812,7 +1567,7 @@ class FlowingText(OfficeVariant):
                 content_height = _measure_content_height(self.chrome, self.html_path, self.width)
             if not content_height:
                 # Couldn't measure - rather than guess a one-size-fits-
-                # all OFFICE_MAX_CAPTURE_HEIGHT (a real, if rare, source
+                # all OfficeVariant.OFFICE_MAX_CAPTURE_HEIGHT (a real, if rare, source
                 # of a giant near-blank page under load, where Chrome's
                 # dump-dom measurement is more likely to time out), fall
                 # back to the screenshot path, which doesn't depend on
@@ -1824,7 +1579,7 @@ class FlowingText(OfficeVariant):
             # two rendering paths) - this only has to avoid spilling a
             # couple of leftover px onto a needless second page, not be
             # exact.
-            page_height = min(OFFICE_MAX_CAPTURE_HEIGHT, content_height + 40)
+            page_height = min(self.OFFICE_MAX_CAPTURE_HEIGHT, content_height + 40)
         else:
             page_height = self.height
         label = f"{self.name}: rendering to PDF"
@@ -1839,7 +1594,7 @@ class FlowingText(OfficeVariant):
 
     def _build_pages_via_screenshot(self, tmpdir, debug, render_scale, progress, continuous):
         if render_scale == OFFICE_RENDER_SCALE:
-            render_scale = OFFICE_RENDER_SCALE_FLOWING
+            render_scale = self.OFFICE_RENDER_SCALE_FLOWING
         out_png = os.path.join(tmpdir, f"office-capture-{self.tag}.png")
         # Starting small (rather than generously large) matters for
         # speed, not just to avoid over-capturing a short document: it
@@ -1847,7 +1602,7 @@ class FlowingText(OfficeVariant):
         # _capture_html_screenshot's GPU-safe size threshold, where
         # every doubling from here on is much faster than the single
         # oversized one this used to start with.
-        capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, max(self.height * 3, 1500))
+        capture_height = min(self.OFFICE_MAX_CAPTURE_HEIGHT, max(self.height * 3, 1500))
         try:
             attempt = 0
             while True:
@@ -1866,9 +1621,9 @@ class FlowingText(OfficeVariant):
                 img = Image.open(out_png)
                 img.load()
                 trimmed, cut_off = _trim_trailing_blank_rows(img, _sample_background_color(img))
-                if not cut_off or capture_height >= OFFICE_MAX_CAPTURE_HEIGHT:
+                if not cut_off or capture_height >= self.OFFICE_MAX_CAPTURE_HEIGHT:
                     break
-                capture_height = min(OFFICE_MAX_CAPTURE_HEIGHT, capture_height * 2)
+                capture_height = min(self.OFFICE_MAX_CAPTURE_HEIGHT, capture_height * 2)
             if continuous:
                 bounds = [0, trimmed.height]
             else:
@@ -1927,22 +1682,6 @@ def _caret_notation(match):
     return "^" + chr(ord(match.group()) ^ 0x40)
 
 
-def is_rtf_file(path):
-    """Sniff for RTF's own signature ("{\\rtf1" right at the start),
-    the same way PdfDocument.is_pdf_file() sniffs "%PDF-" rather than trusting the
-    extension. RTF is - deliberately - plain ASCII text, so
-    is_probably_text()'s NUL-byte heuristic happily calls it plain
-    text too; read_plain_text_lines() uses this to tell the two apart,
-    since showing an RTF file "as plain text" verbatim just means
-    showing its raw markup (control words, font/color tables, ...)
-    instead of the document's actual content."""
-    try:
-        with open(path, "rb") as f:
-            return f.read(6) == b"{\\rtf1"
-    except OSError:
-        return False
-
-
 def read_plain_text_lines(path, tab_width=8):
     """A plain text file's lines, as pdftotext -layout's output is for a
     PDF page: ready to hand straight to the existing text-mode renderer.
@@ -1952,29 +1691,16 @@ def read_plain_text_lines(path, tab_width=8):
     - see _caret_notation() - rather than passed through raw, so odd
     file content can't corrupt the terminal display the way that would.
 
-    An RTF file (see is_rtf_file()) is its own special case: its "plain
-    text" content is the raw RTF markup, not the document text a reader
-    actually wants, so this extracts that instead via extract_office_text()
-    (macOS's textutil) - falling back to the raw markup only if that
-    somehow fails, rather than showing nothing at all."""
-    if is_rtf_file(path):
-        lines = extract_office_text(path)
-        if lines is not None:
-            return lines
+    Always reads `path` verbatim - an RTF file's raw markup (control
+    words, font/color tables, ...) rather than its document text, which
+    is exactly what a plain-text sniff/decode check wants. RtfDocument
+    is the one that knows to prefer extract_office_text() over this raw
+    markup for actual display - see RtfDocument.extract_text()."""
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     content = content.expandtabs(tab_width)
     content = _CONTROL_CHAR_RE.sub(_caret_notation, content)
     return content.splitlines()
-
-
-_BBOX_PAGE_RE = re.compile(
-    r'<page width="([\d.]+)" height="([\d.]+)">(.*?)</page>', re.S
-)
-_BBOX_WORD_RE = re.compile(
-    r'<word xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" yMax="([\d.]+)">(.*?)</word>'
-)
-
 
 
 def compile_search_pattern(query):
@@ -2162,6 +1888,13 @@ class DocumentHandler:
 class PdfDocument(DocumentHandler):
     kind = "pdf"
 
+    _BBOX_PAGE_RE = re.compile(
+        r'<page width="([\d.]+)" height="([\d.]+)">(.*?)</page>', re.S
+    )
+    _BBOX_WORD_RE = re.compile(
+        r'<word xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" yMax="([\d.]+)">(.*?)</word>'
+    )
+
     @staticmethod
     def is_pdf_file(path):
         """Sniff the file's own content rather than trusting its
@@ -2238,11 +1971,11 @@ class PdfDocument(DocumentHandler):
         ).stdout
 
         pages = []
-        for width, height, body in _BBOX_PAGE_RE.findall(out):
+        for width, height, body in self._BBOX_PAGE_RE.findall(out):
             words = []
             parts = []
             offset = 0
-            for xmin, ymin, xmax, ymax, word_html in _BBOX_WORD_RE.findall(body):
+            for xmin, ymin, xmax, ymax, word_html in self._BBOX_WORD_RE.findall(body):
                 word_text = html.unescape(word_html)
                 if not word_text:
                     continue
@@ -2541,9 +2274,25 @@ class RtfDocument(TextDocument):
     markup (control words, font/color tables, ...), not the document's
     actual content - see is_rtf_file()."""
 
+    @staticmethod
+    def is_rtf_file(path):
+        """Sniff for RTF's own signature ("{\\rtf1" right at the start),
+        the same way PdfDocument.is_pdf_file() sniffs "%PDF-" rather
+        than trusting the extension. RTF is - deliberately - plain
+        ASCII text, so is_probably_text()'s NUL-byte heuristic happily
+        calls it plain text too; sniff() uses this to tell the two
+        apart. A staticmethod (not reading self.path) since
+        RtfOfficeDocument.sniff() also calls this directly, on a
+        candidate path, before any RtfDocument instance exists."""
+        try:
+            with open(path, "rb") as f:
+                return f.read(6) == b"{\\rtf1"
+        except OSError:
+            return False
+
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
-        if not is_rtf_file(path):
+        if not cls.is_rtf_file(path):
             return None
         if not is_probably_text(path):
             # Vanishingly unlikely for genuine RTF (it's pure ASCII by
@@ -2589,6 +2338,9 @@ class OfficeDocument(DocumentHandler):
     # - nothing like qlmanage's "one full sheet per page". See
     # _soffice_pages_if_eligible().
     _SOFFICE_EXTENSIONS = (".doc", ".docx", ".docm", ".ppt", ".pptx", ".pptm", ".rtf")
+
+    OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
+    OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
 
     def __init__(self, path):
         super().__init__(path)
@@ -2828,6 +2580,108 @@ class OfficeDocument(DocumentHandler):
             return None
         return ("pdf", out_pdf, npages)
 
+    def _measure_slide_offsets(self, chrome, html_path, page_element_xpath, width):
+        """For a document whose Quick Look preview has distinct page/slide
+        elements (see _generate_ql_preview()'s page_element_xpath - Word's
+        continuously-flowing text has none, so this is never called for
+        that), ask Chrome for the exact pixel boundary between each one, via
+        a small script injected into a scratch copy of the HTML and read
+        back with `--dump-dom` - real computed layout (offsetTop) rather
+        than a guess. This matters because they can butt right up against
+        each other with no clean gap to detect in a screenshot (e.g. a
+        PowerPoint slide's drop shadow bleeding into the margin before the
+        next one), so slicing by the plist's Height (one page/slide's own
+        height, not counting that margin) drifts out of alignment with the
+        actual boundaries after enough of them.
+
+        Returns (total_height, [offset, ...]) in logical (unscaled) CSS
+        pixels - one offset per page/slide, in document order - or None if
+        page_element_xpath matched nothing, or Chrome/parsing failed.
+
+        Note this still can't guarantee a slide's content never bleeds onto
+        the next one: PowerPoint/Keynote auto-shrink text at display time so
+        it fits its placeholder, but this static HTML preview doesn't
+        reproduce that, so a slide relying on it can render past its box's
+        bottom edge despite the box's own overflow:hidden - that's a
+        limitation of the generator's HTML output itself (also visible in
+        Quick Look proper), not something fixable from here.
+
+        `width` must match the logical width the real screenshot is later
+        taken at (_render_office_pages()'s own `width`): layout - and so each
+        element's offsetTop - can depend on the viewport's width (e.g. a
+        slide whose content is one `<img width="100%">`, scaling with the
+        container), so measuring at any other width (Chrome's own headless
+        default, if not given explicitly) can silently disagree with the
+        boundaries the real capture ends up with, throwing off every slice
+        from that point on."""
+        try:
+            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            return None
+
+        if not page_element_xpath:
+            page_element_xpath = _detect_fallback_page_xpath(content)
+            if not page_element_xpath:
+                return None
+
+        idx = content.rfind("</body>")
+        script = _build_slide_measure_script(page_element_xpath)
+        instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
+        measure_path = os.path.join(os.path.dirname(html_path), "pdfless-slide-measure.html")
+        with open(measure_path, "w", encoding="utf-8") as f:
+            f.write(instrumented)
+        try:
+            r = subprocess.run(
+                [
+                    chrome, "--headless", "--no-sandbox",
+                    # Must match the real capture's width (see the
+                    # docstring): a tall, arbitrary height is fine since
+                    # dump-dom doesn't render/screenshot anything, just
+                    # loads and serializes the DOM at that viewport size.
+                    f"--window-size={width},1080",
+                    # 8s, not 2s: an upper bound on how long the injected
+                    # script (see _build_slide_measure_script()) is allowed
+                    # to wait for every <img> to finish decoding before
+                    # giving up and dumping whatever it's got - it resolves
+                    # as soon as they're all ready, so this only matters as
+                    # a cap for a deck with many/large embedded images.
+                    "--dump-dom", "--virtual-time-budget=8000",
+                    f"file://{os.path.abspath(measure_path)}",
+                ],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return None
+        finally:
+            os.unlink(measure_path)
+
+        m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
+        if not m:
+            return None
+        try:
+            data = json.loads(html.unescape(m.group(1)))
+            tops = [float(t) for t in data["tops"]]
+            if not tops:
+                return None
+            # Sanity check: a real stack of pages/slides lays out top to
+            # bottom, so each offsetTop should be strictly greater than the
+            # last. Seen in the wild for one Keynote/iWork.qlgenerator
+            # variant: the same shape _detect_fallback_page_xpath() looks
+            # for (a <div> wrapping one full-bleed <img> per slide), but
+            # with every single one reporting offsetTop 0 and a tiny total
+            # scrollHeight - i.e. this generator overlaps them (probably
+            # meant to be shown one at a time via some JS this static
+            # capture doesn't run), not stacked in document flow at all. If
+            # so, slicing by these numbers would compute zero- or negative-
+            # height "pages" - return None and let the caller fall back to
+            # the plain grow-and-trim path instead of acting on bogus data.
+            if any(tops[i + 1] <= tops[i] for i in range(len(tops) - 1)):
+                return None
+            return float(data["total"]), tops
+        except (ValueError, KeyError, TypeError):
+            return None
+
     def _render_office_pages(
         self, path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
         progress=None, continuous=False,
@@ -2846,7 +2700,7 @@ class OfficeDocument(DocumentHandler):
         (--rendering-scale) - higher is sharper when zoomed in but
         slower for a large document; left at its default
         (OFFICE_RENDER_SCALE), continuously-flowing text (Word and the
-        like) renders at OFFICE_RENDER_SCALE_FLOWING instead, favoring
+        like) renders at FlowingText.OFFICE_RENDER_SCALE_FLOWING instead, favoring
         sharpness since these documents are usually short. `progress`,
         if given, is a _ProgressLine to post a one-line "what's
         happening right now" status to, since this whole method can
@@ -2908,8 +2762,8 @@ class OfficeDocument(DocumentHandler):
             if preview is None:
                 return None
             html_path, width, height, should_not_scale, page_element_xpath = preview
-            width = width or OFFICE_DEFAULT_WIDTH
-            height = height or OFFICE_DEFAULT_HEIGHT
+            width = width or self.OFFICE_DEFAULT_WIDTH
+            height = height or self.OFFICE_DEFAULT_HEIGHT
 
             # A short, stable-per-path tag so this file's capture/page
             # PNGs don't collide with another file's (or its own
@@ -2961,7 +2815,7 @@ class OfficeDocument(DocumentHandler):
                     # "page".
                     progress.update(f"{name}: measuring page/slide layout...")
                     with _DebugTimer(debug, f"{name}: measure slide/page offsets"):
-                        slide_offsets = _measure_slide_offsets(chrome, html_path, page_element_xpath, width)
+                        slide_offsets = self._measure_slide_offsets(chrome, html_path, page_element_xpath, width)
 
                 if slide_offsets is not None:
                     variant = SlideDeck(chrome, html_path, width, height, tag, name, slide_offsets, confident)
@@ -3054,7 +2908,7 @@ class RtfOfficeDocument(OfficeDocument):
     is - by first converting it to .docx via textutil (_rtf_to_docx()),
     since RTF's own Quick Look preview is just a redirect back to the
     original file (a Preview.url), not an HTML bundle qlmanage/Chrome
-    could render directly (see is_rtf_file()). Once converted, it's
+    could render directly (see RtfDocument.is_rtf_file()). Once converted, it's
     handled through the exact same OfficeDocument._render_office_pages() pipeline as any
     other Word document (most often as a FlowingText OfficeVariant).
 
@@ -3092,7 +2946,7 @@ class RtfOfficeDocument(OfficeDocument):
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
-        if not is_rtf_file(path):
+        if not RtfDocument.is_rtf_file(path):
             return None
         docx_path = cls._rtf_to_docx(path, tmpdir)
         if docx_path is None:
@@ -3253,7 +3107,7 @@ class SvgDocument(OfficeDocument):
         self._write_svg_wrapper(wrapper_path, self.path, None, None)
         with _DebugTimer(debug, f"{name}: measure SVG size"):
             size = _measure_svg_natural_size(chrome, wrapper_path)
-        width, height = size if size else (OFFICE_DEFAULT_WIDTH, OFFICE_DEFAULT_HEIGHT)
+        width, height = size if size else (self.OFFICE_DEFAULT_WIDTH, self.OFFICE_DEFAULT_HEIGHT)
         self._write_svg_wrapper(wrapper_path, self.path, width, height)
 
         out_pdf = os.path.join(tmpdir, f"svg-capture-{tag}.pdf")
@@ -3289,7 +3143,7 @@ class SvgDocument(OfficeDocument):
 
 class MarkdownDocument(OfficeDocument):
     """A Markdown file, rendered to a real PDF via the `markdown` +
-    `weasyprint` Python libraries (see _render_markdown_pdf()) - no
+    `weasyprint` Python libraries (see _render_markdown_pdf() below) - no
     Quick Look, Chrome, or LibreOffice involved at all, and
     dramatically faster than either (confirmed by hand: well under a
     second, against Chrome's own ~1-2s process startup alone), since
@@ -3315,11 +3169,150 @@ class MarkdownDocument(OfficeDocument):
 
     _MARKDOWN_EXTENSIONS = (".md", ".markdown")
 
+    # Minimal styling for the rendered pages - just enough that
+    # headings/code/quotes are visually distinct, deliberately not
+    # trying to imitate any particular Markdown renderer's house style.
+    # No @font-face/font-family override: left to whatever WeasyPrint
+    # picks as the system default, so CJK text (which needs a real CJK
+    # font) renders using whatever's actually installed rather than a
+    # Latin-only font silently dropping every Japanese glyph.
+    MARKDOWN_CSS = """
+body { line-height: 1.5; padding: 2em; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.2; margin-top: 1em; }
+pre, code { font-family: monospace; background: #f0f0f0; }
+pre { padding: 0.6em; white-space: pre-wrap; }
+code { padding: 0.1em 0.3em; }
+pre code { padding: 0; background: none; }
+blockquote { border-left: 4px solid #ccc; margin-left: 0; padding-left: 1em; color: #555; }
+table { border-collapse: collapse; max-width: 100%; }
+th, td { border: 1px solid #ccc; padding: 0.3em 0.6em; }
+img { max-width: 100%; height: auto; }
+"""
+
+    @staticmethod
+    def _ensure_homebrew_lib_path_for_weasyprint():
+        """WeasyPrint (via cffi) dlopen()s Cairo/Pango/GLib by their bare
+        library names, relying on the dynamic linker's own default search
+        to find them. Confirmed by hand: that default search does NOT
+        include Homebrew's own lib directory when running under a
+        uv-managed standalone Python build (e.g. a free-threaded 3.14
+        install) - even with those exact libraries installed via Homebrew
+        - while the same import succeeds unmodified under a
+        Homebrew-installed Python on the same machine. Rather than
+        requiring every user hitting this to discover and set
+        DYLD_LIBRARY_PATH by hand (WeasyPrint's own macOS troubleshooting
+        docs suggest exactly that), add Homebrew's lib directory to
+        DYLD_FALLBACK_LIBRARY_PATH before the first import attempt -
+        confirmed by hand this alone is enough to fix the failing case.
+        A *fallback* path (rather than DYLD_LIBRARY_PATH, which is
+        consulted first) can't ever shadow a library some other search
+        step already finds correctly, so this is safe to always do.
+        macOS-only; a no-op everywhere else."""
+        if sys.platform != "darwin":
+            return
+        existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+        parts = existing.split(":") if existing else []
+        for lib_dir in ("/opt/homebrew/lib", "/usr/local/lib"):
+            if os.path.isdir(lib_dir) and lib_dir not in parts:
+                parts.append(lib_dir)
+        if parts:
+            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(parts)
+
+    @staticmethod
+    def _markdown_rendering_available():
+        """Whether MarkdownDocument can even attempt to render at all -
+        both the `markdown` and `weasyprint` libraries import cleanly.
+        Cheap to call more than once: a successful import is cached by
+        Python itself (sys.modules), so only the first call actually pays
+        for it. See _render_markdown_pdf() for why this has to be a
+        runtime check rather than something assumed from the PEP723
+        dependency list.
+
+        Deliberately catches more than just ImportError: weasyprint's own
+        import chain reaches into cffi to dlopen() the actual Cairo/Pango/
+        GLib shared libraries, and a missing one there raises a plain
+        OSError, not an ImportError (confirmed by hand: "cannot load
+        library 'libgobject-2.0-0'" on a machine without those system
+        libraries installed) - anything going wrong at import time means
+        the same thing here (rendering isn't available), so it's all
+        caught the same way rather than letting a fairly common
+        installation gap crash the whole program on startup.
+
+        Also deliberately swallows whatever weasyprint prints along the
+        way: on that same missing-libraries path, it print()s its own
+        multi-line "could not import some external libraries" notice
+        before the OSError above even reaches here (confirmed by hand).
+        Since this whole function's job is to fail silently and let the
+        caller fall back to plain text, letting that notice through would
+        defeat the point - and pdfless spends most of its life with the
+        terminal in raw mode showing an alternate screen, where a stray
+        print from a library is a corrupted-looking screen, not just
+        unwanted noise."""
+        MarkdownDocument._ensure_homebrew_lib_path_for_weasyprint()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                import markdown  # noqa: F401
+                import weasyprint  # noqa: F401
+        except Exception:
+            return False
+        return True
+
+    def _render_markdown_pdf(self, out_pdf):
+        """Convert self.path (a Markdown file) to a real PDF via the
+        `markdown` (Markdown -> HTML) and `weasyprint` (HTML+CSS -> PDF)
+        libraries - no headless Chrome or LibreOffice involved at all, and
+        dramatically faster than either (confirmed by hand: a whole
+        conversion takes well under a second, against Chrome's own ~1-2s
+        process startup alone), since WeasyPrint has a real CSS
+        pagination engine of its own - no need for FlowingText/
+        SvgDocument's own "measure the content first, then set an exact
+        @page size" dance; a long document just comes out as however many
+        pages it naturally takes.
+
+        Both libraries are declared PEP723 dependencies (so `uv run`
+        always installs the pip packages), but weasyprint also needs
+        system-level Cairo/Pango/GLib libraries pip can't install by
+        itself - so the import happens lazily, here (via
+        _markdown_rendering_available()), rather than at module load time,
+        and any failure is treated the same as "not installed": returns
+        False, and the caller falls back to plain-text rendering, the
+        same graceful degradation soffice/Chrome already get when they're
+        missing.
+
+        Returns False on any failure (including a missing library) - never
+        raises, so this is always safe for a caller to attempt speculatively."""
+        if not self._markdown_rendering_available():
+            return False
+        import markdown
+        from weasyprint import HTML
+
+        try:
+            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+                source = f.read()
+        except OSError:
+            return False
+        body = markdown.markdown(source, extensions=["extra", "sane_lists"])
+        html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{self.MARKDOWN_CSS}</style></head><body>{body}</body></html>'
+        # base_url lets a relative-path image reference in the source
+        # (e.g. "![alt](./diagram.png)") resolve against the Markdown
+        # file's own directory, the same as a browser would for a page
+        # loaded from there.
+        base_url = os.path.dirname(os.path.abspath(self.path)) + "/"
+        try:
+            HTML(string=html, base_url=base_url).write_pdf(out_pdf)
+        except Exception:
+            # WeasyPrint can raise a variety of its own exception types for
+            # a malformed document/CSS - none of them worth the whole
+            # program aborting over; the caller's error-placeholder
+            # fallback handles it the same as any other rendering failure.
+            return False
+        return os.path.exists(out_pdf)
+
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
         if not path.lower().endswith(cls._MARKDOWN_EXTENSIONS):
             return None
-        if not _markdown_rendering_available():
+        if not cls._markdown_rendering_available():
             return None
         return cls(path)
 
@@ -3334,7 +3327,7 @@ class MarkdownDocument(OfficeDocument):
         out_pdf = os.path.join(tmpdir, f"markdown-capture-{tag}.pdf")
         label = f"{name}: rendering to PDF"
         with _DebugTimer(debug, label), progress.spin(label + "..."):
-            ok = _render_markdown_pdf(self.path, out_pdf)
+            ok = self._render_markdown_pdf(out_pdf)
         npages = _pdf_page_count_safe(out_pdf) if ok else None
         if not npages:
             if os.path.exists(out_pdf):

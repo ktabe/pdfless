@@ -1,7 +1,7 @@
 """Markdown support: rendered to a real PDF via the `markdown` +
 `weasyprint` Python libraries (MarkdownDocument), not Quick Look,
-Chrome, or LibreOffice - see pdfless.py's _render_markdown_pdf() for
-why. requires_markdown_rendering gates on both libraries (and
+Chrome, or LibreOffice - see MarkdownDocument._render_markdown_pdf()
+for why. requires_markdown_rendering gates on both libraries (and
 weasyprint's own Cairo/Pango system libraries) actually being usable;
 see conftest.py.
 """
@@ -25,8 +25,8 @@ def test_markdown_css_constrains_images_to_the_page_width():
     width and spills off the right edge of the page (confirmed by
     hand opening README.md itself) rather than being scaled down to
     fit, the way a browser or any other Markdown renderer would."""
-    assert "img" in pdfless.MARKDOWN_CSS
-    assert "max-width: 100%" in pdfless.MARKDOWN_CSS
+    assert "img" in pdfless.MarkdownDocument.MARKDOWN_CSS
+    assert "max-width: 100%" in pdfless.MarkdownDocument.MARKDOWN_CSS
 
 
 @requires_markdown_rendering
@@ -61,10 +61,11 @@ def test_markdown_text_mode_shows_raw_source(sample_md, tmp_path):
 
 
 @requires_markdown_rendering
-def test_markdown_text_mode_toggle_clears_active_search(sample_md, tmp_path):
+def test_markdown_text_mode_toggle_carries_active_search(sample_md, tmp_path):
     """Markdown image mode searches the rendered PDF; text mode searches
-    the raw source - different text, so `t` clears any active search
-    rather than trying to carry a match across."""
+    the raw source - different text, so `t` can't carry the match object
+    itself across, but it re-runs the same query against the new mode's
+    own text rather than just dropping the search."""
     from test_search import make_viewer
 
     handler = classify(sample_md, tmp_path)
@@ -75,7 +76,10 @@ def test_markdown_text_mode_toggle_clears_active_search(sample_md, tmp_path):
 
     assert viewer.enter_text_mode() is True
     assert viewer.text_mode is True
-    assert viewer.search_query is None
+    assert viewer.search_query == "追加セクション2"
+    # The heading text itself (unlike its "##" markup) appears in both
+    # extractions, so re-running the query here finds it again.
+    assert viewer.search_pos is not None
     viewer._draw_text_unwrapped()  # must not raise
 
     viewer.start_search("## リスト")
@@ -83,7 +87,10 @@ def test_markdown_text_mode_toggle_clears_active_search(sample_md, tmp_path):
 
     assert viewer.toggle_text_mode() is True
     assert viewer.text_mode is False
-    assert viewer.search_query is None
+    # The query string still carries over, even though the rendered
+    # PDF's text has no "##" markup for it to match.
+    assert viewer.search_query == "## リスト"
+    assert viewer.search_pos is None
 
 
 @requires_markdown_rendering
@@ -125,7 +132,9 @@ def test_markdown_falls_back_to_plain_text_without_weasyprint(sample_md, tmp_pat
     must fall through to TextDocument (its own raw Markdown source)
     the same way an RTF file falls through to RtfDocument without
     textutil - not go unclassified entirely."""
-    monkeypatch.setattr(pdfless, "_markdown_rendering_available", lambda: False)
+    monkeypatch.setattr(
+        pdfless.MarkdownDocument, "_markdown_rendering_available", staticmethod(lambda: False)
+    )
     handler = classify(sample_md, tmp_path)
     assert isinstance(handler, pdfless.TextDocument)
     assert not isinstance(handler, pdfless.MarkdownDocument)
@@ -159,7 +168,7 @@ def test_markdown_rendering_available_survives_a_missing_system_library(monkeypa
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    assert pdfless._markdown_rendering_available() is False
+    assert pdfless.MarkdownDocument._markdown_rendering_available() is False
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -173,7 +182,7 @@ def test_ensure_homebrew_lib_path_adds_existing_dirs_to_dyld_fallback(monkeypatc
     free-threaded 3.14 install: the exact same Homebrew-installed
     libraries resolve fine under a Homebrew-installed Python, but not
     there) - even though the libraries are genuinely installed.
-    _ensure_homebrew_lib_path_for_weasyprint() works around this by
+    MarkdownDocument._ensure_homebrew_lib_path_for_weasyprint() works around this by
     adding Homebrew's lib directory to DYLD_FALLBACK_LIBRARY_PATH
     (confirmed by hand this alone fixes the failing case) - this
     checks the environment-variable bookkeeping only, since actually
@@ -183,7 +192,7 @@ def test_ensure_homebrew_lib_path_adds_existing_dirs_to_dyld_fallback(monkeypatc
     monkeypatch.delenv("DYLD_FALLBACK_LIBRARY_PATH", raising=False)
     monkeypatch.setattr(pdfless.os.path, "isdir", lambda path: path == "/opt/homebrew/lib")
 
-    pdfless._ensure_homebrew_lib_path_for_weasyprint()
+    pdfless.MarkdownDocument._ensure_homebrew_lib_path_for_weasyprint()
 
     assert pdfless.os.environ["DYLD_FALLBACK_LIBRARY_PATH"] == "/opt/homebrew/lib"
 
@@ -192,6 +201,6 @@ def test_ensure_homebrew_lib_path_is_a_noop_off_macos(monkeypatch):
     monkeypatch.setattr(pdfless.sys, "platform", "linux")
     monkeypatch.delenv("DYLD_FALLBACK_LIBRARY_PATH", raising=False)
 
-    pdfless._ensure_homebrew_lib_path_for_weasyprint()
+    pdfless.MarkdownDocument._ensure_homebrew_lib_path_for_weasyprint()
 
     assert "DYLD_FALLBACK_LIBRARY_PATH" not in pdfless.os.environ

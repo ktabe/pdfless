@@ -53,7 +53,7 @@ def test_numbers_multisheet_only_renders_first_sheet(sample_multisheet_numbers, 
     """Known gap (not a regression to fix here): Numbers' own Quick
     Look generator (iWork.qlgenerator) marks up its multi-sheet tab
     strip differently from Excel's (Office.qlgenerator) -
-    OfficeDocument._parse_sheet_tabs()'s TabViewItem-based regex
+    ExcelWorkbook._parse_sheet_tabs()'s TabViewItem-based regex
     doesn't recognize it, so a multi-sheet .numbers workbook (unlike
     the equivalent .xlsx/.xls) renders only its first sheet as a
     single page rather than one page per sheet."""
