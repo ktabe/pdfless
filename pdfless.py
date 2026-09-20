@@ -5304,13 +5304,22 @@ class Viewer:
         return f"\x1b[{self.rows};1H\x1b[2K{''.join(out)}{STATUS_COLOR_OFF}"
 
     def draw_status(self, text=None):
-        sys.stdout.write(self.format_status(text))
+        # \x1b[?25l re-hides the real terminal cursor draw_search_prompt()
+        # shows while a "/"/"?" query is being typed - every other status
+        # line (including the "isn't available"/no-match ones shown right
+        # after a search prompt closes) goes back to the normal paging
+        # UI, which never shows a cursor of its own.
+        sys.stdout.write(self.format_status(text) + "\x1b[?25l")
         sys.stdout.flush()
 
-    def draw_search_prompt(self, buf, backward=False):
+    def draw_search_prompt(self, buf, cursor, backward=False):
         """The search pattern being typed, echoed on the status line
         behind the prompt character it was opened with - "/" forward,
-        "?" backward, the same as less(1) shows them."""
+        "?" backward, the same as less(1) shows them. `cursor` is the
+        index into `buf` (in Python characters, not columns) the next
+        inserted/deleted character applies at - not necessarily
+        len(buf), since ^B/^F/LEFT/RIGHT can move it back into the
+        middle of an already-typed query."""
         # Unlike draw_status(), this doesn't pad the line out to the full
         # terminal width: padding leaves the cursor sitting at the far
         # right edge (in autowrap's "pending wrap" state), which is past
@@ -5322,8 +5331,22 @@ class Viewer:
         # filled) with the status color first, via \x1b[2K, and the color
         # is left active (not reset) so text typed via IME composition
         # picks it up too; draw_status() resets it on the next full redraw.
-        text = truncate_to_width(f"{'?' if backward else '/'}{buf}", self.cols)
-        sys.stdout.write(f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K{text}")
+        prefix = "?" if backward else "/"
+        text = truncate_to_width(f"{prefix}{buf}", self.cols)
+        # The terminal cursor's column, not buf's: it sits after the
+        # prompt character plus every column `buf[:cursor]` occupies -
+        # using display_width() (not len()) since a wide character (e.g.
+        # Japanese) covers 2 columns, same reasoning as
+        # format_status()'s own width accounting.
+        col = min(self.cols, 1 + display_width(prefix) + display_width(buf[:cursor]))
+        # \x1b[?25h shows the real terminal cursor - normally hidden the
+        # whole time pdfless owns the screen (see the entry-screen write
+        # in main()) - positioned at `col` so it tracks mid-string edits
+        # too (draw_status() hides it again once the prompt closes).
+        sys.stdout.write(
+            f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K{text}"
+            f"\x1b[{self.rows};{col}H\x1b[?25h"
+        )
         sys.stdout.flush()
 
     def go_page(self, page, scroll):
@@ -5952,6 +5975,8 @@ def run_viewer(
 
     num_buf = ""
     search_buf = None  # None: not typing; otherwise the query in progress
+    search_cursor = 0  # index into search_buf the next inserted/deleted
+    # character applies at - only meaningful while search_buf is not None
     search_backward = False  # whether that query was opened with "?" (not "/")
     last_search_query = None  # remembered across searches, for a bare "/"/"?"
     colon_pending = False  # True right after ":", awaiting n/p/h
@@ -6115,8 +6140,11 @@ def run_viewer(
             # Typing a search pattern after "/" or "?": collect
             # characters until Enter confirms it, Esc/^C cancels,
             # backspace edits it (or also cancels, if the pattern is
-            # already empty). Every other key is swallowed so it can't
-            # leak through as a page command while the prompt is up.
+            # already empty), ^B/^F/LEFT/RIGHT move search_cursor within
+            # it, and ^U/^K kill from search_cursor to the start/end -
+            # readline's own bindings for these. Every other key is
+            # swallowed so it can't leak through as a page command while
+            # the prompt is up.
             if key in ("\r", "\n"):
                 query = search_buf or last_search_query
                 search_buf = None
@@ -6129,15 +6157,34 @@ def run_viewer(
                 search_buf = None
                 viewer.draw_status()
             elif key in ("\x7f", "\x08"):
-                if search_buf:
-                    search_buf = search_buf[:-1]
-                    viewer.draw_search_prompt(search_buf, backward=search_backward)
-                else:
+                if search_cursor > 0:
+                    search_buf = search_buf[:search_cursor - 1] + search_buf[search_cursor:]
+                    search_cursor -= 1
+                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
+                elif not search_buf:
                     search_buf = None
                     viewer.draw_status()
+            elif key in ("\x02", "LEFT"):  # ^B
+                if search_cursor > 0:
+                    search_cursor -= 1
+                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
+            elif key in ("\x06", "RIGHT"):  # ^F
+                if search_cursor < len(search_buf):
+                    search_cursor += 1
+                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
+            elif key == "\x15":  # ^U: kill from search_cursor to the start
+                if search_cursor > 0:
+                    search_buf = search_buf[search_cursor:]
+                    search_cursor = 0
+                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
+            elif key == "\x0b":  # ^K: kill from search_cursor to the end
+                if search_cursor < len(search_buf):
+                    search_buf = search_buf[:search_cursor]
+                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
             elif len(key) == 1 and key.isprintable():
-                search_buf += key
-                viewer.draw_search_prompt(search_buf, backward=search_backward)
+                search_buf = search_buf[:search_cursor] + key + search_buf[search_cursor:]
+                search_cursor += 1
+                viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
             continue
 
         if colon_pending:
@@ -6318,8 +6365,9 @@ def run_viewer(
             # via its own page/bbox index).
             if viewer.text_mode or viewer.doc_handler.supports_search():
                 search_buf = ""
+                search_cursor = 0
                 search_backward = key == "?"
-                viewer.draw_search_prompt(search_buf, backward=search_backward)
+                viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
             else:
                 viewer.draw_status("search isn't available for this file type")
             continue
