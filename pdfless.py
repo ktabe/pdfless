@@ -543,16 +543,19 @@ class _ViewerProgress:
     either corrupt or hide behind the alternate screen buffer at that
     point, so this posts into the status line instead, the same as any
     other one-off status message. Off under -d/--debug, which already
-    prints its own, more detailed, per-stage timing lines to stderr. Also
-    off under -F/--quit-if-one-screen: whether this render ends up
-    interactive or a plain dump-and-quit isn't known until it's done, so
-    nothing gets written to the status line either way, rather than risk
-    a "converting via LibreOffice..."-style message leaking into what
-    might turn out to be a quiet dump (see Viewer.dump_and_quit())."""
+    prints its own, more detailed, per-stage timing lines to stderr.
+
+    Not used at all for the very first file under -F/--quit-if-one-
+    screen, whose eventual dump-and-quit-or-interactive outcome isn't
+    known until this render is done - _ensure_office_pages() uses a
+    plain _ProgressLine (stderr, self-overwriting via \\r, no absolute
+    cursor positioning) there instead, so a still-running conversion
+    stays visible without leaving anything behind that would need
+    cleaning up before a dump - see Viewer.dump_and_quit()."""
 
     def __init__(self, viewer):
         self.viewer = viewer
-        self.enabled = not viewer.debug and not viewer.quit_if_one_screen
+        self.enabled = not viewer.debug
 
     def update(self, text):
         if self.enabled:
@@ -3917,12 +3920,27 @@ class Viewer:
         an OfficeDocument. A no-op every time after that (doc_handler.
         ensure_pages() remembers its own result on the handler itself,
         the same as a file that's always been rendered up front would
-        be) other than resetting self.npages, which is cheap."""
+        be) other than resetting self.npages, which is cheap.
+
+        self.quit_if_one_screen means this is the very first file, under
+        -F/--quit-if-one-screen, and whether the session ends up
+        dump-and-quit or interactive isn't decided yet - a plain
+        _ProgressLine (stderr, \\r-overwriting in place, no absolute
+        cursor positioning) posts progress there instead of the usual
+        _ViewerProgress (the interactive status line), so a slow
+        LibreOffice/Quick Look conversion still shows something moving
+        without leaving anything for a subsequent dump to clean up - see
+        Viewer.dump_and_quit() and run_viewer()'s own quit_if_one_screen
+        handling, which resets this flag once the outcome is known."""
         if not isinstance(self.doc_handler, OfficeDocument):
             return
+        progress = (
+            _ProgressLine(not self.debug) if self.quit_if_one_screen
+            else _ViewerProgress(self)
+        )
         pages = self.doc_handler.ensure_pages(
             self.tmpdir, debug=self.debug,
-            render_scale=self.office_render_scale, progress=_ViewerProgress(self),
+            render_scale=self.office_render_scale, progress=progress,
             continuous=self.office_continuous,
         )
         if not pages:
@@ -6057,6 +6075,12 @@ def run_viewer(
         # rather than staying stuck with one row less than it should have.
         viewer._dump_margin_rows = 0
         viewer.resized = True
+        # The outcome is decided now - a later :n/:p to another office
+        # file should get the normal interactive status-line progress
+        # (_ViewerProgress), not _ensure_office_pages()'s own stderr
+        # _ProgressLine fallback, which only makes sense while this
+        # first file's dump-or-interactive question was still open.
+        viewer.quit_if_one_screen = False
 
     initial_mouse = MOUSE_OFF if viewer.text_mode else MOUSE_ON
     sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON + FOCUS_ON)

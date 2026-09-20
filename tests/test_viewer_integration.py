@@ -214,26 +214,30 @@ def test_quit_if_one_screen_leaves_a_margin_row_for_its_own_trailing_newline(
 
 
 @requires_office_support
-def test_quit_if_one_screen_dumps_an_office_file_without_progress_spinner_noise(
-    pty_session, sample_docx,
-):
-    """Regression test: a single-page Office document (Word here) still
-    needs its usual Quick-Look/LibreOffice render - and _before_ this
-    fix, that render's own progress spinner (_ViewerProgress, normally
-    posted into the interactive status line) wrote status-line escapes
-    (cursor-position to the bottom row, clear, "converting via
-    LibreOffice..." text) directly into the terminal's real scrollback
-    ahead of the dumped image, since it runs during Viewer construction,
-    before quit_if_one_screen is even known - see _ViewerProgress and
-    Viewer.quit_if_one_screen. The dumped output must be just the image,
-    with no such spinner/status-line noise in front of it."""
+def test_quit_if_one_screen_shows_progress_then_a_clean_dump(pty_session, sample_docx):
+    """A single-page Office document (Word here) still needs its usual
+    Quick-Look/LibreOffice render, which can take a while - under -F it
+    still shows progress (via _ensure_office_pages()'s own stderr
+    _ProgressLine, not the interactive-only _ViewerProgress status
+    line - the render's outcome, dump-and-quit or interactive, isn't
+    known yet at this point), but must leave no trace behind once done:
+    _ProgressLine self-overwrites with \\r rather than jumping to an
+    absolute row (unlike _ViewerProgress, which - before this test's
+    own fix - left the cursor on the bottom row right before the dump,
+    scrolling its own top row out of view the moment more content
+    followed it - see Viewer._dump_margin_rows for that separate,
+    already-fixed bug)."""
     session = pty_session(["-F", sample_docx])
     exited, out = _drain_until_exit(session, deadline_seconds=10)
     assert exited, "pdfless did not exit on its own under -F for a single-page docx"
     assert b"\x1b[?1049h" not in out
-    assert b"converting via LibreOffice" not in out
-    assert b"looking for LibreOffice" not in out
-    assert out.startswith(b"\x1b]1337;File=inline=1")
+    assert b"converting via LibreOffice" in out  # progress is now visible...
+    assert b"\x1b[40;1H" not in out  # ...but never via an absolute cursor jump
+    # ...and is fully gone (overwritten with spaces, then a bare \r)
+    # immediately before the dump - see _ProgressLine.clear().
+    osc_idx = out.index(b"\x1b]1337;File=inline=1")
+    assert out[:osc_idx].endswith(b"\r")
+    assert not out[:osc_idx].rstrip(b"\r").endswith(b"LibreOffice...")
 
 
 def test_quit_if_one_screen_does_not_exit_for_a_multipage_pdf(pty_session, sample_pdf):
