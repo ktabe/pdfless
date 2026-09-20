@@ -261,7 +261,7 @@ requires_soffice = pytest.mark.skipif(
 
 
 requires_markdown_rendering = pytest.mark.skipif(
-    not pdfless._markdown_rendering_available(),
+    not pdfless.MarkdownDocument._markdown_rendering_available(),
     reason="needs the markdown and weasyprint Python libraries (and weasyprint's own Cairo/Pango system libraries)",
 )
 
