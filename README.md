@@ -13,7 +13,7 @@ It has been tested with [iTerm2](https://iterm2.com) and
 - Search PDF text and follow external and internal PDF links.
 - Switch to text mode to read or copy extracted text.
 - Open multiple files and switch between them.
-- Reload the current file automatically when it changes (with `-F`/`--follow`).
+- Reload the current file automatically when it changes (in follow mode).
 - Open plain text files and, with additional dependencies, Office documents,
   SVG, and Markdown.
 
@@ -120,7 +120,7 @@ controls. Press `C` again to restore the previous display settings.
 | `-p`, `--page PAGE` | Start on the given page in the first file (default: 1). |
 | `-h`, `--fit-height` | Fit pages to the terminal height instead of its width. |
 | `-k`, `--keep` | Leave the last page on screen when quitting. |
-| `-F`, `--follow` | Check the current file for changes every 3 seconds and reload it, preserving the page and display mode. |
+| `-F`, `--follow` | Start in follow mode: check the current file for changes every 3 seconds and reload it, preserving the page and display mode. |
 | `-N`, `--line-numbers` | Show line numbers in text mode. |
 | `-S`, `--chop-long-lines` | Pan across long lines instead of wrapping them in text mode. |
 | `-B`, `--no-border` | Hide page borders in text mode. |
