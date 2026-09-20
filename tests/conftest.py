@@ -266,6 +266,12 @@ requires_markdown_rendering = pytest.mark.skipif(
 )
 
 
+requires_macos = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="needs macOS (e.g. for the \"O\"/\"v\" open-in-default-app feature)",
+)
+
+
 @pytest.fixture
 def sample_md():
     """A Markdown file with a title, lorem-ipsum/Japanese body text,

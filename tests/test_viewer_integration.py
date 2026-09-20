@@ -13,7 +13,7 @@ import os
 import signal
 import time
 
-from conftest import requires_office_support
+from conftest import requires_office_support, requires_macos
 
 
 def assert_no_crash(session, keys, wait=0.5, initial_wait=3):
@@ -88,6 +88,37 @@ def test_f_key_toggles_follow_mode_and_its_status_indicator(pty_session, sample_
 
     session.send(b"F")
     assert b" follow " not in session.read_all(0.5)
+    session.send(b"q")
+
+
+@requires_macos
+def test_o_or_v_opens_the_file_externally_and_turns_on_follow_mode(
+    pty_session, sample_pdf, tmp_path, monkeypatch,
+):
+    """"O"/"v" (see run_viewer(), pdfless._open_in_default_app()) hand
+    the file off to macOS's own `open` command and switch follow mode
+    on. A real `open` would launch a real GUI app, so this puts a fake
+    one on PATH instead - a script that just records the path it was
+    given - for the pdfless subprocess's own subprocess.Popen(["open",
+    ...]) call to find via PATH lookup instead of the genuine
+    /usr/bin/open. monkeypatching os.environ here (before pty.fork(),
+    inside the pty_session fixture) is inherited by the forked child,
+    since it duplicates the parent's memory before exec()ing."""
+    marker = tmp_path / "opened.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_open = fake_bin / "open"
+    fake_open.write_text(f'#!/bin/sh\necho "$1" >> {marker}\n')
+    fake_open.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+
+    session = pty_session([sample_pdf])
+    time.sleep(3)
+    assert b" follow " not in session.read_all(0.5)  # off by default (startup paint)
+
+    session.send(b"O", wait=1.0)
+    assert b" follow " in session.read_all(0.5)
+    assert marker.read_text().strip() == sample_pdf
     session.send(b"q")
 
 

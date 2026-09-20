@@ -294,6 +294,8 @@ Keys:
   r                       toggle the scrollbar
   F                       toggle follow mode (auto-reload on file change)
                         <MISCELLANEOUS COMMANDS>
+  O v                     open the file in its own app (macOS only) and
+                          switch follow mode on
   ^L                      redraw the screen
   F1 :h                   show this help (q to close it)
   q :q                    quit\
@@ -315,6 +317,33 @@ def positive_int(s):
     if n < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return n
+
+
+def _open_in_default_app(path):
+    """Hand `path` off to macOS's own default app for it, via `open` -
+    the macOS-only half of "O"/"v" (see run_viewer()). Fire-and-forget:
+    this only launches `open` itself and doesn't wait for or know
+    anything about whatever app ends up handling the file. Returns
+    True if that launch succeeded, False if this isn't macOS at all or
+    `open` itself couldn't be started (there's no single equivalent
+    command bundled with every Linux desktop the way `open` ships with
+    every Mac, so this is deliberately macOS-only rather than guessing
+    at xdg-open or similar)."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        subprocess.Popen(
+            ["open", path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+            # Detached from pdfless's own controlling terminal/session -
+            # this is a real, independent program (the default app for
+            # `path`), not a helper that should share pdfless's raw-
+            # mode tty or die along with it.
+        )
+    except OSError:
+        return False
+    return True
 
 
 POPPLER_INSTALL_HINT = (
@@ -5861,6 +5890,20 @@ def run_viewer(
         last_mtime = None
     last_follow_check = time.monotonic()
 
+    def start_following():
+        """(Re)start follow's mtime tracking from the current file/time -
+        shared by "F" turning follow on and "O"/"v" doing the same as a
+        side effect of handing the file to an external app. Otherwise a
+        change that happened while follow was off (a stale last_mtime)
+        would trigger an immediate reload the moment it's turned on."""
+        nonlocal last_follow_path, last_mtime, last_follow_check
+        last_follow_path = viewer.path
+        try:
+            last_mtime = os.path.getmtime(last_follow_path)
+        except OSError:
+            last_mtime = None
+        last_follow_check = time.monotonic()
+
     viewer.refresh()
     while True:
         r, _, _ = select.select([fd], [], [], 0.3)
@@ -6111,16 +6154,30 @@ def run_viewer(
             follow = not follow
             viewer.follow = follow
             if follow:
-                # Start tracking from here, the same way the initial
-                # setup above does - otherwise a change that happened
-                # while follow was off (stale last_mtime) would trigger
-                # an immediate reload the moment it's turned back on.
-                last_follow_path = viewer.path
-                try:
-                    last_mtime = os.path.getmtime(last_follow_path)
-                except OSError:
-                    last_mtime = None
-                last_follow_check = time.monotonic()
+                start_following()
+            viewer.refresh()
+            continue
+
+        if key in ("O", "v"):
+            # Hand the current file off to macOS's own default app for
+            # it (Preview/Word/Excel/...), and switch follow mode on (if
+            # it wasn't already) so an edit made there comes back
+            # automatically - the same reload path -F/--follow and "F"
+            # already use. viewer.path is always the original file (see
+            # DocumentHandler.__init__/Viewer.path), never a temporary
+            # rendered PDF, so this opens the same thing the user
+            # pointed pdfless at in the first place, even for a
+            # soffice/Chrome-rendered format.
+            if not _open_in_default_app(viewer.path):
+                viewer.draw_status(
+                    "opening the file in its own app needs macOS"
+                    if sys.platform != "darwin" else f"couldn't open {viewer.path}"
+                )
+                continue
+            if not follow:
+                follow = True
+                viewer.follow = True
+                start_following()
             viewer.refresh()
             continue
 

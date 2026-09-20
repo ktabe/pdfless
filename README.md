@@ -195,6 +195,7 @@ The status line shows `follow` while the mode is active.
 | `[` / `]` | Go back / forward through internal-link navigation history. |
 | Click or drag the scrollbar | Jump to a document position in image mode. In text mode, the scrollbar is display-only. |
 | Mouse wheel | Scroll by two lines in image mode (configurable) or one line in text mode. |
+| `O`, `v` | Open the file in its default app (macOS only) and switch follow mode on, so an edit made there is picked up automatically. |
 | `^L` | Redraw the screen. |
 | `F1`, `:h` | Show keyboard help; press `q` to close it. |
 | `q`, `:q`, `^C` | Quit. |
