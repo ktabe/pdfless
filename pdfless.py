@@ -3446,6 +3446,13 @@ class RawTerminal:
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
 
+# termios.tcgetattr()'s return value is a fixed-shape list with no named
+# accessors in this Python version - [iflag, oflag, cflag, lflag,
+# ispeed, ospeed, cc] - tty.LFLAG/tty.CC spell these out, but only since
+# Python 3.12 (pdfless supports 3.9+, see its shebang), hence these.
+_TC_LFLAG, _TC_CC = 3, 6
+
+
 def run_subprocess(args, *, timeout=None, **kwargs):
     """Drop-in replacement for subprocess.run(), used for every external
     tool pdfless shells out to (qlmanage, soffice, Chrome, textutil,
@@ -3488,15 +3495,15 @@ def run_subprocess(args, *, timeout=None, **kwargs):
         return subprocess.run(args, timeout=timeout, **kwargs)
     vdisable = os.fpathconf(fd, "PC_VDISABLE")
     attrs = termios.tcgetattr(fd)
-    old_cc = attrs[6][termios.VQUIT], attrs[6][termios.VSUSP]
-    attrs[3] |= termios.ISIG
-    attrs[6][termios.VQUIT] = attrs[6][termios.VSUSP] = vdisable
+    old_cc = attrs[_TC_CC][termios.VQUIT], attrs[_TC_CC][termios.VSUSP]
+    attrs[_TC_LFLAG] |= termios.ISIG
+    attrs[_TC_CC][termios.VQUIT] = attrs[_TC_CC][termios.VSUSP] = vdisable
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
     try:
         return subprocess.run(args, timeout=timeout, **kwargs)
     finally:
-        attrs[3] &= ~termios.ISIG
-        attrs[6][termios.VQUIT], attrs[6][termios.VSUSP] = old_cc
+        attrs[_TC_LFLAG] &= ~termios.ISIG
+        attrs[_TC_CC][termios.VQUIT], attrs[_TC_CC][termios.VSUSP] = old_cc
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
