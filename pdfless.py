@@ -4117,14 +4117,23 @@ class Viewer:
         sys.stdout.write(MOUSE_OFF)
         self._last_viewport_set = False
         self._last_marker_bounds = None
-        if self.search_query and self.doc_handler.search_resets_on_text_mode_toggle():
-            self.clear_search()
+        reindex_search = (
+            self.search_query and self.doc_handler.search_resets_on_text_mode_toggle()
+        )
         self._load_text_page()
-        # If there's a search match highlighted/boxed on this same page,
-        # follow it across into text mode too, scrolled into view.
-        match = self._active_search_page_match()
-        if match:
-            self._scroll_text_to_match(match)
+        if reindex_search:
+            # image mode and text mode search different extractions here
+            # (see search_resets_on_text_mode_toggle()) - the match object
+            # itself can't carry over, so re-run the same query against
+            # this mode's own text instead, landing on the nearest hit.
+            self.start_search(self.search_query)
+        else:
+            # If there's a search match highlighted/boxed on this same
+            # page, follow it across into text mode too, scrolled into
+            # view.
+            match = self._active_search_page_match()
+            if match:
+                self._scroll_text_to_match(match)
         self.refresh()
         return True
 
@@ -4151,15 +4160,23 @@ class Viewer:
         # - refresh() only reloads it on a resize - so without this it'd
         # redraw whatever page/scroll was last loaded before entering text
         # mode instead of following you back to where you navigated to.
-        if self.search_query and self.doc_handler.search_resets_on_text_mode_toggle():
-            self.clear_search()
+        reindex_search = (
+            self.search_query and self.doc_handler.search_resets_on_text_mode_toggle()
+        )
         self.scroll = 0
         self._load_page()
-        # Symmetric with enter_text_mode(): carry a highlighted match back
-        # into the box marker on the rendered page.
-        match = self._active_search_page_match()
-        if match:
-            self._scroll_image_to_match(match)
+        if reindex_search:
+            # Symmetric with enter_text_mode(): the two modes search
+            # different extractions here, so re-run the same query
+            # against image mode's own (bbox) index instead of trying to
+            # carry the match object across.
+            self.start_search(self.search_query)
+        else:
+            # Symmetric with enter_text_mode(): carry a highlighted match
+            # back into the box marker on the rendered page.
+            match = self._active_search_page_match()
+            if match:
+                self._scroll_image_to_match(match)
         self.refresh()
 
     def toggle_text_mode(self):
@@ -4522,8 +4539,7 @@ class Viewer:
             if len(match) == 3:
                 return match
             return self._text_highlight_for_match(match)
-        page_match = match if len(match) == 5 else self._active_search_page_match()
-        return self._text_highlight_for_match(page_match)
+        return self._text_highlight_for_match(self._active_search_page_match())
 
     def _text_highlight_for_match(self, match):
         """(line_idx, start, end) of `match` within self.text_lines, or
