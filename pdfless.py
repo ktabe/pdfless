@@ -356,7 +356,7 @@ def check_deps():
         if shutil.which(tool) is None:
             die(f"requires poppler's '{tool}' ({POPPLER_INSTALL_HINT})")
 
-    r = subprocess.run(["pdftoppm", "-h"], capture_output=True, text=True)
+    r = run_subprocess(["pdftoppm", "-h"], capture_output=True, text=True)
     if "-png" not in r.stdout + r.stderr:
         die(f"pdftoppm is not poppler-compatible ({POPPLER_INSTALL_HINT})")
 
@@ -414,7 +414,7 @@ def _default_browser_bundle_id():
         "~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist"
     )
     try:
-        r = subprocess.run(
+        r = run_subprocess(
             ["plutil", "-convert", "json", "-o", "-", plist_path],
             capture_output=True, text=True, timeout=5,
         )
@@ -668,7 +668,7 @@ def _pdf_page_size_pt_safe(pdf_path):
     embedded in a Quick Look preview, where a bad reading just means
     falling back to a default DPI rather than aborting entirely."""
     try:
-        out = subprocess.run(
+        out = run_subprocess(
             ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
         ).stdout
     except (subprocess.TimeoutExpired, OSError):
@@ -684,7 +684,7 @@ def _pdf_page_count_safe(pdf_path):
     FlowingText.build_pages()), where a bad reading just means falling
     back to the screenshot-based path rather than aborting entirely."""
     try:
-        out = subprocess.run(
+        out = run_subprocess(
             ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
         ).stdout
     except (subprocess.TimeoutExpired, OSError):
@@ -714,7 +714,7 @@ def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
     shared user profile lock."""
     profile_dir = os.path.join(tmpdir, "soffice-profile")
     try:
-        subprocess.run(
+        run_subprocess(
             [
                 soffice,
                 f"-env:UserInstallation=file://{profile_dir}",
@@ -869,7 +869,7 @@ def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
             dpi = max(36.0, min(300.0, dpi))
 
             try:
-                subprocess.run(
+                run_subprocess(
                     # pdftocairo (not pdftoppm - it has no -transp option) so a
                     # picture with a transparent background (e.g. a PNG/GIF with
                     # alpha, flattened into this PDF by the Quick Look
@@ -994,11 +994,11 @@ def _capture_html_screenshot(chrome, html_path, width, height, out_png, render_s
     ]
     if max(physical_w, physical_h) < OfficeVariant.OFFICE_GPU_SAFE_PHYSICAL_PX:
         try:
-            subprocess.run(base_args, capture_output=True, check=True, timeout=8)
+            run_subprocess(base_args, capture_output=True, check=True, timeout=8)
             return
         except subprocess.TimeoutExpired:
             pass  # bigger than expected for this content; fall through
-    subprocess.run(
+    run_subprocess(
         [base_args[0], "--disable-gpu", *base_args[1:]],
         capture_output=True, check=True, timeout=30,
     )
@@ -1046,7 +1046,7 @@ def _capture_html_pdf(chrome, html_path, width, height, out_pdf, timeout=20):
         return False
 
     try:
-        subprocess.run(
+        run_subprocess(
             [
                 chrome, "--headless", "--disable-gpu", "--no-sandbox",
                 f"--print-to-pdf={out_pdf}", "--print-to-pdf-no-header",
@@ -1209,7 +1209,7 @@ def _measure_content_height(chrome, html_path, width, timeout=30):
     except OSError:
         return None
     try:
-        r = subprocess.run(
+        r = run_subprocess(
             [
                 chrome, "--headless", "--no-sandbox",
                 f"--window-size={width},1080",
@@ -1265,7 +1265,7 @@ def _measure_svg_natural_size(chrome, wrapper_path, timeout=20):
     except OSError:
         return None
     try:
-        r = subprocess.run(
+        r = run_subprocess(
             [
                 chrome, "--headless", "--no-sandbox",
                 "--dump-dom", "--virtual-time-budget=8000",
@@ -1674,7 +1674,7 @@ def extract_office_text(path):
     if shutil.which("textutil") is None:
         return None
     try:
-        out = subprocess.run(
+        out = run_subprocess(
             ["textutil", "-convert", "txt", "-stdout", path],
             capture_output=True, text=True, timeout=30,
         )
@@ -1936,7 +1936,7 @@ class PdfDocument(DocumentHandler):
 
     @staticmethod
     def _pdf_page_count(path):
-        out = subprocess.run(
+        out = run_subprocess(
             ["pdfinfo", path], capture_output=True, text=True, check=True
         ).stdout
         m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
@@ -1959,7 +1959,7 @@ class PdfDocument(DocumentHandler):
 
     def page_size_pt(self, page):
         """(width_pt, height_pt) for `page`."""
-        out = subprocess.run(
+        out = run_subprocess(
             ["pdfinfo", "-f", str(page), "-l", str(page), self.path],
             capture_output=True,
             text=True,
@@ -1974,7 +1974,7 @@ class PdfDocument(DocumentHandler):
         """Plain-text rendering of one page, via poppler's pdftotext
         -layout (which tries to preserve the page's visual line/column
         layout, unlike the flat word-run text used for search)."""
-        out = subprocess.run(
+        out = run_subprocess(
             ["pdftotext", "-f", str(page), "-l", str(page), "-layout", self.path, "-"],
             capture_output=True,
             text=True,
@@ -1988,7 +1988,7 @@ class PdfDocument(DocumentHandler):
         {"width_pt": float, "height_pt": float, "text": str,
         "words": [(start, end, xMin, yMin, xMax, yMax), ...]} (all in points)
         where (start, end) are offsets into "text" for that word."""
-        out = subprocess.run(
+        out = run_subprocess(
             ["pdftotext", "-bbox", self.path, "-"],
             capture_output=True,
             text=True,
@@ -2210,7 +2210,7 @@ class PdfDocument(DocumentHandler):
             return cached
 
         prefix = os.path.join(cache.tmpdir, f"page-{page}-{round(dpi)}")
-        subprocess.run(
+        run_subprocess(
             [
                 "pdftoppm", "-png", "-r", str(dpi),
                 "-f", str(page), "-l", str(page),
@@ -2411,7 +2411,7 @@ class OfficeDocument(DocumentHandler):
         outdir = tempfile.mkdtemp(dir=tmpdir, prefix="qlpreview-")
         name = os.path.basename(path)
         try:
-            result = subprocess.run(
+            result = run_subprocess(
                 ["qlmanage", "-o", outdir, "-p", path],
                 capture_output=True, timeout=30,
             )
@@ -2667,7 +2667,7 @@ class OfficeDocument(DocumentHandler):
         with open(measure_path, "w", encoding="utf-8") as f:
             f.write(instrumented)
         try:
-            r = subprocess.run(
+            r = run_subprocess(
                 [
                     chrome, "--headless", "--no-sandbox",
                     # Must match the real capture's width (see the
@@ -2978,7 +2978,7 @@ class RtfOfficeDocument(OfficeDocument):
         tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
         out_path = os.path.join(tmpdir, f"rtf-as-docx-{tag}.docx")
         try:
-            subprocess.run(
+            run_subprocess(
                 ["textutil", "-convert", "docx", "-output", out_path, path],
                 capture_output=True, check=True, timeout=20,
             )
@@ -3418,6 +3418,14 @@ HANDLER_CLASSES = [
 ]
 
 
+_CTRL_C_FD = None  # the interactive session's tty fd while RawTerminal is
+# active, otherwise None - see run_subprocess(), which uses this to
+# temporarily restore ISIG (which raw mode turns off - it would
+# otherwise deliver ^C as a literal, unread byte sitting in the tty's
+# input buffer until whatever blocking external-tool call is
+# in progress returns on its own) for the duration of that call.
+
+
 class RawTerminal:
     """Puts the tty into raw (cbreak-ish) mode for the duration of the block."""
 
@@ -3426,12 +3434,70 @@ class RawTerminal:
         self.old = None
 
     def __enter__(self):
+        global _CTRL_C_FD
         self.old = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
+        _CTRL_C_FD = self.fd
         return self
 
     def __exit__(self, *exc):
+        global _CTRL_C_FD
+        _CTRL_C_FD = None
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+
+def run_subprocess(args, *, timeout=None, **kwargs):
+    """Drop-in replacement for subprocess.run(), used for every external
+    tool pdfless shells out to (qlmanage, soffice, Chrome, textutil,
+    poppler's pdftoppm/pdfinfo/pdftocairo, ...) so a long one can be
+    interrupted with ^C instead of running to completion no matter what
+    - see _CTRL_C_FD's comment for why raw mode otherwise defeats that.
+
+    While the interactive viewer's RawTerminal is active (_CTRL_C_FD
+    set), this restores ISIG on that tty for the call's duration, so
+    the terminal driver itself turns ^C into a real SIGINT - delivered
+    to pdfless *and* the child (they share a process group; none of
+    these calls detach into their own - see main()'s one exception,
+    the Popen() that opens a file in an external app), interrupting
+    whichever of them was still blocked in a syscall. Python's default
+    SIGINT handler then raises KeyboardInterrupt here, which every
+    caller up the stack (OfficeDocument.build_pages() and friends) lets
+    propagate rather than swallowing alongside subprocess.TimeoutExpired/
+    OSError - it isn't a subclass of Exception, so their existing
+    `except (subprocess.TimeoutExpired, OSError):` clauses already
+    don't catch it - all the way up to run_viewer()'s main loop, which
+    quits the same way a plain "\x03" typed between renders already
+    does.
+
+    Before RawTerminal is ever entered (e.g. the -h capability probe at
+    import time, or classifying files in main()) or after it exits,
+    _CTRL_C_FD is None and this behaves exactly like subprocess.run() -
+    the tty is still in its normal cooked mode there anyway, where ^C
+    already generates SIGINT on its own.
+
+    ISIG governs ^C/^\\/^Z's signal generation as one bundle - it can't
+    enable just ^C - so VQUIT and VSUSP are pinned to VDISABLE for the
+    same duration, leaving them literal, unread bytes exactly like
+    today (^Z already has its own hand-rolled suspend - see
+    run_viewer()'s "\\x1a" handling - keyed off actually reading that
+    byte back in the main loop; a real SIGTSTP firing here instead
+    would suspend the process without it ever running, skipping the
+    terminal cleanup that handling does first)."""
+    fd = _CTRL_C_FD
+    if fd is None:
+        return subprocess.run(args, timeout=timeout, **kwargs)
+    vdisable = os.fpathconf(fd, "PC_VDISABLE")
+    attrs = termios.tcgetattr(fd)
+    old_cc = attrs[6][termios.VQUIT], attrs[6][termios.VSUSP]
+    attrs[3] |= termios.ISIG
+    attrs[6][termios.VQUIT] = attrs[6][termios.VSUSP] = vdisable
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    try:
+        return subprocess.run(args, timeout=timeout, **kwargs)
+    finally:
+        attrs[3] &= ~termios.ISIG
+        attrs[6][termios.VQUIT], attrs[6][termios.VSUSP] = old_cc
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
 def read_utf8_char(fd, timeout=0.1):
@@ -6937,4 +7003,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # ^C during a run_subprocess() call (see its docstring) unwinds
+        # all the way up to here rather than being caught anywhere in
+        # between - main()'s own try/finally blocks have already put the
+        # terminal back to normal by this point, so there's nothing left
+        # to clean up; just exit quietly instead of dumping a traceback
+        # nobody asked for. 130 is the conventional exit code for a
+        # SIGINT-terminated process (128 + SIGINT's number).
+        sys.exit(130)
