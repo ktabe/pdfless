@@ -3297,8 +3297,10 @@ class MarkdownDocument(OfficeDocument):
     Text mode (`t`) always shows the raw Markdown source from disk -
     not text extracted from the rendered PDF - so you can read or
     search the `#`/`*` markup while keeping the WeasyPrint preview in
-    image mode. Image-mode search still uses the PDF delegate's own
-    per-page index when one exists.
+    image mode. text_mode_is_paginated() is False because that source
+    is one continuous blob in text mode; image-mode / search still
+    uses the PDF delegate's own per-page bbox index (see
+    Viewer._search_uses_text_lines()).
 
     -c/--continuous has no effect here, the same as SofficeOnlyDocument
     and for the same reason: WeasyPrint's real pagination can't be
@@ -5562,6 +5564,15 @@ class Viewer:
                 return i
         return 0
 
+    def _search_uses_text_lines(self):
+        """Whether / search should walk self.text_lines as one blob
+        (line_idx, start, end) matches rather than a PDF page/bbox
+        index. True for plain text files (always in text mode) and for
+        handlers like MarkdownDocument whose text mode shows the whole
+        raw source at once - but False in image mode even for those,
+        where a real PDF delegate's bbox index should still be used."""
+        return self.text_mode and not self.doc_handler.text_mode_is_paginated()
+
     def start_search(self, query, backward=False):
         """Search the whole document for `query` and jump to one match -
         which one depends on where you are now and on `backward`, i.e.
@@ -5571,11 +5582,11 @@ class Viewer:
         if not query:
             return
         self.search_query = query
-        if not self.doc_handler.text_mode_is_paginated():
+        if self._search_uses_text_lines():
             # No page/bbox structure for a non-paginated document
-            # (plain text/RTF, or an Office document currently in text
-            # mode) - matches are just (line_idx, start, end) straight
-            # out of text_lines, the whole document's text.
+            # (plain text/RTF, or Markdown currently in text mode) -
+            # matches are just (line_idx, start, end) straight out of
+            # text_lines, the whole document's text.
             self.search_matches = self._find_all_text_matches()
             if not self.search_matches:
                 self.search_pos = None
@@ -5633,7 +5644,7 @@ class Viewer:
     def _goto_search_match(self, idx):
         self.search_pos = idx
 
-        if not self.doc_handler.text_mode_is_paginated():
+        if self._search_uses_text_lines():
             line_idx, start, end = self.search_matches[idx]
             if self.text_wrap:
                 # No pan to speak of while wrapped - _row_for_line()

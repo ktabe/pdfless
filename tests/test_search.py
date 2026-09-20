@@ -14,7 +14,8 @@ import termios
 import tempfile
 
 import pdfless
-from conftest import requires_office_support
+from conftest import requires_markdown_rendering, requires_office_support
+from test_markdown import classify
 
 
 def make_viewer(handler):
@@ -70,6 +71,28 @@ def test_docx_search_uses_pdf_bbox_index_in_both_modes(sample_docx):
     viewer.start_search("Hello")
     assert viewer.search_matches
     assert len(viewer.search_matches[0]) == 5
+
+
+@requires_markdown_rendering
+def test_markdown_image_search_uses_pdf_bbox_index(sample_md, tmp_path):
+    """Regression: MarkdownDocument.text_mode_is_paginated() is False
+    (text mode shows the whole raw source), but image-mode / search
+    must still use the PDF delegate's bbox index - not
+    self.text_lines, which isn't even loaded yet."""
+    handler = classify(sample_md, tmp_path)
+    handler.build_pages(str(tmp_path))
+    viewer = make_viewer(handler)
+    assert viewer.text_mode is False
+    assert viewer.doc_handler.text_mode_is_paginated() is False
+
+    viewer.start_search("追加セクション2")
+    assert viewer.search_matches
+    assert len(viewer.search_matches[0]) == 5  # (page, xmin, ymin, xmax, ymax)
+
+    assert viewer.enter_text_mode() is True
+    viewer.start_search("## リスト")
+    assert viewer.search_matches
+    assert len(viewer.search_matches[0]) == 3  # (line_idx, start, end)
 
 
 def test_plain_text_file_search_works(sample_text):
