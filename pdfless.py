@@ -2058,6 +2058,13 @@ class DocumentHandler:
         textutil)."""
         return False
 
+    def search_resets_on_text_mode_toggle(self):
+        """Whether an active search should be cleared when `t` crosses
+        between image mode and text mode. False for handlers where both
+        views search the same extracted text (e.g. PDF); True when the
+        two modes search different things (MarkdownDocument)."""
+        return False
+
     def starts_in_text_mode(self):
         """Whether this handler has no image view at all - permanently
         "in text mode" from the moment the file opens (a plain text
@@ -3294,6 +3301,14 @@ class MarkdownDocument(OfficeDocument):
     WeasyPrint itself needs (Cairo/Pango/GLib, not something pip can
     install on its own) - aren't available; see sniff().
 
+    Text mode (`t`) always shows the raw Markdown source from disk -
+    not text extracted from the rendered PDF - so you can read or
+    search the `#`/`*` markup while keeping the WeasyPrint preview in
+    image mode. text_mode_is_paginated() is False because that source
+    is one continuous blob in text mode; image-mode / search still
+    uses the PDF delegate's own per-page bbox index (see
+    Viewer._search_uses_text_lines()).
+
     -c/--continuous has no effect here, the same as SofficeOnlyDocument
     and for the same reason: WeasyPrint's real pagination can't be
     collapsed back into a single page."""
@@ -3326,6 +3341,21 @@ class MarkdownDocument(OfficeDocument):
                 os.unlink(out_pdf)
             return None
         return self._remember_pages(("pdf", out_pdf, npages))
+
+    def extract_text(self, page):
+        return read_plain_text_lines(self.path)
+
+    def text_mode_is_paginated(self):
+        return False
+
+    def default_text_border(self, border_default):
+        return False
+
+    def default_text_wrap(self, wrap_default):
+        return wrap_default
+
+    def search_resets_on_text_mode_toggle(self):
+        return True
 
 
 # The order main()'s classification loop tries these in - RtfOfficeDocument
@@ -4087,12 +4117,23 @@ class Viewer:
         sys.stdout.write(MOUSE_OFF)
         self._last_viewport_set = False
         self._last_marker_bounds = None
+        reindex_search = (
+            self.search_query and self.doc_handler.search_resets_on_text_mode_toggle()
+        )
         self._load_text_page()
-        # If there's a search match highlighted/boxed on this same page,
-        # follow it across into text mode too, scrolled into view.
-        match = self._active_search_page_match()
-        if match:
-            self._scroll_text_to_match(match)
+        if reindex_search:
+            # image mode and text mode search different extractions here
+            # (see search_resets_on_text_mode_toggle()) - the match object
+            # itself can't carry over, so re-run the same query against
+            # this mode's own text instead, landing on the nearest hit.
+            self.start_search(self.search_query)
+        else:
+            # If there's a search match highlighted/boxed on this same
+            # page, follow it across into text mode too, scrolled into
+            # view.
+            match = self._active_search_page_match()
+            if match:
+                self._scroll_text_to_match(match)
         self.refresh()
         return True
 
@@ -4119,13 +4160,23 @@ class Viewer:
         # - refresh() only reloads it on a resize - so without this it'd
         # redraw whatever page/scroll was last loaded before entering text
         # mode instead of following you back to where you navigated to.
+        reindex_search = (
+            self.search_query and self.doc_handler.search_resets_on_text_mode_toggle()
+        )
         self.scroll = 0
         self._load_page()
-        # Symmetric with enter_text_mode(): carry a highlighted match back
-        # into the box marker on the rendered page.
-        match = self._active_search_page_match()
-        if match:
-            self._scroll_image_to_match(match)
+        if reindex_search:
+            # Symmetric with enter_text_mode(): the two modes search
+            # different extractions here, so re-run the same query
+            # against image mode's own (bbox) index instead of trying to
+            # carry the match object across.
+            self.start_search(self.search_query)
+        else:
+            # Symmetric with enter_text_mode(): carry a highlighted match
+            # back into the box marker on the rendered page.
+            match = self._active_search_page_match()
+            if match:
+                self._scroll_image_to_match(match)
         self.refresh()
 
     def toggle_text_mode(self):
@@ -4478,6 +4529,18 @@ class Viewer:
                     results.append((i, m.start(), m.end()))
         return results
 
+    def _text_search_highlight(self):
+        """(line_idx, start, end) to highlight while drawing text mode,
+        or None. Never returns a PDF bbox tuple."""
+        if self.search_pos is None or not self.search_matches:
+            return None
+        match = self.search_matches[self.search_pos]
+        if self._search_uses_text_lines():
+            if len(match) == 3:
+                return match
+            return self._text_highlight_for_match(match)
+        return self._text_highlight_for_match(self._active_search_page_match())
+
     def _text_highlight_for_match(self, match):
         """(line_idx, start, end) of `match` within self.text_lines, or
         None if the query doesn't appear there at all (a real
@@ -4674,13 +4737,7 @@ class Viewer:
         own to border - it just keeps flowing to fill the width."""
         self._ensure_display_rows()
         avail_rows = self._text_avail_rows()
-        if not self.doc_handler.text_mode_is_paginated():
-            highlight = (
-                self.search_matches[self.search_pos]
-                if self.search_pos is not None else None
-            )
-        else:
-            highlight = self._text_highlight_for_match(self._active_search_page_match())
+        highlight = self._text_search_highlight()
 
         out = [STATUS_COLOR_OFF, "\x1b[H\x1b[2J"]
         n_rows = len(self._display_rows)
@@ -4754,16 +4811,7 @@ class Viewer:
         # below never needs to know it exists.
         gutter_width = self._line_number_gutter_width()
         avail_cols = max(1, self._text_avail_cols() - gutter_width)
-        if not self.doc_handler.text_mode_is_paginated():
-            # No PDF page/bbox structure to reconcile against here - the
-            # match tuple already is (line_idx, start, end), exactly
-            # what a highlight needs, so use it directly.
-            highlight = (
-                self.search_matches[self.search_pos]
-                if self.search_pos is not None else None
-            )
-        else:
-            highlight = self._text_highlight_for_match(self._active_search_page_match())
+        highlight = self._text_search_highlight()
         # Reset text attributes *before* clearing, not after: a
         # still-active SGR state (e.g. a background color left on by
         # draw_search_prompt(), which doesn't reset it since it's
@@ -5544,6 +5592,15 @@ class Viewer:
                 return i
         return 0
 
+    def _search_uses_text_lines(self):
+        """Whether / search should walk self.text_lines as one blob
+        (line_idx, start, end) matches rather than a PDF page/bbox
+        index. True for plain text files (always in text mode) and for
+        handlers like MarkdownDocument whose text mode shows the whole
+        raw source at once - but False in image mode even for those,
+        where a real PDF delegate's bbox index should still be used."""
+        return self.text_mode and not self.doc_handler.text_mode_is_paginated()
+
     def start_search(self, query, backward=False):
         """Search the whole document for `query` and jump to one match -
         which one depends on where you are now and on `backward`, i.e.
@@ -5553,11 +5610,11 @@ class Viewer:
         if not query:
             return
         self.search_query = query
-        if not self.doc_handler.text_mode_is_paginated():
+        if self._search_uses_text_lines():
             # No page/bbox structure for a non-paginated document
-            # (plain text/RTF, or an Office document currently in text
-            # mode) - matches are just (line_idx, start, end) straight
-            # out of text_lines, the whole document's text.
+            # (plain text/RTF, or Markdown currently in text mode) -
+            # matches are just (line_idx, start, end) straight out of
+            # text_lines, the whole document's text.
             self.search_matches = self._find_all_text_matches()
             if not self.search_matches:
                 self.search_pos = None
@@ -5615,7 +5672,7 @@ class Viewer:
     def _goto_search_match(self, idx):
         self.search_pos = idx
 
-        if not self.doc_handler.text_mode_is_paginated():
+        if self._search_uses_text_lines():
             line_idx, start, end = self.search_matches[idx]
             if self.text_wrap:
                 # No pan to speak of while wrapped - _row_for_line()

@@ -43,19 +43,58 @@ def test_markdown_renders_via_weasyprint_with_real_pagination(sample_md, tmp_pat
 
 
 @requires_markdown_rendering
-def test_markdown_extracted_text_is_paginated_and_searchable(sample_md, tmp_path):
-    """Text mode and search both come from the real PDF delegate, the
-    same as Word's own soffice/Chrome-rendered pages - each page's
-    text is its own, not one whole-document blob, and there's a real
-    per-page/bbox search index."""
+def test_markdown_text_mode_shows_raw_source(sample_md, tmp_path):
+    """Text mode (`t`) shows the raw Markdown source from disk - not
+    text extracted from the rendered PDF - so markup like `#` headings
+    is still visible."""
+    handler = classify(sample_md, tmp_path)
+    assert isinstance(handler, pdfless.MarkdownDocument)
+    handler.build_pages(str(tmp_path))
+    assert handler.text_mode_is_paginated() is False
+
+    source = handler.extract_text(1)
+    assert source == handler.extract_text(2)
+    joined = "\n".join(source)
+    assert joined.startswith("# Lorem Ipsum Sample")
+    assert "## リストの例" in joined
+    assert "追加セクション2" in joined
+
+
+@requires_markdown_rendering
+def test_markdown_text_mode_toggle_clears_active_search(sample_md, tmp_path):
+    """Markdown image mode searches the rendered PDF; text mode searches
+    the raw source - different text, so `t` clears any active search
+    rather than trying to carry a match across."""
+    from test_search import make_viewer
+
+    handler = classify(sample_md, tmp_path)
+    handler.build_pages(str(tmp_path))
+    viewer = make_viewer(handler)
+    viewer.start_search("追加セクション2")
+    assert viewer.search_query == "追加セクション2"
+
+    assert viewer.enter_text_mode() is True
+    assert viewer.text_mode is True
+    assert viewer.search_query is None
+    viewer._draw_text_unwrapped()  # must not raise
+
+    viewer.start_search("## リスト")
+    assert viewer.search_query == "## リスト"
+
+    assert viewer.toggle_text_mode() is True
+    assert viewer.text_mode is False
+    assert viewer.search_query is None
+
+
+@requires_markdown_rendering
+def test_markdown_image_mode_search_uses_pdf_delegate(sample_md, tmp_path):
+    """Image-mode search still comes from the real PDF delegate's own
+    per-page/bbox index - separate from text mode's whole-file source
+    search."""
     handler = classify(sample_md, tmp_path)
     assert isinstance(handler, pdfless.MarkdownDocument)
     handler.build_pages(str(tmp_path))
     assert handler.supports_search() is True
-    assert handler.text_mode_is_paginated() is True
-
-    assert "リストの例" in "\n".join(handler.extract_text(1))
-    assert "追加セクション2" in "\n".join(handler.extract_text(2))
 
     index = handler.build_search_index()
     assert len(index) == 2
