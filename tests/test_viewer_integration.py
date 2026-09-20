@@ -74,6 +74,23 @@ def test_rtf_office_text_mode_toggle(pty_session, sample_rtf):
     assert_no_crash(session, [b"t", b"t", b"q"], wait=1.0, initial_wait=6)
 
 
+def test_f_key_toggles_follow_mode_and_its_status_indicator(pty_session, sample_pdf):
+    """F is a runtime toggle for the same follow behavior -F/--follow
+    turns on at startup (see run_viewer()'s "F" handling) - and the
+    status line shows a " follow " segment (status_segments()) only
+    while it's active, regardless of how it got turned on."""
+    session = pty_session([sample_pdf])
+    time.sleep(3)
+    assert b" follow " not in session.read_all(0.5)  # off by default (startup paint)
+
+    session.send(b"F")
+    assert b" follow " in session.read_all(0.5)
+
+    session.send(b"F")
+    assert b" follow " not in session.read_all(0.5)
+    session.send(b"q")
+
+
 def test_f1_and_colon_h_both_open_the_help(pty_session, sample_text):
     """less(1)'s "?" is a backward search, so help moved to F1 - sent
     as ESC O P by most terminals and ESC [ 1 1 ~ by the rest - with

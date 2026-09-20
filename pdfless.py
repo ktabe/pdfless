@@ -74,6 +74,8 @@ STATUS_COLOR_FILE_INDEX = "\x1b[46;97m"  # white on cyan
 STATUS_COLOR_PAGE = "\x1b[42;97m"  # white on green
 STATUS_COLOR_LOC = "\x1b[43;30m"  # black on yellow
 STATUS_COLOR_ZOOM = "\x1b[45;97m"  # white on magenta
+STATUS_COLOR_FOLLOW = "\x1b[41;97m"  # white on red - stands out, since it
+# means pdfless is polling the disk behind your back (see -F/--follow)
 STATUS_COLOR_HELP = "\x1b[100;37m"  # light grey on dark grey
 
 # Text-mode search match: no image to draw a box marker over there, so
@@ -288,6 +290,7 @@ Keys:
                           and put back whatever was on before on a
                           second press
   r                       toggle the scrollbar
+  F                       toggle follow mode (auto-reload on file change)
                         <MISCELLANEOUS COMMANDS>
   ^L                      redraw the screen
   F1 :h                   show this help (q to close it)
@@ -3658,11 +3661,15 @@ class Viewer:
         border=True, wrap=True, eol_mark=True, line_numbers=False,
         scrollbar=True, wheel_scroll_step=2, incremental_scroll=True,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
-        office_continuous=False,
+        office_continuous=False, follow=False,
     ):
         self.files = files  # [DocumentHandler, ...] - one per CLI argument
         self.file_index = file_index
         self.tmpdir = tmpdir
+        self.follow = follow  # -F/--follow, or toggled at runtime with F -
+        # purely a display flag for status_segments(); the actual mtime-
+        # polling/reload logic lives in run_viewer()'s own loop, which
+        # keeps this in sync when the F key toggles it
         self.debug = debug  # -d/--debug: print office-preview stage timing
         self.office_render_scale = office_render_scale  # --rendering-scale
         self.office_continuous = office_continuous  # -c/--continuous
@@ -5132,8 +5139,10 @@ class Viewer:
             (f" page {self.page:>{len(str(self.npages))}}/{self.npages} ", STATUS_COLOR_PAGE),
             (f" {pct:>3}% ", STATUS_COLOR_LOC),
             (mode_field, STATUS_COLOR_ZOOM),
-            (" F1 or :h for help ", STATUS_COLOR_HELP),
         ]
+        if self.follow:
+            segments.append((" follow ", STATUS_COLOR_FOLLOW))
+        segments.append((" F1 or :h for help ", STATUS_COLOR_HELP))
         return segments
 
     def format_status(self, text=None):
@@ -5796,6 +5805,7 @@ def run_viewer(
         incremental_scroll=incremental_scroll,
         debug=debug,
         office_render_scale=office_render_scale, office_continuous=office_continuous,
+        follow=follow,
     )
 
     def on_winch(signum, frame):
@@ -6057,6 +6067,26 @@ def run_viewer(
             # Viewer.toggle_scrollbar()), so handled here at the top
             # level rather than inside handle_key()/handle_key_text().
             viewer.toggle_scrollbar()
+            viewer.refresh()
+            continue
+
+        if key == "F":
+            # Same -F/--follow behavior as the command-line flag, toggled
+            # at runtime; applies in both image and text mode, so handled
+            # here rather than inside handle_key()/handle_key_text().
+            follow = not follow
+            viewer.follow = follow
+            if follow:
+                # Start tracking from here, the same way the initial
+                # setup above does - otherwise a change that happened
+                # while follow was off (stale last_mtime) would trigger
+                # an immediate reload the moment it's turned back on.
+                last_follow_path = viewer.path
+                try:
+                    last_mtime = os.path.getmtime(last_follow_path)
+                except OSError:
+                    last_mtime = None
+                last_follow_check = time.monotonic()
             viewer.refresh()
             continue
 
@@ -6346,7 +6376,7 @@ def main():
         action="store_true",
         help="watch the file and reload it if it changes on disk "
              f"(checked every {FOLLOW_INTERVAL:.0f}s), staying on the "
-             "same page and in the same mode",
+             "same page and in the same mode; toggle any time with F",
     )
     parser.add_argument(
         "--wheel-scroll-step", type=positive_int, default=2, metavar="N",

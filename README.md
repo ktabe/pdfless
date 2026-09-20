@@ -133,7 +133,9 @@ controls. Press `C` again to restore the previous display settings.
 | `-d`, `--debug` | Print debugging information to standard error. |
 
 Note that `-h` means **fit to height**; use `--help` for command-line help.
-With `--follow`, only the currently displayed file is watched.
+With `--follow`, only the currently displayed file is watched, and it can
+be toggled on or off at any time with `F` (see below); the status line
+shows `follow` while it's active.
 
 ## Keyboard and mouse controls
 
@@ -185,6 +187,7 @@ With `--follow`, only the currently displayed file is watched.
 | `#`, `-N` | Toggle line numbers in text mode (hidden by default). |
 | `C` | Toggle a clean text display for copying, restoring previous settings on the second press. |
 | `r` | Toggle the scrollbar (shown by default). |
+| `F` | Toggle follow mode (same as `-F`/`--follow`), off by default. The status line shows `follow` while it's active. |
 | Click a PDF link | Open a URL in the system browser or follow an internal link. |
 | `[` / `]` | Go back / forward through internal-link navigation history. |
 | Click or drag the scrollbar | Jump to a document position in image mode. In text mode, the scrollbar is display-only. |
