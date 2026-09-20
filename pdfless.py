@@ -3119,6 +3119,8 @@ class SvgDocument(OfficeDocument):
         chrome = find_chrome()
         if chrome is None:
             return None
+        if debug:
+            print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
         tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
         wrapper_path = os.path.join(tmpdir, f"svg-wrap-{tag}.html")
 
