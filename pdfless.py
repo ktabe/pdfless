@@ -75,7 +75,7 @@ STATUS_COLOR_PAGE = "\x1b[42;97m"  # white on green
 STATUS_COLOR_LOC = "\x1b[43;30m"  # black on yellow
 STATUS_COLOR_ZOOM = "\x1b[45;97m"  # white on magenta
 STATUS_COLOR_FOLLOW = "\x1b[41;97m"  # white on red - stands out, since it
-# means pdfless is polling the disk behind your back (see -F/--follow)
+# means pdfless is polling the disk behind your back (see -f/--follow)
 STATUS_COLOR_HELP = "\x1b[100;37m"  # light grey on dark grey
 
 # Text-mode search match: no image to draw a box marker over there, so
@@ -230,7 +230,7 @@ MIN_ZOOM = 0.5
 MAX_ZOOM = 4.0
 ZOOM_STEP = 1.15
 PAN_STEP_CELLS = 8
-FOLLOW_INTERVAL = 3.0  # seconds between checks, under -F/--follow
+FOLLOW_INTERVAL = 3.0  # seconds between checks, under -f/--follow
 
 KEY_TABLE = """\
 Keys:
@@ -543,11 +543,16 @@ class _ViewerProgress:
     either corrupt or hide behind the alternate screen buffer at that
     point, so this posts into the status line instead, the same as any
     other one-off status message. Off under -d/--debug, which already
-    prints its own, more detailed, per-stage timing lines to stderr."""
+    prints its own, more detailed, per-stage timing lines to stderr. Also
+    off under -F/--quit-if-one-screen: whether this render ends up
+    interactive or a plain dump-and-quit isn't known until it's done, so
+    nothing gets written to the status line either way, rather than risk
+    a "converting via LibreOffice..."-style message leaking into what
+    might turn out to be a quiet dump (see Viewer.dump_and_quit())."""
 
     def __init__(self, viewer):
         self.viewer = viewer
-        self.enabled = not viewer.debug
+        self.enabled = not viewer.debug and not viewer.quit_if_one_screen
 
     def update(self, text):
         if self.enabled:
@@ -1869,7 +1874,7 @@ class DocumentHandler:
             else:
                 img = img.convert("RGB")
         except Exception as e:
-            # Reached from -F/--follow noticing the file changed into
+            # Reached from -f/--follow noticing the file changed into
             # something that fails to decode - main() already checks
             # this once up front, but the file can always go bad again
             # later. Re-raised as a plain RuntimeError so callers
@@ -2778,7 +2783,7 @@ class OfficeDocument(DocumentHandler):
 
             # A short, stable-per-path tag so this file's capture/page
             # PNGs don't collide with another file's (or its own
-            # previous ones, e.g. across a -F/--follow reload) - unlike
+            # previous ones, e.g. across a -f/--follow reload) - unlike
             # id(path), collision odds are negligible even if a path
             # string gets reused after being freed.
             tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
@@ -2948,7 +2953,7 @@ class RtfOfficeDocument(OfficeDocument):
         Returns the converted file's path, or None if textutil isn't
         available or the conversion failed. Always reconverts (rather
         than reusing a previous run's output) so a changed source file
-        (e.g. -F/--follow) can't leave a stale docx behind."""
+        (e.g. -f/--follow) can't leave a stale docx behind."""
         if shutil.which("textutil") is None:
             return None
         tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
@@ -3688,7 +3693,7 @@ class PageCache:
 
     def clear(self):
         self._cache.clear()
-        self._native_images.clear()  # re-read the file(s), e.g. for -F/--follow
+        self._native_images.clear()  # re-read the file(s), e.g. for -f/--follow
 
     def get(self, page, target_px, fit="width"):
         """The PDF page, or a pre-rendered page (a plain image file for
@@ -3739,15 +3744,35 @@ class Viewer:
         border=True, wrap=True, eol_mark=True, line_numbers=False,
         scrollbar=True, wheel_scroll_step=2, incremental_scroll=True,
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
-        office_continuous=False, follow=False,
+        office_continuous=False, follow=False, quit_if_one_screen=False,
     ):
         self.files = files  # [DocumentHandler, ...] - one per CLI argument
         self.file_index = file_index
         self.tmpdir = tmpdir
-        self.follow = follow  # -F/--follow, or toggled at runtime with F -
+        self.follow = follow  # -f/--follow, or toggled at runtime with F -
         # purely a display flag for status_segments(); the actual mtime-
         # polling/reload logic lives in run_viewer()'s own loop, which
         # keeps this in sync when the F key toggles it
+        self.quit_if_one_screen = quit_if_one_screen  # -F/--quit-if-one-
+        # screen - set before _set_current_file() below so _ViewerProgress
+        # can already see it: whether this first file ends up dumped-and-
+        # quit or interactive isn't known until after that render
+        # completes, so its progress reporting stays silent either way
+        # rather than risk printing "converting via LibreOffice..."-style
+        # status lines into what might turn out to be a plain dump
+        # (see _ViewerProgress and dump_and_quit()).
+        self.entered_alt_screen = False  # set True by run_viewer() once it
+        # switches into the alternate screen buffer - False on -F/--quit-
+        # if-one-screen's dump-and-quit path, which never does, so
+        # main()'s teardown knows there's nothing to restore
+        self._dump_margin_rows = 0  # extra rows _recompute_geometry()/
+        # _text_avail_rows() hold back beyond the usual status-line one -
+        # set to 1 by run_viewer()'s quit_if_one_screen dump path (see
+        # dump_and_quit()), which draws no status line but does write one
+        # trailing \r\n of its own; without this margin, content sized to
+        # exactly fill the terminal would make that \r\n force a one-line
+        # scroll, pushing the dump's own top row out of view the instant
+        # it's written
         self.debug = debug  # -d/--debug: print office-preview stage timing
         self.office_render_scale = office_render_scale  # --rendering-scale
         self.office_continuous = office_continuous  # -c/--continuous
@@ -3970,7 +3995,7 @@ class Viewer:
         self.base_width_px = width_px - (cell_w if self.scrollbar else 0)
         self.cell_h_px = cell_h
         self.cell_w_px = cell_w
-        self.avail_height_px = cell_h * max(1, rows - 1)
+        self.avail_height_px = cell_h * max(1, rows - 1 - self._dump_margin_rows)
         self.cache.clear()
         self.encode_cache.clear()
         self._last_viewport_set = False
@@ -4078,7 +4103,12 @@ class Viewer:
         self.text_scroll = self._row_for_line(line_idx) if self.text_wrap else line_idx
         self._clamp_text_scroll()
 
-    def refresh(self):
+    def _load_content(self):
+        """Geometry + page/text load half of refresh() - split out so
+        run_viewer()'s quit_if_one_screen check can run it without also
+        triggering the other half (the actual interactive draw, which
+        assumes an already-entered alternate screen: clears the
+        viewport, writes the status line, etc.)."""
         if self.resized:
             self._recompute_geometry()
             self.resized = False
@@ -4088,12 +4118,57 @@ class Viewer:
                 self._clamp_text_scroll()
             else:
                 self._load_page()
+
+    def refresh(self):
+        self._load_content()
         if self.help_active:
             self._draw_help()
         elif self.text_mode:
             self._draw_text()
         else:
             self._draw()
+
+    def dump_and_quit(self):
+        """-F/--quit-if-one-screen's own one-shot output: print the
+        already-loaded page/text and return - the caller is responsible
+        for having called _load_content() first, and for never having
+        entered the alternate screen at all, so this lands in the
+        terminal's real scrollback like `cat` would, the same as real
+        less(1)'s own -F. -N line numbers and the eol_mark marker still
+        apply, same as interactively - real content-display options, not
+        pager-only chrome, unlike the status line/border/scrollbar,
+        which this skips."""
+        if self.text_mode:
+            gutter_width = self._line_number_gutter_width()
+            rows = []
+            for i, line in enumerate(self.text_lines):
+                if gutter_width:
+                    num = str(i + 1).rjust(gutter_width - 1)
+                    line = LINE_NUMBER_COLOR + num + " " + LINE_NUMBER_RESET + line
+                if self.eol_mark:
+                    line += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
+                rows.append(line)
+            # \r\n, not just \n: the terminal is in raw mode (tty.setraw()
+            # - see RawTerminal) for the whole run regardless of which
+            # path run_viewer() takes, and raw mode turns off the normal
+            # tty-driver translation of a bare \n into \r\n - every other
+            # draw path avoids this by cursor-positioning each line
+            # explicitly instead of relying on it.
+            sys.stdout.write("\r\n".join(rows) + "\r\n")
+        else:
+            data = self._encode_crop(self.img)
+            b64 = base64.b64encode(data).decode("ascii")
+            osc = (
+                f"\x1b]1337;File=inline=1;size={len(data)};"
+                f"width={self.img.width}px;height={self.img.height}px;"
+                f"preserveAspectRatio=0:{b64}\x07"
+            )
+            # \r\n, not just \n - same raw-mode reasoning as the text
+            # branch above: without the \r, the shell prompt that
+            # follows lands one column short of column 1, which zsh
+            # flags with its own "%" no-trailing-newline marker.
+            sys.stdout.write(wrap_for_tmux(osc) + "\r\n")
+        sys.stdout.flush()
 
     def show_help(self):
         self.help_active = True
@@ -4246,7 +4321,7 @@ class Viewer:
             self.text_x_offset = self.text_x_offset_min
 
     def _text_avail_rows(self):
-        return max(1, self.rows - 1)  # bottom row is the status bar
+        return max(1, self.rows - 1 - self._dump_margin_rows)  # bottom row is the status bar
 
     def _text_avail_cols(self):
         # One column held back for the scrollbar (see
@@ -5543,7 +5618,7 @@ class Viewer:
         self.scroll = max(0, min(self.scroll_max, round(px_top) - margin))
 
     def reload(self):
-        """Re-read the PDF from disk (e.g. -F/--follow noticed it changed
+        """Re-read the PDF from disk (e.g. -f/--follow noticed it changed
         underneath us) and redraw, staying on the same page number and
         in the same mode. The rasterized-page cache and search index are
         both keyed off content that's now stale, so both get dropped;
@@ -5931,7 +6006,7 @@ def run_viewer(
     border=True, wrap=True, eol_mark=True, line_numbers=False, scrollbar=True,
     follow=False, wheel_scroll_step=2, keep=False, incremental_scroll=True,
     debug=False, office_render_scale=OFFICE_RENDER_SCALE,
-    office_continuous=False,
+    office_continuous=False, quit_if_one_screen=False,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
     caller can inspect its final geometry (e.g. to tidy up the screen)."""
@@ -5942,8 +6017,51 @@ def run_viewer(
         incremental_scroll=incremental_scroll,
         debug=debug,
         office_render_scale=office_render_scale, office_continuous=office_continuous,
-        follow=follow,
+        follow=follow, quit_if_one_screen=quit_if_one_screen,
     )
+
+    if quit_if_one_screen:
+        # -F/--quit-if-one-screen: real less(1)'s own -F. Only affects
+        # whether/how this first file starts up - never entering the
+        # alternate screen at all here is what leaves the dump in the
+        # terminal's real scrollback, the same as less -F itself (as
+        # opposed to -k/--keep, which stays parked in the alternate
+        # screen instead - not real scrollback).
+        viewer._dump_margin_rows = 1  # see Viewer.__init__ - applied to
+        # the "does it fit" check itself (not just the eventual render),
+        # so a file that only fits with no margin at all correctly falls
+        # through to interactive mode below instead of still being
+        # dumped somewhere it would immediately scroll itself out of.
+        if viewer.text_mode:
+            # -h/fit doesn't apply to text mode; "fits" here means the
+            # actual line count needs no scrolling - not just "1 page"
+            # (every plain-text/RTF file reports npages==1 regardless of
+            # length, so gating on that alone would dump-and-quit any
+            # length of piped $PAGER input instead of paging it).
+            viewer._load_content()
+            if viewer.text_scroll_max <= 0:
+                viewer.dump_and_quit()
+                return viewer
+        elif viewer.npages == 1:
+            # Force fit-to-height for the dump regardless of -h, so a
+            # single page is guaranteed to fit vertically; -h still
+            # governs the multi-page (interactive) case below untouched.
+            viewer.fit = "height"
+            viewer._load_content()
+            viewer.dump_and_quit()
+            return viewer
+        # else/fallthrough: not dumping after all (more than one page,
+        # or - in text mode - didn't fit even with the margin) - undo it
+        # and force a fresh geometry recompute, so the interactive
+        # session below gets the terminal's full usable height back
+        # rather than staying stuck with one row less than it should have.
+        viewer._dump_margin_rows = 0
+        viewer.resized = True
+
+    initial_mouse = MOUSE_OFF if viewer.text_mode else MOUSE_ON
+    sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON + FOCUS_ON)
+    sys.stdout.flush()
+    viewer.entered_alt_screen = True
 
     def on_winch(signum, frame):
         viewer.request_resize()
@@ -6222,7 +6340,7 @@ def run_viewer(
             continue
 
         if key == "F":
-            # Same -F/--follow behavior as the command-line flag, toggled
+            # Same -f/--follow behavior as the command-line flag, toggled
             # at runtime; applies in both image and text mode, so handled
             # here rather than inside handle_key()/handle_key_text().
             follow = not follow
@@ -6236,7 +6354,7 @@ def run_viewer(
             # Hand the current file off to macOS's own default app for
             # it (Preview/Word/Excel/...), and switch follow mode on (if
             # it wasn't already) so an edit made there comes back
-            # automatically - the same reload path -F/--follow and "F"
+            # automatically - the same reload path -f/--follow and "F"
             # already use. viewer.path is always the original file (see
             # DocumentHandler.__init__/Viewer.path), never a temporary
             # rendered PDF, so this opens the same thing the user
@@ -6497,6 +6615,15 @@ def main():
              "full width (default: fit width)",
     )
     parser.add_argument(
+        "-F", "--quit-if-one-screen",
+        action="store_true",
+        help="if the document is a single page (or, in text mode, "
+             "already fits the terminal with no scrolling needed), print "
+             "it fit-to-height and quit immediately, leaving it in the "
+             "normal scrollback instead of entering the pager; otherwise "
+             "start up normally (less(1)-style)",
+    )
+    parser.add_argument(
         "-B", "--no-border",
         action="store_false",
         dest="border",
@@ -6552,7 +6679,7 @@ def main():
              "under tmux) doesn't render correctly",
     )
     parser.add_argument(
-        "-F", "--follow",
+        "-f", "--follow",
         action="store_true",
         help="watch the file and reload it if it changes on disk "
              f"(checked every {FOLLOW_INTERVAL:.0f}s), staying on the "
@@ -6659,12 +6786,12 @@ def main():
             fd = sys.stdin.fileno()
 
         with RawTerminal(fd) as rt:
-            # A text-kind first file starts straight in text mode (see
-            # Viewer.__init__), where mouse reporting should be off, the
-            # same as it would be for a PDF's `t` toggle.
-            initial_mouse = MOUSE_OFF if files[0].starts_in_text_mode() else MOUSE_ON
-            sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON + FOCUS_ON)
-            sys.stdout.flush()
+            # Entering the alternate screen (and enabling mouse/alt-
+            # scroll/focus reporting) is now run_viewer()'s own call, not
+            # unconditional here - -F/--quit-if-one-screen's dump-and-quit
+            # path skips it entirely so its output lands in the terminal's
+            # real scrollback (see run_viewer(), and viewer.entered_alt_
+            # screen below).
             viewer = None
             try:
                 fit = "height" if args.fit_height else "width"
@@ -6678,22 +6805,26 @@ def main():
                     debug=args.debug,
                     office_render_scale=args.rendering_scale,
                     office_continuous=args.continuous,
+                    quit_if_one_screen=args.quit_if_one_screen,
                 )
             finally:
-                if args.keep and viewer is not None:
-                    # Stay in the alternate screen buffer so the last
-                    # rendered page remains visible; just clear the status
-                    # line and bring the cursor back so the shell prompt
-                    # lands cleanly below the image.
-                    sys.stdout.write(
-                        MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF
-                        + f"\x1b[{viewer.rows};1H\x1b[2K\x1b[?25h"
-                    )
-                else:
-                    sys.stdout.write(
-                        MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h\x1b[?1049l"
-                    )
-                sys.stdout.flush()
+                if viewer is not None and viewer.entered_alt_screen:
+                    if args.keep:
+                        # Stay in the alternate screen buffer so the last
+                        # rendered page remains visible; just clear the
+                        # status line and bring the cursor back so the
+                        # shell prompt lands cleanly below the image.
+                        sys.stdout.write(
+                            MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF
+                            + f"\x1b[{viewer.rows};1H\x1b[2K\x1b[?25h"
+                        )
+                    else:
+                        sys.stdout.write(
+                            MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h\x1b[?1049l"
+                        )
+                    sys.stdout.flush()
+                # else: the alternate screen was never entered (-F/--quit-
+                # if-one-screen's dump-and-quit path) - nothing to restore.
     finally:
         if tty_fd is not None:
             os.close(tty_fd)
