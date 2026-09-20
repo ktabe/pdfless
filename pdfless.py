@@ -595,6 +595,7 @@ def find_chrome():
 SOFFICE_CANDIDATES = (
     "/opt/homebrew/bin/soffice",
     "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    "/usr/bin/soffice",
 )
 
 
@@ -2452,6 +2453,16 @@ class OfficeDocument(DocumentHandler):
 
         debug=True (-d/--debug) reports a crashed/failing qlmanage -
         see _generate_ql_preview()."""
+        # soffice alone is enough, without ever touching qlmanage/
+        # Chrome - both macOS-only, so on Linux (no Quick Look at all)
+        # this is the only way Word/PowerPoint/RTF get previewed. Safe
+        # even on macOS: _render_office_pages()/build_pages() already
+        # try soffice before qlmanage for these extensions (see
+        # _soffice_pages_if_eligible()), so this just matches what
+        # rendering would do anyway instead of paying for a redundant
+        # qlmanage dry run.
+        if path.lower().endswith(OfficeDocument._SOFFICE_EXTENSIONS) and find_soffice() is not None:
+            return True
         if find_chrome() is None:
             return False
         return OfficeDocument._generate_ql_preview(path, tmpdir, debug=debug) is not None
@@ -2904,17 +2915,24 @@ class OfficeDocument(DocumentHandler):
 
 
 class RtfOfficeDocument(OfficeDocument):
-    """An RTF file, rendered as an image the same way a Word document
-    is - by first converting it to .docx via textutil (_rtf_to_docx()),
-    since RTF's own Quick Look preview is just a redirect back to the
-    original file (a Preview.url), not an HTML bundle qlmanage/Chrome
-    could render directly (see RtfDocument.is_rtf_file()). Once converted, it's
-    handled through the exact same OfficeDocument._render_office_pages() pipeline as any
-    other Word document (most often as a FlowingText OfficeVariant).
+    """An RTF file, rendered as an image. Preferably via soffice
+    reading the original .rtf natively (see build_pages()'s
+    _soffice_pages_if_eligible() call against self.path, not a
+    converted .docx) - the only path available on Linux, where
+    textutil doesn't exist. Falls back to converting it to .docx via
+    macOS's own textutil (_rtf_to_docx()) when soffice isn't
+    installed, since RTF's own Quick Look preview is just a redirect
+    back to the original file (a Preview.url), not an HTML bundle
+    qlmanage/Chrome could render directly (see
+    RtfDocument.is_rtf_file()). Once converted, it's handled through
+    the exact same OfficeDocument._render_office_pages() pipeline as
+    any other Word document (most often as a FlowingText
+    OfficeVariant).
 
     Tried before the plain-text-only RtfDocument fallback (see
-    HANDLER_CLASSES) - falls through to it if textutil isn't available
-    or qlmanage can't preview the converted .docx for some reason."""
+    HANDLER_CLASSES) - falls through to it if neither soffice nor
+    textutil is available, or qlmanage can't preview the converted
+    .docx for some reason."""
 
     @staticmethod
     def _rtf_to_docx(path, tmpdir):
@@ -2948,6 +2966,12 @@ class RtfOfficeDocument(OfficeDocument):
     def sniff(cls, path, tmpdir, debug=False):
         if not RtfDocument.is_rtf_file(path):
             return None
+        if find_soffice() is not None:
+            # build_pages() will try soffice against the original
+            # .rtf first anyway (see _soffice_pages_if_eligible()) -
+            # no need to pay for a textutil conversion just to probe
+            # that here, and textutil doesn't even exist on Linux.
+            return cls(path)
         docx_path = cls._rtf_to_docx(path, tmpdir)
         if docx_path is None:
             return None
