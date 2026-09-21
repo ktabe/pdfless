@@ -473,27 +473,37 @@ class _ProgressLine:
 
     def __init__(self, enabled):
         self.enabled = enabled and sys.stderr.isatty()
-        self._last_len = 0
+        self._last_width = 0  # terminal columns last written, not len()
         self._lock = threading.Lock()
+
+    def _stderr_cols(self):
+        try:
+            return os.get_terminal_size(sys.stderr.fileno()).columns
+        except OSError:
+            return shutil.get_terminal_size().columns
 
     def update(self, text):
         if not self.enabled:
             return
         with self._lock:
-            text = f"pdfless: {text}"
-            pad = max(0, self._last_len - len(text))
+            text = truncate_to_width(f"pdfless: {text}", self._stderr_cols())
+            pad = max(0, self._last_width - display_width(text))
             sys.stderr.write("\r" + text + " " * pad)
             sys.stderr.flush()
-            self._last_len = len(text)
+            self._last_width = display_width(text)
 
     def clear(self):
         if not self.enabled:
             return
         with self._lock:
-            if self._last_len:
-                sys.stderr.write("\r" + " " * self._last_len + "\r")
-                sys.stderr.flush()
-            self._last_len = 0
+            # EL (\x1b[2K) clears the whole row - needed when a previous
+            # update wrapped because the filename was wider than the
+            # terminal (before truncation) or the spinner briefly pushed
+            # the line over; a bare \\r plus len()-based spaces only
+            # ever touched the last wrapped row.
+            sys.stderr.write("\r\x1b[2K")
+            sys.stderr.flush()
+            self._last_width = 0
 
     def spin(self, label):
         """Context manager: animates a spinner in front of `label` in a
@@ -562,17 +572,23 @@ class _ViewerProgress:
             self.viewer.draw_status(text)
 
     def clear(self):
-        # Blank the line rather than restoring the viewer's normal status
-        # text (draw_status() with no argument) - that needs geometry
-        # (self.scroll_max, etc.) this may run before the current file's
-        # own first _load_page() has ever computed, if it's the very
-        # first file opened. A real refresh() always follows moments
-        # after this (from run_viewer() for the first file, or from the
-        # end of go_to_file()/reload() otherwise), painting the correct
-        # status right over this blank - so nothing is ever left stuck
-        # looking wrong.
+        # Erase the status row outright rather than restoring the viewer's
+        # normal status text (draw_status() with no argument) - that
+        # needs geometry (self.scroll_max, etc.) this may run before the
+        # current file's own first _load_page() has ever computed, if it's
+        # the very first file opened. A real refresh() always follows
+        # moments after this (from run_viewer() for the first file, or
+        # from the end of go_to_file()/reload() otherwise), painting the
+        # correct status right over this blank - so nothing is ever left
+        # stuck looking wrong. Use EL directly, same as _ProgressLine:
+        # a long filename in the progress message can wrap if it wasn't
+        # truncated tightly enough, and padding the line back out to
+        # self.cols afterward wouldn't touch any spill onto the row above.
         if self.enabled:
-            self.viewer.draw_status(" ")
+            sys.stdout.write(
+                f"\x1b[{self.viewer.rows};1H\x1b[2K{STATUS_COLOR_OFF}\x1b[?25l"
+            )
+            sys.stdout.flush()
 
     def spin(self, label):
         return _Spinner(self, label)
