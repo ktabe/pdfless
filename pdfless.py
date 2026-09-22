@@ -6908,7 +6908,9 @@ def main():
                     debug=args.debug,
                     office_render_scale=args.rendering_scale,
                     office_continuous=args.continuous,
-                    quit_if_one_screen=args.quit_if_one_screen,
+                    # Only meaningful for a single file - dumping the first
+                    # of several and quitting would silently drop the rest.
+                    quit_if_one_screen=args.quit_if_one_screen and len(files) == 1,
                 )
             finally:
                 if viewer is not None and viewer.entered_alt_screen:
