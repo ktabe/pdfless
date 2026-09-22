@@ -18,6 +18,19 @@ sys.path.insert(0, REPO_ROOT)
 import pdfless  # noqa: E402  (import after sys.path tweak, deliberately)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_office_cache(tmp_path, monkeypatch):
+    """Every test gets its own throwaway LibreOffice-PDF cache directory
+    (see pdfless._office_cache_root()) instead of ever touching the
+    real persistent one on the machine running the suite - via an env
+    var rather than a plain monkeypatch of the function, since a
+    PtySession-driven test spawns a real, separate `pdfless.py`
+    subprocess (see PtySession) that only an inherited env var (not an
+    attribute patched on this process's own imported pdfless module)
+    can actually reach."""
+    monkeypatch.setenv("PDFLESS_OFFICE_CACHE_DIR", str(tmp_path / "office-cache"))
+
+
 # All of these are static files checked into tests/fixtures/ rather
 # than generated on the fly - faster (no per-run PIL/textutil work),
 # easy to inspect/open by hand, and (sample.docx in particular) works

@@ -135,6 +135,8 @@ press `C` again to restore the previous display settings.
 | `-c`, `--continuous` | Use a continuous view for Quick Look previews. |
 | `--no-incremental-scroll` | Redraw the full page image on every scroll. |
 | `-d`, `--debug` | Print debugging information to standard error. |
+| `--no-cache` | Render afresh without reading or writing the persistent cache. |
+| `--clear-cache` | Delete the persistent cache and exit without opening any files. |
 
 Note that `-h` means **fit to height**; use `--help` for command-line help.
 Follow mode watches only the currently displayed file. Press `F` to toggle
@@ -281,6 +283,16 @@ Use `-s` to increase the resolution of image-based Quick Look previews and
 `-c` to request continuous scrolling for Quick Look documents. These options
 do not change the pagination or resolution of LibreOffice-only formats or Markdown.
 Excel uses Quick Look's sheet-based view rather than LibreOffice's print layout.
+
+## Cache
+
+Rendered output is saved in a persistent cache to reduce loading time when
+reopening the same file. Caching is supported for Word, Excel, PowerPoint,
+RTF, Keynote, Pages, and SVG. When the source file changes, the output is
+rendered again and the cache is updated automatically.
+
+Use `--no-cache` to render without reading or writing the cache, or
+`--clear-cache` to delete it and exit. The cache directory is shown in `--help`.
 
 ## Caveats
 
