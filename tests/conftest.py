@@ -303,6 +303,15 @@ class PtySession:
                 os.dup2(stdin_r, 0)
                 os.close(stdin_r)
                 os.close(stdin_w)
+            # Every test here assumes real image-mode output (an
+            # OSC 1337 inline image), which iterm2_like() only turns on
+            # given the right env vars - present when the suite happens
+            # to run inside a real iTerm2 window, but not guaranteed
+            # anywhere else (CI, a plain xterm, ...). Forcing it here
+            # (only in this forked child, not the pytest process
+            # itself) keeps every test deterministic regardless of
+            # where the suite is actually run from.
+            os.environ["TERM_PROGRAM"] = "iTerm.app"
             os.execvp(sys.executable, [sys.executable, PDFLESS_PY, *args])
         else:
             fcntl.ioctl(
