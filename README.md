@@ -180,6 +180,20 @@ The status line shows `follow` while the mode is active.
 | `/` `Enter` / `?` `Enter` | Repeat the previous pattern forward / backward. |
 | `N` / `P` | Next / previous match. |
 
+While entering a search pattern with `/` or `?`, use the following keys to
+edit the input. These bindings apply only while the search prompt is active.
+
+| Keys | Action |
+| --- | --- |
+| `^B`, `Left` | Move the cursor one character left. |
+| `^F`, `Right` | Move the cursor one character right. |
+| `^A` | Move to the beginning of the input. |
+| `^E` | Move to the end of the input. |
+| `^U` | Delete from the cursor to the beginning of the input. |
+| `^K` | Delete from the cursor to the end of the input. |
+| `^D`, `Delete` | Delete the character to the right of the cursor. |
+| `^H`, `Backspace` | Delete the character to the left of the cursor. |
+
 ### Display and interaction
 
 | Keys or gesture | Action |

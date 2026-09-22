@@ -3544,6 +3544,7 @@ CSI_FINAL_LETTERS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT", "H": "HO
 CSI_TILDE_CODES = {
     "1": "HOME", "7": "HOME",
     "4": "END", "8": "END",
+    "3": "DEL",
     "5": "PAGEUP",
     "6": "PAGEDOWN",
     "11": "F1",  # terminals that send F1 as a CSI; see SS3_FINAL_LETTERS
@@ -6374,11 +6375,13 @@ def run_viewer(
             # characters until Enter confirms it, Esc/^C cancels,
             # backspace edits it (or also cancels, if the pattern is
             # already empty), ^B/^F/LEFT/RIGHT move search_cursor within
-            # it, ^A/^E/HOME/END jump it to the start/end, ^D deletes the
-            # character under search_cursor, and ^U/^K kill from
+            # it, ^A/^E/HOME/END jump it to the start/end, ^D/DEL delete
+            # the character under search_cursor, and ^U/^K kill from
             # search_cursor to the start/end - readline's own bindings
-            # for these. Every other key is swallowed so it can't leak
-            # through as a page command while the prompt is up.
+            # for these (DEL is the one exception, added for the plain
+            # Delete key on keyboards without an easy ^D). Every other
+            # key is swallowed so it can't leak through as a page
+            # command while the prompt is up.
             if key in ("\r", "\n"):
                 query = search_buf or last_search_query
                 search_buf = None
@@ -6414,7 +6417,7 @@ def run_viewer(
                 if search_cursor < len(search_buf):
                     search_cursor = len(search_buf)
                     viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key == "\x04":  # ^D: delete the character under search_cursor
+            elif key in ("\x04", "DEL"):  # ^D / Delete: delete the character under search_cursor
                 if search_cursor < len(search_buf):
                     search_buf = search_buf[:search_cursor] + search_buf[search_cursor + 1:]
                     viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
