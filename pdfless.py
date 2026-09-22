@@ -6153,6 +6153,36 @@ def run_viewer(
         follow=follow, quit_if_one_screen=quit_if_one_screen,
     )
 
+    if not viewer.text_mode and not iterm2_like():
+        # Image mode is drawn entirely via the OSC 1337 inline-image
+        # protocol (see iterm2_like()) - on a terminal that doesn't
+        # understand it, that escape sequence is either ignored or shown
+        # as garbage, so nothing meaningful ever reaches the screen.
+        # Warn on the real (not yet alternate) screen, then fall back to
+        # text mode where this file has one; run_viewer()'s own "t"/"T"
+        # handling below keeps you there afterwards (see there).
+        name = os.path.basename(viewer.path)
+        has_text = (
+            viewer.doc_handler.supports_text_mode()
+            and viewer.doc_handler.extract_text(viewer.page) is not None
+        )
+        if has_text:
+            warning = f"{name}: this terminal doesn't support inline images (needs iTerm2/WezTerm) - showing text mode instead"
+        else:
+            warning = f"{name}: this terminal doesn't support inline images (needs iTerm2/WezTerm), and no text mode is available for this file"
+        sys.stdout.write(warning + "\r\n")
+        sys.stdout.flush()
+        time.sleep(2)
+        if has_text:
+            viewer.text_mode = True
+            # _load_content() only (re)loads text_mode content when
+            # switching *into* it (starts_in_text_mode()) or via
+            # enter_text_mode() - flipping the flag directly like this
+            # would otherwise leave text_lines at its __init__ default
+            # ([]), drawing an empty page (border/scrollbar/status line
+            # only, no content) until something else happened to reload it.
+            viewer._load_text_page()
+
     if quit_if_one_screen:
         # -F/--quit-if-one-screen: real less(1)'s own -F. Only affects
         # whether/how this first file starts up - never entering the
@@ -6578,6 +6608,13 @@ def run_viewer(
                 # Always-on text mode already - toggling would try to
                 # switch to an image view this kind doesn't have.
                 viewer.draw_status("this is already a plain text file")
+            elif viewer.text_mode and not iterm2_like():
+                # Already in text mode - possibly the run_viewer() startup
+                # fallback above put it there - and image mode wouldn't
+                # show anything on this terminal anyway (see there), so
+                # refuse to cross back rather than switching to a blank
+                # screen.
+                viewer.draw_status("image mode needs iTerm2/WezTerm - not supported on this terminal")
             elif viewer.doc_handler.supports_text_mode():
                 if not viewer.toggle_text_mode():
                     viewer.draw_status("no text could be extracted from this file")
@@ -6593,6 +6630,8 @@ def run_viewer(
             # there too.
             if viewer.doc_handler.starts_in_text_mode():
                 viewer.draw_status("this is already a plain text file")
+            elif viewer.text_mode and not iterm2_like():
+                viewer.draw_status("image mode needs iTerm2/WezTerm - not supported on this terminal")
             elif viewer.doc_handler.supports_text_mode():
                 if not viewer.toggle_clean_text_mode():
                     viewer.draw_status("no text could be extracted from this file")
