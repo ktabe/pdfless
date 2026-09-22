@@ -75,15 +75,21 @@ def test_rtf_office_document_always_renders_continuous(sample_rtf, tmp_path):
 
 
 def test_rtf_falls_back_to_plain_text_without_textutil(sample_rtf, tmp_path, monkeypatch):
-    """Without textutil (e.g. non-macOS), RtfOfficeDocument.sniff()
-    can't convert to .docx at all - HANDLER_CLASSES falls through to
-    the plain-text-only RtfDocument instead (see HANDLER_CLASSES'
-    ordering)."""
+    """Without soffice or textutil (e.g. a minimal non-macOS install),
+    RtfOfficeDocument.sniff() can't render the file at all - via
+    soffice directly, or by converting to .docx first - so
+    HANDLER_CLASSES falls through to the plain-text-only RtfDocument
+    instead (see HANDLER_CLASSES' ordering). find_soffice() checks
+    SOFFICE_CANDIDATES' fixed paths before ever calling shutil.which()
+    (see its own docstring), so that alone has to be patched too, not
+    just shutil.which("soffice") - otherwise a real local LibreOffice
+    install (found via one of those fixed paths) would still win."""
     real_which = pdfless.shutil.which
     monkeypatch.setattr(
         pdfless.shutil, "which",
         lambda name: None if name == "textutil" else real_which(name),
     )
+    monkeypatch.setattr(pdfless, "find_soffice", lambda: None)
     handler = classify(sample_rtf, tmp_path)
     assert isinstance(handler, pdfless.RtfDocument)
     assert not isinstance(handler, pdfless.RtfOfficeDocument)
