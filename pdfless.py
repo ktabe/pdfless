@@ -51,7 +51,7 @@ import unicodedata
 import webbrowser
 from collections import OrderedDict
 
-from PIL import Image, ImageChops, ImageOps
+from PIL import ExifTags, Image, ImageChops, ImageOps
 
 # A many-page/many-slide office document's full-height capture (see
 # OfficeDocument._render_office_pages()) routinely exceeds Pillow's default "decompression
@@ -2229,6 +2229,24 @@ class PdfDocument(DocumentHandler):
 class ImageDocument(DocumentHandler):
     kind = "image"
 
+    # UserComment/GPSProcessingMethod/GPSAreaInformation are all the EXIF
+    # spec's "UNDEFINED"-type comment layout (EXIF 2.3 section 4.6.5): an
+    # 8-byte character-code prefix, not part of the text itself, saying how
+    # to decode whatever bytes follow it.
+    _EXIF_COMMENT_TAG_NAMES = {"UserComment", "GPSProcessingMethod", "GPSAreaInformation"}
+    _EXIF_COMMENT_CODES = {
+        b"ASCII\x00\x00\x00": "ascii",
+        b"UNICODE\x00": "utf-16",
+        b"JIS\x00\x00\x00\x00\x00": "shift_jis",
+    }
+
+    # Standard EXIF GPS IFD tag ids (EXIF 2.3 section 4.6.6) for the four
+    # tags _gps_decimal_degrees() combines - fixed by the spec, unlike
+    # every other tag here, which is instead looked up by name through
+    # ExifTags.GPSTAGS.
+    _GPS_LATITUDE_REF, _GPS_LATITUDE = 1, 2
+    _GPS_LONGITUDE_REF, _GPS_LONGITUDE = 3, 4
+
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
         try:
@@ -2247,6 +2265,208 @@ class ImageDocument(DocumentHandler):
 
     def _source_for_page(self, cache, page):
         return self.path  # always page 1 - see page_count()
+
+    def extract_text(self, page):
+        # No document text to speak of - this is facts about the image
+        # itself (format/size/EXIF/...) instead. See _image_info_lines().
+        return self._image_info_lines()
+
+    def supports_text_mode(self):
+        return True
+
+    def _human_size(self, num_bytes):
+        """`num_bytes` as a short "12.3 MB"-style string - _image_info_lines()'s
+        own file-size line, not a general-purpose formatter (no need for one
+        elsewhere in this file)."""
+        size = float(num_bytes)
+        for unit in ("bytes", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{num_bytes} bytes" if unit == "bytes" else f"{size:.1f} {unit}"
+            size /= 1024
+
+    def _decode_exif_comment(self, value):
+        """The text half of a UserComment/GPSProcessingMethod/
+        GPSAreaInformation value, per its own 8-byte code prefix (see
+        _EXIF_COMMENT_CODES) - or None if that prefix isn't one the spec
+        defines, for _format_exif_value()'s generic bytes handling to fall
+        back to instead.
+
+        Spec-compliant EXIF declares this tag's type as UNDEFINED, which
+        Pillow hands back as bytes - but plenty of real cameras/phones
+        (confirmed by hand: a Motorola Moto G6 Plus's own
+        GPSProcessingMethod, "ASCII\\0\\0\\0network") mislabel it as plain
+        ASCII instead, which Pillow then decodes into a str itself - one
+        still carrying this same 8-byte prefix as literal characters,
+        Pillow having no way to know to strip it. latin-1 round-trips
+        every byte 0-255 back losslessly (the only encoding Python
+        guarantees that for), undoing exactly that str decode so the same
+        prefix-stripping logic below applies regardless of which shape
+        Pillow gave this in."""
+        if isinstance(value, str):
+            value = value.encode("latin-1", errors="ignore")
+        prefix, rest = value[:8], value[8:]
+        encoding = self._EXIF_COMMENT_CODES.get(prefix)
+        if encoding is None:
+            return None
+        try:
+            return rest.decode(encoding).rstrip("\x00").strip()
+        except UnicodeDecodeError:
+            return None
+
+    def _format_exif_value(self, name, value):
+        """A single EXIF tag's value as display text - most are already
+        plain numbers/strings/Pillow IFDRationals (str()'s fine for all of
+        those), but a few need special handling by `name` (the tag's own
+        display name, from ExifTags.TAGS/GPSTAGS - see _exif_lines()):
+        GPSVersionID is 4 raw version-number bytes (e.g. 2.3.0.0), not
+        text, and the UNDEFINED-type comment fields (_EXIF_COMMENT_TAG_NAMES)
+        carry a non-text prefix before their actual value - both would
+        otherwise come out as garbled control characters through the
+        generic bytes handling below, which everything else (MakerNote,
+        thumbnail data, ...) still falls back to."""
+        if name == "GPSVersionID" and isinstance(value, (bytes, tuple, list)):
+            return ".".join(str(b) for b in value)
+        if name in self._EXIF_COMMENT_TAG_NAMES and isinstance(value, (bytes, str)):
+            decoded = self._decode_exif_comment(value)
+            if decoded is not None:
+                return decoded
+        if isinstance(value, bytes):
+            if len(value) > 64:
+                return f"<binary, {len(value)} bytes>"
+            try:
+                return value.decode("ascii").strip("\x00")
+            except UnicodeDecodeError:
+                return f"<binary, {len(value)} bytes>"
+        return str(value)
+
+    def _gps_decimal_degrees(self, dms, ref):
+        """A GPSLatitude/GPSLongitude (degrees, minutes, seconds) tuple plus
+        its Ref ("N"/"S"/"E"/"W") as one signed decimal-degrees float -
+        negative for S/W. The raw DMS form EXIF stores this in is standard
+        but not practically usable (nothing takes DMS input directly),
+        unlike decimal degrees, which is what maps/GPS tools (Google Maps'
+        own search box included) expect."""
+        degrees, minutes, seconds = (float(v) for v in dms)
+        value = degrees + minutes / 60 + seconds / 3600
+        return -value if ref in ("S", "W") else value
+
+    def _exif_lines(self, img):
+        """"Tag: value" lines for `img`'s EXIF metadata (most JPEGs from a
+        camera/phone carry some; most PNGs/screenshots don't), or [] if it
+        has none. GPSInfo is a nested sub-IFD of its own (see
+        ExifTags.IFD.GPSInfo) rather than a plain tag - expanded into its
+        own "GPS <tag>" lines instead of the raw dict getexif() otherwise
+        leaves it as. Where both GPSLatitude/GPSLongitude and their Ref are
+        present, those four raw DMS tags are replaced with two decimal-
+        degrees lines and a single "lat,lon" line ready to paste into
+        Google Maps' search box - see _gps_decimal_degrees()."""
+        try:
+            exif = img.getexif()
+        except Exception:
+            return []
+        if not exif:
+            return []
+        lines = []
+        for tag_id in sorted(exif.keys()):
+            if tag_id == ExifTags.IFD.GPSInfo:
+                continue
+            name = ExifTags.TAGS.get(tag_id, str(tag_id))
+            lines.append(f"{name}: {self._format_exif_value(name, exif[tag_id])}")
+        try:
+            gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+        except Exception:
+            gps = None
+        gps = gps or {}
+
+        lat_dd = lon_dd = None
+        try:
+            if self._GPS_LATITUDE in gps and self._GPS_LATITUDE_REF in gps:
+                lat_dd = self._gps_decimal_degrees(gps[self._GPS_LATITUDE], gps[self._GPS_LATITUDE_REF])
+            if self._GPS_LONGITUDE in gps and self._GPS_LONGITUDE_REF in gps:
+                lon_dd = self._gps_decimal_degrees(gps[self._GPS_LONGITUDE], gps[self._GPS_LONGITUDE_REF])
+        except (TypeError, ValueError, ZeroDivisionError):
+            lat_dd = lon_dd = None
+
+        skip_ids = set()
+        if lat_dd is not None:
+            lines.append(f"GPS Latitude: {abs(lat_dd):.6f}° {gps[self._GPS_LATITUDE_REF]}")
+            skip_ids |= {self._GPS_LATITUDE, self._GPS_LATITUDE_REF}
+        if lon_dd is not None:
+            lines.append(f"GPS Longitude: {abs(lon_dd):.6f}° {gps[self._GPS_LONGITUDE_REF]}")
+            skip_ids |= {self._GPS_LONGITUDE, self._GPS_LONGITUDE_REF}
+        if lat_dd is not None and lon_dd is not None:
+            lines.append(f"GPS Coordinates (paste into Google Maps): {lat_dd:.6f},{lon_dd:.6f}")
+
+        for tag_id in sorted(gps):
+            if tag_id in skip_ids:
+                continue
+            name = ExifTags.GPSTAGS.get(tag_id, str(tag_id))
+            lines.append(f"GPS {name}: {self._format_exif_value(name, gps[tag_id])}")
+        return lines
+
+    def _image_info_lines(self):
+        """Text-mode content for an image, shown via the same "t" key every
+        other kind uses (see ImageDocument.extract_text()) - there's no
+        document text to extract from a raw image, so this shows facts
+        about the image itself instead: basic format/size info every image
+        has, then EXIF metadata and any embedded text chunks (a screenshot
+        tool's own tag, or an AI image generator's embedded prompt - PNG
+        stores both the same way, as a tEXt/iTXt chunk) where the file
+        happens to carry them. None if the file can no longer be opened
+        (e.g. deleted since being classified)."""
+        try:
+            img = Image.open(self.path)
+        except Exception:
+            return None
+        with img:
+            lines = ["Image Info", "==========", ""]
+            lines.append(f"File:        {os.path.basename(self.path)}")
+            lines.append(f"Format:      {img.format or 'unknown'}")
+            lines.append(f"Size:        {img.width} x {img.height} px")
+            lines.append(f"Color mode:  {img.mode}")
+            try:
+                lines.append(f"File size:   {self._human_size(os.path.getsize(self.path))}")
+            except OSError:
+                pass
+            dpi = img.info.get("dpi")
+            if dpi:
+                # dpi's own values can be a plain float or Pillow's
+                # IFDRational (when read from EXIF) - the latter has no
+                # :.0f support of its own, hence the explicit float() first.
+                lines.append(f"DPI:         {float(dpi[0]):.0f} x {float(dpi[1]):.0f}")
+            n_frames = getattr(img, "n_frames", 1)
+            if n_frames > 1:
+                lines.append(f"Frames:      {n_frames} (animated)")
+            if "transparency" in img.info or "A" in img.mode:
+                lines.append("Transparency: yes")
+            if img.info.get("icc_profile"):
+                lines.append("ICC profile: yes")
+
+            # PNG (and some other formats') text chunks - Pillow decodes
+            # these straight to str in .info, unlike the binary metadata
+            # (icc_profile, exif, ...) also stored there, so a plain
+            # isinstance check is enough to single them out.
+            text_chunks = {k: v for k, v in img.info.items() if isinstance(v, str)}
+            if text_chunks:
+                lines += ["", "Embedded text", "=============", ""]
+                for key, value in sorted(text_chunks.items()):
+                    value_lines = value.splitlines() or [""]
+                    for i, line in enumerate(value_lines):
+                        label = f"{key}:" if i == 0 else " " * (len(key) + 1)
+                        lines.append(f"{label} {line}")
+
+            exif_lines = self._exif_lines(img)
+            if exif_lines:
+                lines += ["", "EXIF", "====", ""]
+                lines += exif_lines
+
+            # EXIF fields (Artist/Copyright/UserComment/...) and PNG text
+            # chunks both come straight from the file's own bytes - same
+            # untrusted-content caret-notation treatment as a plain text
+            # file (see read_plain_text_lines()), so a raw ESC or other
+            # control byte tucked into one can't inject terminal escape
+            # sequences or otherwise corrupt the display.
+            return [_CONTROL_CHAR_RE.sub(_caret_notation, line) for line in lines]
 
 
 class TextDocument(DocumentHandler):
@@ -6139,10 +6359,19 @@ def run_viewer(
     border=True, wrap=True, eol_mark=True, line_numbers=False, scrollbar=True,
     follow=False, wheel_scroll_step=2, keep=False, incremental_scroll=True,
     debug=False, office_render_scale=OFFICE_RENDER_SCALE,
-    office_continuous=False, quit_if_one_screen=False,
+    office_continuous=False, quit_if_one_screen=False, viewer_out=None,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
-    caller can inspect its final geometry (e.g. to tidy up the screen)."""
+    caller can inspect its final geometry (e.g. to tidy up the screen).
+
+    `viewer_out`, if given, is a list this appends the Viewer to as soon
+    as it's constructed - main()'s own try/finally can only restore the
+    terminal (mouse reporting, the alternate screen, ...) once this
+    returns *or raises*, and `viewer = run_viewer(...)`'s assignment
+    never happens on the latter, so without this a bug anywhere in the
+    interactive loop below (a page render, a keypress handler, ...)
+    would leave the terminal in whatever raw/alternate-screen/mouse-
+    reporting state it was in when the exception hit - see main()."""
     viewer = Viewer(
         files, start_file_index, start_page, tmpdir, fd, fit=fit,
         border=border, wrap=wrap, eol_mark=eol_mark, line_numbers=line_numbers,
@@ -6152,6 +6381,8 @@ def run_viewer(
         office_render_scale=office_render_scale, office_continuous=office_continuous,
         follow=follow, quit_if_one_screen=quit_if_one_screen,
     )
+    if viewer_out is not None:
+        viewer_out.append(viewer)
 
     if not viewer.text_mode and not iterm2_like():
         # Image mode is drawn entirely via the OSC 1337 inline-image
@@ -7011,6 +7242,8 @@ def main():
             # real scrollback (see run_viewer(), and viewer.entered_alt_
             # screen below).
             viewer = None
+            keep = args.keep
+            viewer_out = []
             try:
                 fit = "height" if args.fit_height else "width"
                 viewer = run_viewer(
@@ -7026,10 +7259,24 @@ def main():
                     # Only meaningful for a single file - dumping the first
                     # of several and quitting would silently drop the rest.
                     quit_if_one_screen=args.quit_if_one_screen and len(files) == 1,
+                    viewer_out=viewer_out,
                 )
+            except BaseException:
+                # run_viewer() raised (a bug mid-render/mid-keypress, or
+                # ^C during a re-render - see run_subprocess()) rather
+                # than returning normally, so the assignment above never
+                # happened - viewer_out is what run_viewer() reported
+                # its Viewer through instead (see there). Ignore --keep
+                # here and fall through to a full restore regardless:
+                # the traceback about to print needs the real screen and
+                # cooked mouse reporting to actually be visible, not
+                # left behind in the alternate screen this is leaving.
+                viewer = viewer_out[0] if viewer_out else None
+                keep = False
+                raise
             finally:
                 if viewer is not None and viewer.entered_alt_screen:
-                    if args.keep:
+                    if keep:
                         # Stay in the alternate screen buffer so the last
                         # rendered page remains visible; just clear the
                         # status line and bring the cursor back so the

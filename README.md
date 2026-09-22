@@ -198,7 +198,7 @@ edit the input. These bindings apply only while the search prompt is active.
 
 | Keys or gesture | Action |
 | --- | --- |
-| `t` | Toggle text mode where text extraction is supported. For Markdown, shows the raw source (`#`, `*`, etc.), not PDF-extracted text. |
+| `t` | Toggle text mode: extracted text for supported documents, raw source for Markdown, or image information and metadata for image files. |
 | `T` | Toggle text mode with a clean display for copying, combining the functions of `t` and `C`. |
 | `B` | Toggle page borders in text mode (on by default, except for plain text files, which never show one). Borders are hidden while lines wrap. |
 | `s`, `-S` | Toggle line wrapping in text mode. Plain text wraps by default; other formats do not. |
@@ -219,8 +219,17 @@ edit the input. These bindings apply only while the search prompt is active.
 ## Additional formats (experimental)
 
 PNG, JPEG, and other image formats supported by
-[Pillow](https://python-pillow.org) open directly. The formats below require
-additional software. PDF-based rendering also requires Poppler.
+[Pillow](https://python-pillow.org) open directly. Press `t` or `T` to view
+image information in text mode, including the filename, format, pixel
+dimensions, color mode, file size, DPI, and transparency.
+
+EXIF metadata and embedded text chunks are also shown when present. GPS
+metadata includes decimal latitude and longitude and a coordinate pair you
+can paste into Google Maps. Embedded text may include screenshot-tool tags
+or AI image-generation prompts.
+
+The formats below require additional software. PDF-based rendering also
+requires Poppler.
 
 ### Optional dependencies
 

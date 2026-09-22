@@ -138,7 +138,7 @@ def test_capability_matrix_matches_expectations(
         True, True, True,
     )
     assert (image.supports_text_mode(), image.supports_search(), image.text_mode_is_paginated()) == (
-        False, False, False,
+        True, False, False,
     )
     assert (text.supports_text_mode(), text.supports_search(), text.text_mode_is_paginated()) == (
         True, True, False,
