@@ -693,6 +693,223 @@ def _pdf_page_count_safe(pdf_path):
     return int(m.group(1)) if m else None
 
 
+OFFICE_CACHE_MAX_ENTRIES = 50  # persistent rendered-pages cache (see
+# _office_cache_dir()) - entries beyond this many, least-recently-used
+# first (by atime - see _render_result_cached()), are pruned each time
+# a new one is added.
+
+_OFFICE_CACHE_ENABLED = True  # --no-cache flips this off for the whole
+# process - read directly by _render_result_cached() rather than
+# threaded as a parameter through every build_pages()/ensure_pages()
+# layer in between (OfficeDocument/RtfOfficeDocument/
+# _render_office_pages()/ExcelWorkbook/SlideDeck/FlowingText/
+# SvgDocument/...) - the same ambient-global shape _CTRL_C_FD already
+# uses for a similar problem (a deeply-nested function needing one bit
+# of top-level CLI state).
+
+
+def _office_cache_root():
+    """Base directory for the persistent rendered-pages cache, without
+    creating it - split out from _office_cache_dir() so --clear-cache
+    can name the directory to remove without the side effect of
+    creating it again right after.
+
+    PDFLESS_OFFICE_CACHE_DIR, if set, names the cache directory itself
+    directly - not a base to join "pdfless/rendered-pages" onto. Not a
+    documented user-facing setting; it exists so the test suite can
+    point every test (including one that launches a real `pdfless.py`
+    subprocess - an env var, unlike a plain monkeypatch of this
+    function, reaches a subprocess too) at a throwaway directory
+    instead of ever touching the real one."""
+    override = os.environ.get("PDFLESS_OFFICE_CACHE_DIR")
+    if override:
+        return override
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Caches")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "pdfless", "rendered-pages")
+
+
+def _office_cache_dir():
+    """The persistent rendered-pages cache directory, created if it
+    doesn't exist yet - unlike `tmpdir` (wiped on exit), this survives
+    across separate pdfless invocations, so reopening the same Word/
+    RTF/PowerPoint/Excel/Keynote/Pages/SVG file skips its (LibreOffice-
+    or Chrome-driven) rendering entirely, as long as the file hasn't
+    changed since (see _render_result_cached()). A function rather
+    than a module-level constant so tests can monkeypatch it to a
+    throwaway directory instead of touching the real one."""
+    d = _office_cache_root()
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _cached_render_dir(path, key_suffix=""):
+    """Directory holding _render_result_cached()'s persistent copy of
+    `path`'s rendered pages - a single "document.pdf" for a real-PDF
+    result (LibreOffice, or Chrome's print-to-pdf via FlowingText/
+    SvgDocument), or a "page-0.<ext>", "page-1.<ext>", ... sequence for
+    a screenshot-sliced one (Excel/Keynote/Pages/PowerPoint-without-
+    soffice, and Word's own screenshot fallback) - whichever's actually
+    present is how _render_result_cached() tells the two shapes apart
+    again on a hit, so no separate manifest file is needed.
+
+    Keyed by `path`'s own absolute location alone, not its mtime/size,
+    so repeatedly editing and reopening the same file reuses (and just
+    refreshes) a single cache entry instead of accumulating a new one
+    on every edit - see _render_result_cached() for how staleness
+    against the current file is actually detected. `key_suffix`, if
+    given, distinguishes multiple different possible renderings of the
+    very same file: -c/--continuous (a real-PDF result differs - one
+    oversized page vs. paginated normally) and -s/--rendering-scale (a
+    screenshot-sliced result bakes in a fixed pixel resolution, unlike
+    a real-PDF one, always re-rasterized on demand at whatever the
+    current zoom needs) - caching one under a key the other could also
+    match would silently serve the wrong rendering."""
+    key = hashlib.sha256((os.path.abspath(path) + key_suffix).encode()).hexdigest()
+    return os.path.join(_office_cache_dir(), key)
+
+
+def _prune_office_cache(cache_dir, keep=OFFICE_CACHE_MAX_ENTRIES):
+    """Delete the least-recently-used entries (oldest atime - bumped on
+    every cache hit by _render_result_cached(), which is the only thing
+    that ever touches atime here) beyond `keep`. Each entry is itself a
+    directory (see _cached_render_dir()), so removal is shutil.rmtree()
+    rather than a plain unlink. Best-effort: an entry that vanishes or
+    fails to stat/remove between listing and pruning (another process's
+    own cache hit or prune, say) is just skipped rather than treated as
+    an error."""
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return
+    if len(names) <= keep:
+        return
+    entries = []
+    for name in names:
+        p = os.path.join(cache_dir, name)
+        try:
+            entries.append((os.stat(p).st_atime, p))
+        except OSError:
+            continue
+    entries.sort()
+    for _atime, p in entries[:len(entries) - keep]:
+        try:
+            shutil.rmtree(p) if os.path.isdir(p) else os.unlink(p)
+        except OSError:
+            pass
+
+
+def _render_result_cached(path, render_fn, key_suffix=""):
+    """Run `render_fn()` (a zero-argument closure doing whatever actual
+    rendering work - shelling out to LibreOffice, or driving Chrome
+    through qlmanage/measuring/screenshotting/print-to-pdf - and
+    returning either a ("pdf", pdf_path, npages) tuple or a plain list
+    of page image paths, in reading order, or None on failure) only if
+    there's no still-fresh persistent cache entry (see
+    _office_cache_dir()) already covering `path` - "fresh" being a
+    plain mtime comparison against `path` itself, the same staleness
+    check -f/--follow already uses elsewhere, applied here to the
+    cache entry directory's own mtime instead of a separately-recorded
+    one: deliberately NOT part of the cache key (see
+    _cached_render_dir()), so this is what actually decides whether a
+    given entry is still good, and updating it (by writing a fresh
+    render) is exactly what makes it good again after an edit. Shared
+    by every one of pdfless's own document-to-page-images renderings -
+    the cache doesn't care which tool produced a given entry or which
+    of the two result shapes it is, only that it's still a fresh
+    rendering of `path`. `key_suffix` is passed straight through to
+    _cached_render_dir() - see there.
+
+    Bypassed entirely by --no-cache (_OFFICE_CACHE_ENABLED) - always
+    calls render_fn() fresh, without reading or writing the cache at
+    all.
+
+    Returns (result, from_cache) with the same shape render_fn() itself
+    returns - None (from_cache False) on whatever failure render_fn()
+    returns None/falsy for."""
+    if not _OFFICE_CACHE_ENABLED:
+        return render_fn(), False
+
+    entry_dir = _cached_render_dir(path, key_suffix)
+    try:
+        source_mtime = os.path.getmtime(path)
+        cache_mtime = os.path.getmtime(entry_dir)
+    except OSError:
+        cache_mtime = None
+
+    if cache_mtime is not None and cache_mtime >= source_mtime:
+        cached = _read_cached_render(entry_dir)
+        if cached is not None:
+            # A hit: bump atime only (LRU recency for
+            # _prune_office_cache()) - mtime is left exactly as it is,
+            # since it's what this same comparison will be judged
+            # against next time.
+            try:
+                os.utime(entry_dir, (time.time(), cache_mtime))
+            except OSError:
+                pass
+            return cached, True
+        # Present but unusable (corrupt/incomplete, or left behind by
+        # an older cache format) - fall through and re-render, which
+        # overwrites it below.
+
+    result = render_fn()
+    if not result:
+        return None, False
+    _publish_cached_render(entry_dir, result)
+    _prune_office_cache(os.path.dirname(entry_dir))
+    return result, False
+
+
+def _read_cached_render(entry_dir):
+    """entry_dir's cached result, re-derived from whatever's actually on
+    disk there (see _cached_render_dir()) - a ("pdf", pdf_path, npages)
+    tuple if it holds a document.pdf (npages read fresh via
+    _pdf_page_count_safe(), rather than also stored, so a cache entry
+    is just the rendered files themselves, nothing more), or a sorted
+    list of its "page-N.<ext>" paths otherwise. None if neither is
+    present/usable at all."""
+    pdf_path = os.path.join(entry_dir, "document.pdf")
+    if os.path.isfile(pdf_path):
+        npages = _pdf_page_count_safe(pdf_path)
+        return ("pdf", pdf_path, npages) if npages else None
+    try:
+        names = [n for n in os.listdir(entry_dir) if n.startswith("page-")]
+        names.sort(key=lambda n: int(n.split("-", 1)[1].split(".", 1)[0]))
+    except OSError:
+        return None
+    return [os.path.join(entry_dir, n) for n in names] if names else None
+
+
+def _publish_cached_render(entry_dir, result):
+    """Copy `result` (render_fn()'s return value - see
+    _render_result_cached()) into entry_dir, atomically: built up in a
+    temp directory alongside it (same filesystem as entry_dir, unlike
+    wherever the actual render output landed - typically `tmpdir` - so
+    the os.replace() below can't hit a cross-device error) and only
+    then moved into place with one directory rename, so no reader ever
+    sees a partially-written cache entry. Best-effort: any OSError here
+    just leaves the cache without this entry, since the render itself
+    already succeeded and that's what actually matters to the caller."""
+    tmp_dir = entry_dir + f".tmp{os.getpid()}"
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+        if isinstance(result, tuple) and result[0] == "pdf":
+            shutil.copyfile(result[1], os.path.join(tmp_dir, "document.pdf"))
+        else:
+            for i, p in enumerate(result):
+                shutil.copyfile(p, os.path.join(tmp_dir, f"page-{i}{os.path.splitext(p)[1]}"))
+        if os.path.isdir(entry_dir):
+            shutil.rmtree(entry_dir, ignore_errors=True)
+        elif os.path.exists(entry_dir):
+            os.unlink(entry_dir)
+        os.replace(tmp_dir, entry_dir)
+    except OSError:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
     """Convert `path` (a Word/RTF/PowerPoint document - see
     OfficeDocument._SOFFICE_EXTENSIONS) to a real PDF via LibreOffice's
@@ -1584,7 +1801,13 @@ class FlowingText(OfficeVariant):
         continuously-flowing document has no real page boundaries of
         its own to paginate at in the first place (see the class
         docstring), so there's nothing for the print engine to do here
-        that measuring wouldn't do more precisely."""
+        that measuring wouldn't do more precisely.
+
+        Persistent caching (see _render_result_cached()) happens one
+        level up, in OfficeDocument._render_office_pages() - wrapping
+        its *entire* pipeline (qlmanage, measuring, this) in one cache
+        check, not just this one step, so a hit skips all of it, not
+        only the final render."""
         out_pdf = os.path.join(tmpdir, f"office-capture-{self.tag}.pdf")
         if continuous:
             measure_label = f"{self.name}: measuring content height"
@@ -2812,6 +3035,16 @@ class OfficeDocument(DocumentHandler):
         document) and needs no embedded-picture workaround (see
         _rasterize_broken_img_sources()) at all.
 
+        A pure, uncached render - persistent caching (see
+        _render_result_cached()) is handled by this method's own
+        callers (_render_office_pages(), and RtfOfficeDocument.
+        build_pages()'s own direct attempt against the original .rtf),
+        each wrapping their *entire* qlmanage-preview-generation-and-
+        all pipeline in one cache check, not just this one step -
+        caching only this step would still pay for qlmanage/measuring
+        on every soffice-eligible file's cache hit, for no reason (this
+        step, when eligible, always pre-empts qlmanage entirely anyway).
+
         Returns the same ("pdf", pdf_path, npages) tuple shape
         FlowingText._build_pdf_pages() already produces, or None if
         soffice isn't installed or the conversion/page-count reading
@@ -2939,7 +3172,7 @@ class OfficeDocument(DocumentHandler):
 
     def _render_office_pages(
         self, path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None, continuous=False,
+        progress=None, continuous=False, use_cache=True,
     ):
         """Try to render `path` - any file this Mac's Quick Look
         generators can preview (Word, Excel, PowerPoint, Keynote,
@@ -2994,100 +3227,127 @@ class OfficeDocument(DocumentHandler):
 
         continuous=True (-c/--continuous) forces the single-continuous-
         page behavior even for a document that would otherwise paginate
-        confidently."""
+        confidently.
+
+        The *entire* pipeline above (soffice attempt included) is
+        wrapped in one persistent-cache check (see
+        _render_result_cached()) keyed on `path` plus render_scale/
+        continuous (see _cached_render_dir()) - a hit skips all of it,
+        qlmanage/soffice/Chrome alike, not just the final render.
+        `use_cache=False` (only passed by RtfOfficeDocument.build_pages()'s
+        own qlmanage/Chrome fallback, against a throwaway converted
+        .docx path) skips this method's own cache check entirely, since
+        that caller already wraps its whole self - including this - in
+        one cache check of its own, keyed on the original .rtf; caching
+        here too would just be an extra, never-reused entry keyed on a
+        temp path nothing will ask for again."""
         if progress is None:
             progress = _ProgressLine(enabled=False)
         name = os.path.basename(path)
-        t_start = time.monotonic()
-        try:
-            soffice_pages = self._soffice_pages_if_eligible(path, tmpdir, debug, progress, continuous)
-            if soffice_pages is not None:
-                return soffice_pages
 
-            progress.update(f"{name}: looking for a local Chrome...")
-            chrome = find_chrome()
-            if chrome is None:
-                return None
-            if debug:
-                print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
+        def render():
+            t_start = time.monotonic()
+            try:
+                soffice_pages = self._soffice_pages_if_eligible(path, tmpdir, debug, progress, continuous)
+                if soffice_pages is not None:
+                    return soffice_pages
 
-            progress.update(f"{name}: reading Quick Look preview...")
-            with _DebugTimer(debug, f"{name}: qlmanage preview"):
-                preview = self._generate_ql_preview(path, tmpdir, debug=debug)
-            if preview is None:
-                return None
-            html_path, width, height, should_not_scale, page_element_xpath = preview
-            width = width or self.OFFICE_DEFAULT_WIDTH
-            height = height or self.OFFICE_DEFAULT_HEIGHT
+                progress.update(f"{name}: looking for a local Chrome...")
+                chrome = find_chrome()
+                if chrome is None:
+                    return None
+                if debug:
+                    print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
 
-            # A short, stable-per-path tag so this file's capture/page
-            # PNGs don't collide with another file's (or its own
-            # previous ones, e.g. across a -f/--follow reload) - unlike
-            # id(path), collision odds are negligible even if a path
-            # string gets reused after being freed.
-            tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+                progress.update(f"{name}: reading Quick Look preview...")
+                with _DebugTimer(debug, f"{name}: qlmanage preview"):
+                    preview = self._generate_ql_preview(path, tmpdir, debug=debug)
+                if preview is None:
+                    return None
+                html_path, width, height, should_not_scale, page_element_xpath = preview
+                width = width or self.OFFICE_DEFAULT_WIDTH
+                height = height or self.OFFICE_DEFAULT_HEIGHT
 
-            # Pick which OfficeVariant strategy applies - see their own
-            # docstrings for what distinguishes each. should_not_scale
-            # (a plist flag) is Excel's tell and is cheap to check up
-            # front; the rest can only be told apart by actually
-            # attempting to measure the slide/page layout.
-            if should_not_scale:
-                # A spreadsheet with more than one sheet:
-                # Office.qlgenerator renders every sheet up front as its
-                # own AttachmentN.html, with Preview.html itself being
-                # just a JS tab strip that swaps an <iframe> between
-                # them - ExcelWorkbook._parse_sheet_tabs() reads that
-                # strip back out; empty for a single-sheet workbook,
-                # where Preview.html *is* the sheet.
-                variant = ExcelWorkbook(chrome, html_path, width, height, tag, name)
-            else:
-                progress.update(f"{name}: converting embedded images...")
-                on_img_progress = lambda done, total: progress.update(
-                    f"{name}: converting embedded images ({done}/{total})..."
-                )
-                with _DebugTimer(debug, f"{name}: converting embedded images"):
-                    html_path = _rasterize_broken_img_sources(html_path, tmpdir, on_progress=on_img_progress)
+                # A short, stable-per-path tag so this file's capture/page
+                # PNGs don't collide with another file's (or its own
+                # previous ones, e.g. across a -f/--follow reload) - unlike
+                # id(path), collision odds are negligible even if a path
+                # string gets reused after being freed.
+                tag = hashlib.md5(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
 
-                # Confident means the Quick Look generator itself named
-                # the page/slide element (page_element_xpath came from
-                # the plist, not guessed by _detect_fallback_page_xpath
-                # inside _measure_slide_offsets) - only then is
-                # pagination trusted; see SlideDeck's docstring for why
-                # a guessed boundary defaults to continuous instead.
-                confident = bool(page_element_xpath)
-                slide_offsets = None
-                if not continuous:
-                    # _measure_slide_offsets() still tries a
-                    # content-shape-based fallback before giving up even
-                    # when page_element_xpath is None, purely so
-                    # FlowingText's "attempt 1/2/3..." growth loop can be
-                    # skipped when it happens to work out - but a result
-                    # obtained that way isn't "confident" (see above)
-                    # and won't be used to paginate. Skipped entirely in
-                    # continuous mode - nothing needs a per-page/slide
-                    # boundary if there's only ever going to be one
-                    # "page".
-                    progress.update(f"{name}: measuring page/slide layout...")
-                    with _DebugTimer(debug, f"{name}: measure slide/page offsets"):
-                        slide_offsets = self._measure_slide_offsets(chrome, html_path, page_element_xpath, width)
-
-                if slide_offsets is not None:
-                    variant = SlideDeck(chrome, html_path, width, height, tag, name, slide_offsets, confident)
+                # Pick which OfficeVariant strategy applies - see their own
+                # docstrings for what distinguishes each. should_not_scale
+                # (a plist flag) is Excel's tell and is cheap to check up
+                # front; the rest can only be told apart by actually
+                # attempting to measure the slide/page layout.
+                if should_not_scale:
+                    # A spreadsheet with more than one sheet:
+                    # Office.qlgenerator renders every sheet up front as its
+                    # own AttachmentN.html, with Preview.html itself being
+                    # just a JS tab strip that swaps an <iframe> between
+                    # them - ExcelWorkbook._parse_sheet_tabs() reads that
+                    # strip back out; empty for a single-sheet workbook,
+                    # where Preview.html *is* the sheet.
+                    variant = ExcelWorkbook(chrome, html_path, width, height, tag, name)
                 else:
-                    variant = FlowingText(chrome, html_path, width, height, tag, name)
+                    progress.update(f"{name}: converting embedded images...")
+                    on_img_progress = lambda done, total: progress.update(
+                        f"{name}: converting embedded images ({done}/{total})..."
+                    )
+                    with _DebugTimer(debug, f"{name}: converting embedded images"):
+                        html_path = _rasterize_broken_img_sources(html_path, tmpdir, on_progress=on_img_progress)
 
-            page_paths = variant.build_pages(tmpdir, debug, render_scale, progress, continuous)
-            if page_paths is None:
-                return None
-            if debug:
-                print(
-                    f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
-                    file=sys.stderr, end="\r\n",
-                )
-            return page_paths
-        finally:
-            progress.clear()
+                    # Confident means the Quick Look generator itself named
+                    # the page/slide element (page_element_xpath came from
+                    # the plist, not guessed by _detect_fallback_page_xpath
+                    # inside _measure_slide_offsets) - only then is
+                    # pagination trusted; see SlideDeck's docstring for why
+                    # a guessed boundary defaults to continuous instead.
+                    confident = bool(page_element_xpath)
+                    slide_offsets = None
+                    if not continuous:
+                        # _measure_slide_offsets() still tries a
+                        # content-shape-based fallback before giving up even
+                        # when page_element_xpath is None, purely so
+                        # FlowingText's "attempt 1/2/3..." growth loop can be
+                        # skipped when it happens to work out - but a result
+                        # obtained that way isn't "confident" (see above)
+                        # and won't be used to paginate. Skipped entirely in
+                        # continuous mode - nothing needs a per-page/slide
+                        # boundary if there's only ever going to be one
+                        # "page".
+                        progress.update(f"{name}: measuring page/slide layout...")
+                        with _DebugTimer(debug, f"{name}: measure slide/page offsets"):
+                            slide_offsets = self._measure_slide_offsets(chrome, html_path, page_element_xpath, width)
+
+                    if slide_offsets is not None:
+                        variant = SlideDeck(chrome, html_path, width, height, tag, name, slide_offsets, confident)
+                    else:
+                        variant = FlowingText(chrome, html_path, width, height, tag, name)
+
+                page_paths = variant.build_pages(tmpdir, debug, render_scale, progress, continuous)
+                if page_paths is None:
+                    return None
+                if debug:
+                    print(
+                        f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
+                        file=sys.stderr, end="\r\n",
+                    )
+                return page_paths
+            finally:
+                progress.clear()
+
+        if not use_cache:
+            return render()
+
+        key_suffix = f":scale={render_scale}" + (":continuous" if continuous else "")
+        result, from_cache = _render_result_cached(path, render, key_suffix=key_suffix)
+        if debug and result is not None and from_cache:
+            print(
+                f"pdfless: [debug] {name}: reusing cached render, skipped qlmanage/soffice/Chrome",
+                file=sys.stderr, end="\r\n",
+            )
+        return result
 
     def ensure_pages(self, tmpdir, **kwargs):
         """Render once and reuse afterward - a no-op on every call after
@@ -3227,30 +3487,51 @@ class RtfOfficeDocument(OfficeDocument):
         self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
         progress=None, continuous=False,
     ):
+        """The whole render (soffice-against-the-original-.rtf attempt,
+        or the textutil-to-docx-then-qlmanage/Chrome fallback) is
+        wrapped in one persistent-cache check keyed on self.path (the
+        original .rtf), the same way OfficeDocument._render_office_pages()
+        wraps its own pipeline - see there. The nested
+        _render_office_pages() call below passes use_cache=False since
+        it would otherwise be keyed on docx_path, a throwaway temp file
+        different every render, making its own cache entry never worth
+        reading back."""
         if progress is None:
             progress = _ProgressLine(enabled=False)
-        # Unlike the textutil-converted-docx path below, soffice reads
-        # the original .rtf natively, so its page breaks correspond to
-        # the real document - no need to force continuous=True just to
-        # dodge untrustworthy converted-page-height metadata (see the
-        # comment below).
-        soffice_pages = self._soffice_pages_if_eligible(self.path, tmpdir, debug, progress, continuous)
-        if soffice_pages is not None:
-            return self._remember_pages(soffice_pages)
+        name = os.path.basename(self.path)
 
-        docx_path = self._rtf_to_docx(self.path, tmpdir)
-        if docx_path is None:
-            return None
-        # Always continuous, regardless of the caller's -c/--continuous
-        # setting - a converted RTF's page-height pagination (the plist
-        # Width/Height textutil's own docx conversion reports) doesn't
-        # correspond to anything in the original RTF, so it's not worth
-        # trusting as a page boundary the way a native Word document's
-        # is.
-        return self._render_and_remember(
-            docx_path, tmpdir, debug=debug, render_scale=render_scale,
-            progress=progress, continuous=True,
-        )
+        def render():
+            # Unlike the textutil-converted-docx path below, soffice reads
+            # the original .rtf natively, so its page breaks correspond to
+            # the real document - no need to force continuous=True just to
+            # dodge untrustworthy converted-page-height metadata (see the
+            # comment below).
+            soffice_pages = self._soffice_pages_if_eligible(self.path, tmpdir, debug, progress, continuous)
+            if soffice_pages is not None:
+                return soffice_pages
+
+            docx_path = self._rtf_to_docx(self.path, tmpdir)
+            if docx_path is None:
+                return None
+            # Always continuous, regardless of the caller's -c/--continuous
+            # setting - a converted RTF's page-height pagination (the plist
+            # Width/Height textutil's own docx conversion reports) doesn't
+            # correspond to anything in the original RTF, so it's not worth
+            # trusting as a page boundary the way a native Word document's
+            # is.
+            return self._render_office_pages(
+                docx_path, tmpdir, debug=debug, render_scale=render_scale,
+                progress=progress, continuous=True, use_cache=False,
+            )
+
+        key_suffix = f":scale={render_scale}" + (":continuous" if continuous else "")
+        result, from_cache = _render_result_cached(self.path, render, key_suffix=key_suffix)
+        if debug and result is not None and from_cache:
+            print(
+                f"pdfless: [debug] {name}: reusing cached render, skipped qlmanage/soffice/Chrome",
+                file=sys.stderr, end="\r\n",
+            )
+        return self._remember_pages(result)
 
     def extract_text(self, page):
         if self._pdf_delegate is not None:
@@ -3315,10 +3596,20 @@ class SofficeOnlyDocument(OfficeDocument):
     ):
         if progress is None:
             progress = _ProgressLine(enabled=False)
-        soffice_pages = self._try_soffice_pages(self.path, tmpdir, debug, progress)
-        if soffice_pages is None:
+        name = os.path.basename(self.path)
+
+        def render():
+            return self._try_soffice_pages(self.path, tmpdir, debug, progress)
+
+        result, from_cache = _render_result_cached(self.path, render)
+        if debug and result is not None and from_cache:
+            print(
+                f"pdfless: [debug] {name}: reusing cached PDF, skipped LibreOffice",
+                file=sys.stderr, end="\r\n",
+            )
+        if result is None:
             return None
-        return self._remember_pages(soffice_pages)
+        return self._remember_pages(result)
 
 
 class SvgDocument(OfficeDocument):
@@ -3368,28 +3659,44 @@ class SvgDocument(OfficeDocument):
         tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
         wrapper_path = os.path.join(tmpdir, f"svg-wrap-{tag}.html")
 
-        # There's no plist (unlike a Quick Look preview) to read a
-        # width from up front, and an SVG's own intrinsic size varies
-        # in both dimensions - so the natural size has to be measured
-        # first, the same "auto" page sizing isn't supported reasoning
-        # as _measure_content_height() (see _measure_svg_natural_size()).
-        progress.update(f"{name}: measuring size...")
-        self._write_svg_wrapper(wrapper_path, self.path, None, None)
-        with _DebugTimer(debug, f"{name}: measure SVG size"):
-            size = _measure_svg_natural_size(chrome, wrapper_path)
-        width, height = size if size else (self.OFFICE_DEFAULT_WIDTH, self.OFFICE_DEFAULT_HEIGHT)
-        self._write_svg_wrapper(wrapper_path, self.path, width, height)
+        # continuous has no effect here (a single SVG is always one
+        # page either way), so - unlike FlowingText._build_pdf_pages() -
+        # this needs no key_suffix to keep the two apart in the cache.
+        def render():
+            # There's no plist (unlike a Quick Look preview) to read a
+            # width from up front, and an SVG's own intrinsic size varies
+            # in both dimensions - so the natural size has to be measured
+            # first, the same "auto" page sizing isn't supported reasoning
+            # as _measure_content_height() (see _measure_svg_natural_size()).
+            progress.update(f"{name}: measuring size...")
+            self._write_svg_wrapper(wrapper_path, self.path, None, None)
+            with _DebugTimer(debug, f"{name}: measure SVG size"):
+                size = _measure_svg_natural_size(chrome, wrapper_path)
+            width, height = size if size else (self.OFFICE_DEFAULT_WIDTH, self.OFFICE_DEFAULT_HEIGHT)
+            self._write_svg_wrapper(wrapper_path, self.path, width, height)
 
-        out_pdf = os.path.join(tmpdir, f"svg-capture-{tag}.pdf")
-        label = f"{name}: rendering to PDF"
-        with _DebugTimer(debug, label), progress.spin(label + "..."):
-            ok = _capture_html_pdf(chrome, wrapper_path, width, height, out_pdf)
-        npages = _pdf_page_count_safe(out_pdf) if ok else None
-        if not npages:
-            if os.path.exists(out_pdf):
+            out_pdf = os.path.join(tmpdir, f"svg-capture-{tag}.pdf")
+            label = f"{name}: rendering to PDF"
+            with _DebugTimer(debug, label), progress.spin(label + "..."):
+                ok = _capture_html_pdf(chrome, wrapper_path, width, height, out_pdf)
+            if not ok:
+                return None
+            npages = _pdf_page_count_safe(out_pdf)
+            if not npages:
                 os.unlink(out_pdf)
+                return None
+            return ("pdf", out_pdf, npages)
+
+        result, from_cache = _render_result_cached(self.path, render)
+        if debug and result is not None:
+            print(
+                f"pdfless: [debug] {name}: "
+                + ("reusing cached PDF, skipped rendering" if from_cache else "cached the converted PDF"),
+                file=sys.stderr, end="\r\n",
+            )
+        if result is None:
             return None
-        return self._remember_pages(("pdf", out_pdf, npages))
+        return self._remember_pages(result)
 
     @staticmethod
     def _write_svg_wrapper(wrapper_path, svg_path, width, height):
@@ -7089,7 +7396,7 @@ def main():
             "Chrome) Quick-Look-previewable file (Word, Excel, "
             "PowerPoint, ...) in iTerm2 or WezTerm, less(1)-style."
         ),
-        epilog=KEY_TABLE,
+        epilog=f"Cache directory (--no-cache/--clear-cache): {_office_cache_root()}\n\n{KEY_TABLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
     )
@@ -7219,7 +7526,26 @@ def main():
         help="scroll N lines per mouse wheel step, in the page image "
              "(default: %(default)s)",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="render afresh without reading or writing the persistent cache",
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="delete the persistent cache and exit without opening any files",
+    )
     args = parser.parse_args()
+
+    if args.clear_cache:
+        shutil.rmtree(_office_cache_root(), ignore_errors=True)
+        print("pdfless: cleared the persistent rendered-pages cache")
+        return
+
+    if args.no_cache:
+        global _OFFICE_CACHE_ENABLED
+        _OFFICE_CACHE_ENABLED = False
 
     # Reading from stdin - no file given at all, or "-" given in its
     # place - lets pdfless work as $PAGER: git/man/etc. invoke $PAGER
