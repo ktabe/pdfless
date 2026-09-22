@@ -93,7 +93,7 @@ Pages fit the terminal width by default. Use `j` / `k` to scroll,
 Press `+` / `-` to zoom, `/` to search, `t` to switch to text mode,
 and `q` to quit. `F1` or `:h` opens the keyboard help.
 
-With multiple files open, use `:n` / `:p` to switch files.
+With multiple files open, use `:n` / `:p` (or `}` / `{`) to switch files.
 With no filename, or with `-` as the filename, `pdfless` reads standard input.
 
 ### Search and text selection
@@ -157,7 +157,7 @@ The status line shows `follow` while the mode is active.
 | `g` / `G` | Go to the top / bottom of the current page. In text mode, prefix with a number to go to that line, e.g. `10g`. |
 | `<`, `Home` / `>`, `End` | Go to the first / last page. Prefix with a number to go to that page, e.g. `10<`. |
 | `n` / `p` | Next / previous page, or next / previous match while a search is active. |
-| `:n` / `:p` | Next / previous file. |
+| `:n` / `:p`, `}` / `{` | Next / previous file. |
 | `x` / `X` | First / last file. Prefix `x` with a number to select that file. |
 
 ### Zoom and pan
