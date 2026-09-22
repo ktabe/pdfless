@@ -233,11 +233,12 @@ def test_quit_if_one_screen_shows_progress_then_a_clean_dump(pty_session, sample
     assert b"\x1b[?1049h" not in out
     assert b"converting via LibreOffice" in out  # progress is now visible...
     assert b"\x1b[40;1H" not in out  # ...but never via an absolute cursor jump
-    # ...and is fully gone (overwritten with spaces, then a bare \r)
-    # immediately before the dump - see _ProgressLine.clear().
+    # ...and is fully gone (a bare \r, then EL/\x1b[2K to erase the whole
+    # row - not just len()-based spaces, which would miss a row the
+    # filename or spinner had wrapped) immediately before the dump - see
+    # _ProgressLine.clear().
     osc_idx = out.index(b"\x1b]1337;File=inline=1")
-    assert out[:osc_idx].endswith(b"\r")
-    assert not out[:osc_idx].rstrip(b"\r").endswith(b"LibreOffice...")
+    assert out[:osc_idx].endswith(b"\r\x1b[2K")
 
 
 def test_quit_if_one_screen_does_not_exit_for_a_multipage_pdf(pty_session, sample_pdf):
@@ -323,7 +324,8 @@ def test_question_mark_opens_a_backward_search_prompt(pty_session, sample_text):
     session.send(b"?")
     out = session.read_all(0.5).decode(errors="replace")
     assert "q to close help" not in out  # no longer the help key
-    assert out.rstrip().endswith("?")  # the prompt, echoed with its own "?"
+    assert "\x1b[2K?" in out  # the prompt, echoed with its own "?" right after clearing the line
+    assert out.rstrip().endswith("\x1b[?25h")  # then the real cursor is shown at the prompt
 
     session.send(b"line\r")
     assert_no_crash(session, [b"q"], initial_wait=0)
