@@ -75,7 +75,7 @@ def test_rtf_office_text_mode_toggle(pty_session, sample_rtf):
 
 
 def test_f_key_toggles_follow_mode_and_its_status_indicator(pty_session, sample_pdf):
-    """F is a runtime toggle for the same follow behavior -F/--follow
+    """F is a runtime toggle for the same follow behavior -f/--follow
     turns on at startup (see run_viewer()'s "F" handling) - and the
     status line shows a " follow " segment (status_segments()) only
     while it's active, regardless of how it got turned on."""
@@ -88,6 +88,182 @@ def test_f_key_toggles_follow_mode_and_its_status_indicator(pty_session, sample_
 
     session.send(b"F")
     assert b" follow " not in session.read_all(0.5)
+    session.send(b"q")
+
+
+def test_lowercase_f_flag_still_enables_follow_at_startup(pty_session, sample_pdf):
+    """-F was renamed to -f (see the new -F/--quit-if-one-screen, real
+    less(1)'s own flag) - -f must still turn follow on at startup."""
+    session = pty_session(["-f", sample_pdf])
+    time.sleep(3)
+    assert b" follow " in session.read_all(0.5)
+    session.send(b"q")
+
+
+def _drain_until_exit(session, deadline_seconds=5):
+    """Poll os.waitpid(WNOHANG) while draining the pty, same as
+    test_colon_q_quits() - draining is required even when not asserting
+    on the output, since a big enough write (e.g. an inline image) can
+    fill the pty buffer and block the child in write(), which would
+    otherwise wedge it before it ever reaches exit(). Returns (exited,
+    captured_bytes)."""
+    deadline = time.monotonic() + deadline_seconds
+    captured = b""
+    exited = False
+    while time.monotonic() < deadline:
+        captured += session.read_all(0.2)
+        pid, _status = os.waitpid(session.pid, os.WNOHANG)
+        if pid != 0:
+            exited = True
+            break
+    return exited, captured
+
+
+def test_quit_if_one_screen_dumps_a_single_page_image_and_exits(pty_session, sample_image):
+    """-F/--quit-if-one-screen on a single-page (here: a plain image,
+    always npages==1) document: no keypress needed, and - unlike a
+    normal quit - it must never have entered the alternate screen at
+    all (no \\x1b[?1049h), so the dump lands in real scrollback like
+    less(1)'s own -F, not vanish with the rest of that buffer."""
+    session = pty_session(["-F", sample_image])
+    exited, out = _drain_until_exit(session)
+    assert exited, "pdfless did not exit on its own under -F for a single-page file"
+    assert b"\x1b[?1049h" not in out
+    assert b"\x1b]1337;File=inline=1" in out  # the dumped page image itself
+    # Must end \r\n, not just \n: the terminal is still in raw mode (see
+    # RawTerminal) when this is written, so a bare \n leaves the cursor
+    # one column short of 1 - visible as zsh's own "%" no-trailing-
+    # newline marker appearing after the image.
+    assert out.endswith(b"\r\n")
+
+
+def test_quit_if_one_screen_dumps_a_short_text_file_and_exits(pty_session, sample_text):
+    """Same as above, but for a text-mode-starting document (a plain
+    text file) - "fits in one screen" there means the actual line count
+    needs no scrolling, not "1 page" (every plain text file reports
+    npages==1 regardless of length - see run_viewer())."""
+    session = pty_session(["-F", sample_text])
+    exited, out = _drain_until_exit(session)
+    assert exited, "pdfless did not exit on its own under -F for a short text file"
+    assert b"\x1b[?1049h" not in out
+    assert b"line one" in out
+    assert b"line three" in out
+    # Confirms the raw-terminal-mode CR fix: without it, bare \n moves
+    # down a row without returning to column 1 (tty.setraw() disables
+    # the usual \n -> \r\n translation - see RawTerminal), so each
+    # successive line lands one column further right instead of at the
+    # start of the next line. (eol_mark's marker is on by default -
+    # between "line one" and the \r\n - see the dedicated test below.)
+    assert b"\r\nline two\x1b[34m" in out
+    assert out.rstrip(b"\r\n").endswith(b"line three\x1b[34m\xe2\x86\xb5\x1b[0m")
+
+
+def test_quit_if_one_screen_dump_respects_line_numbers_and_eol_mark(pty_session, sample_text):
+    """-N/line numbers and the eol_mark (↵) marker are real content-
+    display options the user asked for on the command line - not pager-
+    only interactive chrome like the status line/border/scrollbar - so
+    dump_and_quit() must still apply them, the same as interactive text
+    mode does (see _draw_text_wrapped()'s own gutter_width/eol_mark
+    handling, which dump_and_quit() mirrors for the one-shot dump)."""
+    session = pty_session(["-F", "-N", sample_text])
+    exited, out = _drain_until_exit(session)
+    assert exited
+    assert b"\x1b[?1049h" not in out
+    # LINE_NUMBER_COLOR "1 " LINE_NUMBER_RESET "line one" - gutter and
+    # content are separated by ANSI codes, not adjacent plain text.
+    assert "\x1b[90m1 \x1b[0mline one".encode() in out
+    assert "\x1b[90m3 \x1b[0mline three".encode() in out
+    assert "↵".encode() in out  # NEWLINE_MARKER, on by default (eol_mark)
+
+
+def test_quit_if_one_screen_leaves_a_margin_row_for_its_own_trailing_newline(
+    pty_session, tmp_path,
+):
+    """Regression test: dump_and_quit() writes one trailing \\r\\n after
+    its content (see the CR fix above), and _dump_margin_rows (Viewer.
+    __init__) reserves a row for exactly that - without it, content
+    sized to fill the terminal's usable rows (rows - 1, the same bound
+    _text_avail_rows() normally uses) would make that \\r\\n force a
+    one-line scroll the instant it's written, pushing the dump's own
+    top line out of view right as the shell prompt appears. A file with
+    that many lines must fall through to interactive mode instead of
+    being dumped somewhere it would immediately scroll itself out of;
+    one line shorter must still dump normally."""
+    def make(nlines):
+        p = tmp_path / f"{nlines}.txt"
+        p.write_text("\n".join(f"line {i}" for i in range(nlines)) + "\n")
+        return str(p)
+
+    # rows=40 in pty_session's own default - _text_avail_rows() without
+    # the extra margin is rows - 1 = 39; with it (this path's own -1),
+    # 38 is the largest line count that still fits.
+    session = pty_session(["-F", make(38)])
+    exited, out = _drain_until_exit(session)
+    assert exited, "38 lines should still fit and dump-and-quit"
+    assert b"\x1b[?1049h" not in out
+
+    session = pty_session(["-F", make(39)])
+    time.sleep(3)
+    assert os.waitpid(session.pid, os.WNOHANG) == (0, 0), (
+        "39 lines should no longer auto-dump - it would scroll its own "
+        "first line out of view the instant the trailing \\r\\n is written"
+    )
+    out = session.read_all(0.5)
+    assert b"\x1b[?1049h" in out  # started up interactively instead
+    session.send(b"q")
+
+
+@requires_office_support
+def test_quit_if_one_screen_shows_progress_then_a_clean_dump(pty_session, sample_docx):
+    """A single-page Office document (Word here) still needs its usual
+    Quick-Look/LibreOffice render, which can take a while - under -F it
+    still shows progress (via _ensure_office_pages()'s own stderr
+    _ProgressLine, not the interactive-only _ViewerProgress status
+    line - the render's outcome, dump-and-quit or interactive, isn't
+    known yet at this point), but must leave no trace behind once done:
+    _ProgressLine self-overwrites with \\r rather than jumping to an
+    absolute row (unlike _ViewerProgress, which - before this test's
+    own fix - left the cursor on the bottom row right before the dump,
+    scrolling its own top row out of view the moment more content
+    followed it - see Viewer._dump_margin_rows for that separate,
+    already-fixed bug)."""
+    session = pty_session(["-F", sample_docx])
+    exited, out = _drain_until_exit(session, deadline_seconds=10)
+    assert exited, "pdfless did not exit on its own under -F for a single-page docx"
+    assert b"\x1b[?1049h" not in out
+    assert b"converting via LibreOffice" in out  # progress is now visible...
+    assert b"\x1b[40;1H" not in out  # ...but never via an absolute cursor jump
+    # ...and is fully gone (overwritten with spaces, then a bare \r)
+    # immediately before the dump - see _ProgressLine.clear().
+    osc_idx = out.index(b"\x1b]1337;File=inline=1")
+    assert out[:osc_idx].endswith(b"\r")
+    assert not out[:osc_idx].rstrip(b"\r").endswith(b"LibreOffice...")
+
+
+def test_quit_if_one_screen_does_not_exit_for_a_multipage_pdf(pty_session, sample_pdf):
+    """-F must not affect a document that doesn't fit in one screen at
+    all - lorem_ipsum.pdf is 7 pages, so this should start up exactly
+    like a normal interactive session (no -F), needing an explicit quit."""
+    session = pty_session(["-F", sample_pdf])
+    time.sleep(3)
+    assert os.waitpid(session.pid, os.WNOHANG) == (0, 0)
+    out = session.read_all(0.5)
+    assert b"\x1b[?1049h" in out  # did enter the alternate screen normally
+    session.send(b"q")
+
+
+def test_quit_if_one_screen_does_not_exit_for_a_long_text_file(pty_session, tmp_path):
+    """Same as the multi-page PDF case, but exercises the text-mode
+    (line-count-based) side of the "fits" check specifically, not the
+    page-count one - a long file piped via $PAGER (e.g. `git log |
+    pdfless -F`) must still page normally, not dump everything at once."""
+    long_text = tmp_path / "long.txt"
+    long_text.write_text("\n".join(f"line {i}" for i in range(500)) + "\n")
+    session = pty_session(["-F", str(long_text)])
+    time.sleep(3)
+    assert os.waitpid(session.pid, os.WNOHANG) == (0, 0)
+    out = session.read_all(0.5)
+    assert b"\x1b[?1049h" in out
     session.send(b"q")
 
 

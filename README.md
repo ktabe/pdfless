@@ -83,7 +83,8 @@ pdfless notes.txt              # Open a text file
 pdfless report.pdf chart.png   # Open multiple files
 pdfless -p 10 document.pdf     # Start on page 10
 pdfless -h slides.pdf          # Fit each page to the terminal height
-pdfless -F document.pdf        # Reload when the file changes
+pdfless -f document.pdf        # Reload when the file changes
+pdfless -F document.pdf        # Quit if the document fits on one screen
 cat document.pdf | pdfless     # Read from standard input
 ```
 
@@ -122,7 +123,8 @@ press `C` again to restore the previous display settings.
 | `-p`, `--page PAGE` | Start on the given page in the first file (default: 1). |
 | `-h`, `--fit-height` | Fit pages to the terminal height instead of its width. |
 | `-k`, `--keep` | Leave the last page on screen when quitting. |
-| `-F`, `--follow` | Start in follow mode: check the current file for changes every 3 seconds and reload it, preserving the page and display mode. |
+| `-f`, `--follow` | Start in follow mode: check the current file for changes every 3 seconds and reload it, preserving the page and display mode. |
+| `-F`, `--quit-if-one-screen` | Print a single-page document fit to height and quit immediately; in text mode, quit if no scrolling is needed. Otherwise start normally. |
 | `-N`, `--line-numbers` | Show line numbers in text mode. |
 | `-S`, `--chop-long-lines` | Pan across long lines instead of wrapping them in text mode. |
 | `-B`, `--no-border` | Hide page borders in text mode. |
@@ -136,7 +138,7 @@ press `C` again to restore the previous display settings.
 
 Note that `-h` means **fit to height**; use `--help` for command-line help.
 Follow mode watches only the currently displayed file. Press `F` to toggle
-it on or off at any time, or use `-F`/`--follow` to enable it at startup.
+it on or off at any time, or use `-f`/`--follow` to enable it at startup.
 The status line shows `follow` while the mode is active.
 
 ## Keyboard and mouse controls
@@ -190,7 +192,7 @@ The status line shows `follow` while the mode is active.
 | `#`, `-N` | Toggle line numbers in text mode (hidden by default). |
 | `C` | Toggle a clean text display for copying, restoring previous settings on the second press. |
 | `r` | Toggle the scrollbar (shown by default). |
-| `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-F`/`--follow` is specified. |
+| `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-f`/`--follow` is specified. |
 | Click a PDF link | Open a URL in the system browser or follow an internal link. |
 | `[` / `]` | Go back / forward through internal-link navigation history. |
 | Click or drag the scrollbar | Jump to a document position in image mode. In text mode, the scrollbar is display-only. |
