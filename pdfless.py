@@ -262,7 +262,7 @@ Keys:
   / ENTER  ? ENTER        repeat the last search pattern, forward / back
   N P                     jump to next / previous search match
                             <CHANGING FILES>
-  :n :p                   next / previous file, when more than one was
+  :n :p  { }              next / previous file, when more than one was
                           given on the command line
   x X                     jump to the first / last file in the list
   <N> x                   jump straight to file N
@@ -3638,6 +3638,25 @@ HANDLER_CLASSES = [
 ]
 
 
+def _sniff_file(path, tmpdir, debug=False):
+    """The DocumentHandler for `path` - the first one (in HANDLER_CLASSES
+    order) whose sniff() claims it - or None if none do. Raises
+    UnusableFile if one positively identified the format but couldn't
+    actually use it (e.g. a corrupt PDF).
+
+    Shared by main()'s own upfront search for the first file it can
+    actually display, and Viewer._classify()'s later, lazy sniff of
+    every other file (only attempted the moment you actually navigate to
+    it - see there) - callers differ in how they report a failure (a
+    detailed reason to stderr up front vs. a short status-line message
+    once already interactive), not in how the sniffing itself works."""
+    for handler_cls in HANDLER_CLASSES:
+        handler = handler_cls.sniff(path, tmpdir, debug=debug)
+        if handler is not None:
+            return handler
+    return None
+
+
 _CTRL_C_FD = None  # the interactive session's tty fd while RawTerminal is
 # active, otherwise None - see run_subprocess(), which uses this to
 # temporarily restore ISIG (which raw mode turns off - it would
@@ -4061,8 +4080,20 @@ class Viewer:
         debug=False, office_render_scale=OFFICE_RENDER_SCALE,
         office_continuous=False, follow=False, quit_if_one_screen=False,
     ):
-        self.files = files  # [DocumentHandler, ...] - one per CLI argument
+        self.files = files  # [DocumentHandler | path str, ...] - one per
+        # CLI argument. main() only actually sniffs the one file it's
+        # about to display first (a DocumentHandler there already,
+        # including in every test that constructs a Viewer directly);
+        # every other entry is still a bare path string, sniffed lazily
+        # by _classify() the moment a later go_to_file()/next_file()/
+        # previous_file() actually navigates to it - see there. This is
+        # what keeps startup with a large batch of files from decoding
+        # every single one of them just to show the first.
         self.file_index = file_index
+        self._handler_cache = {}  # file_index -> DocumentHandler | None,
+        # populated by _classify() the first time each lazy (path-string)
+        # entry above is actually visited - None means that one turned
+        # out not to be a usable file at all.
         self.tmpdir = tmpdir
         self.follow = follow  # -f/--follow, or toggled at runtime with F -
         # purely a display flag for status_segments(); the actual mtime-
@@ -4205,12 +4236,33 @@ class Viewer:
         # normal view, which always does a full redraw at the new size.
         self.help_active = False
 
+    def _classify(self, index):
+        """files[index]'s DocumentHandler - already one (the file about
+        to be shown first, or a test harness's direct handler) is
+        returned as-is; a bare path string (every other file - see
+        __init__) is sniffed once, via _sniff_file(), and the result
+        cached, so a later revisit to the same file doesn't repeat the
+        work. None means that file turned out not to be usable at all -
+        go_to_file() treats it the same as an out-of-range index."""
+        entry = self.files[index]
+        if isinstance(entry, DocumentHandler):
+            return entry
+        if index not in self._handler_cache:
+            try:
+                self._handler_cache[index] = _sniff_file(entry, self.tmpdir, debug=self.debug)
+            except UnusableFile:
+                self._handler_cache[index] = None
+        return self._handler_cache[index]
+
     def _set_current_file(self):
         """Point path/name/kind/npages/doc_handler/cache at
         self.files[self.file_index] - just the file's identity, not the
         page/zoom/search/etc. state, which __init__ sets up once and
-        go_to_file() resets explicitly on every later switch."""
-        handler = self.files[self.file_index]
+        go_to_file() resets explicitly on every later switch. Assumes
+        self.file_index already names a usable file - go_to_file() (and
+        __init__, for the first one) only ever lands here once
+        _classify() has confirmed that."""
+        handler = self._classify(self.file_index)
         self.path = handler.path
         self.name = os.path.basename(handler.path)
         self.doc_handler = handler
@@ -4267,19 +4319,35 @@ class Viewer:
         return isinstance(self.doc_handler, PdfDocument)
 
     def next_file(self):
-        self.go_to_file(self.file_index + 1, "no next file")
+        self.go_to_file(self.file_index + 1, "no next file", step=1)
 
     def previous_file(self):
-        self.go_to_file(self.file_index - 1, "no previous file")
+        self.go_to_file(self.file_index - 1, "no previous file", step=-1)
 
-    def go_to_file(self, index, boundary_message="no such file"):
+    def go_to_file(self, index, boundary_message="no such file", step=0):
         """Switch to files[index], starting fresh at its first page -
         zoom, search, link history, and text mode all reset, the same
         as if pdfless had been started fresh on that file. A no-op
-        (with a status message) if index is out of range."""
-        if index < 0 or index >= len(self.files):
-            self.draw_status(boundary_message)
-            return
+        (with a status message) if index is out of range.
+
+        `step` (+-1 from next_file()/previous_file(), 0 from a direct
+        jump like x/X) says what to do if files[index] turns out not to
+        be a usable file at all (_classify() returns None - a lazily-
+        sniffed file, not yet known either way): 0 just reports
+        boundary_message right there, the same as an out-of-range index;
+        +-1 instead keeps stepping in that direction looking for the
+        next usable one, only giving up once the index itself runs out
+        of range."""
+        while True:
+            if index < 0 or index >= len(self.files):
+                self.draw_status(boundary_message)
+                return
+            if self._classify(index) is not None:
+                break
+            if step == 0:
+                self.draw_status(boundary_message)
+                return
+            index += step
         self.file_index = index
         self._set_current_file()
         self.encode_cache.clear()
@@ -6701,8 +6769,10 @@ def run_viewer(
             # ":" was just pressed - less(1)'s :n/:p, next/previous file
             # (only meaningful with more than one file on the command
             # line; harmless otherwise, since go_to_file() just reports
-            # there's nowhere to go), :q to quit, plus pdfless's own ":h"
-            # for the help screen. Any other key cancels quietly.
+            # there's nowhere to go - also bound to "{"/"}", a one-
+            # keystroke equivalent, see below), :q to quit, plus
+            # pdfless's own ":h" for the help screen. Any other key
+            # cancels quietly.
             colon_pending = False
             if key == "n":
                 viewer.next_file()
@@ -6954,6 +7024,16 @@ def run_viewer(
             viewer.refresh()
             continue
 
+        if key in ("{", "}"):
+            # One-keystroke equivalents of ":p"/":n" - mirroring "["/"]"
+            # (PDF link-history back/forward), the shifted key just above
+            # each on a US keyboard.
+            if key == "{":
+                viewer.previous_file()
+            else:
+                viewer.next_file()
+            continue
+
         if key == "x":
             # "x" jumps to the first file in the list; "<number>x" jumps
             # straight to that file (1-based, matching "<number><"'s
@@ -7164,11 +7244,13 @@ def main():
             # `pdfless.py` with no file arguments at all means just it.
             args.files = [stdin_path if a == "-" else a for a in args.files] or [stdin_path]
 
-        # Validate every file up front - each one is checked (existence,
-        # type, and that it actually decodes) before the terminal ever goes
-        # into raw/alternate-screen mode. An invalid file is skipped (with a
-        # warning) rather than aborting the whole thing, so one bad path in
-        # a big batch doesn't stop you from seeing the rest.
+        # Only checked for existence up front, not sniffed - an
+        # expensive check for some kinds (ImageDocument.sniff() actually
+        # decodes the whole image, to catch a format that passes a
+        # lighter check but still fails to load) that would otherwise
+        # run on every file given, before the very first page ever
+        # appears, even for a large batch that's never actually paged
+        # through to the end.
         candidates = []  # [abs_path, ...] - files that at least exist
         for arg in args.files:
             if not os.path.isfile(arg):
@@ -7178,25 +7260,24 @@ def main():
         if any(PdfDocument.is_pdf_file(path) for path in candidates):
             check_deps()
 
-        files = []  # [DocumentHandler, ...], in the given order (each knows its own .path)
-        for path in candidates:
-            # Try each DocumentHandler subclass, in priority order, for
-            # the first one whose sniff() claims this file - see
-            # HANDLER_CLASSES. A raised UnusableFile means one of them
-            # positively identified the format but couldn't actually use
-            # it (e.g. corrupt PDF) - that's specific enough to report
-            # and skip outright, rather than falling through to try
-            # treating it as some other kind.
-            handler = None
+        # Sniff candidates in order, stopping at the first one pdfless can
+        # actually display - that's the only one that has to be known
+        # before the viewer can even start. Every other candidate is left
+        # as a bare path in `files` below, sniffed lazily by
+        # Viewer._classify() the moment (if ever) you actually navigate to
+        # it via next_file()/previous_file()/go_to_file(). A raised
+        # UnusableFile means some handler positively identified a leading
+        # candidate's format but couldn't actually use it (e.g. a corrupt
+        # PDF) - specific enough to report and skip, rather than falling
+        # through to try treating it as some other kind.
+        start_file_index = None
+        first_handler = None
+        for i, path in enumerate(candidates):
             try:
-                for handler_cls in HANDLER_CLASSES:
-                    handler = handler_cls.sniff(path, tmpdir, debug=args.debug)
-                    if handler is not None:
-                        break
+                handler = _sniff_file(path, tmpdir, debug=args.debug)
             except UnusableFile as e:
                 print(f"pdfless: {e}, skipping: {path}", file=sys.stderr)
                 continue
-
             if handler is None:
                 print(
                     f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
@@ -7204,18 +7285,24 @@ def main():
                     file=sys.stderr,
                 )
                 continue
+            start_file_index, first_handler = i, handler
+            break
 
-            files.append(handler)
-
-        if not files:
+        if start_file_index is None:
             die("no valid PDF, image, text, or Quick-Look-previewable files given")
         # A None page_count() (an office-kind first file) means its real
         # page count isn't known until Viewer.__init__ actually renders
         # it, which also clamps self.page against it then; here just
         # keep whatever page number was asked for (>= 1).
-        first_npages = files[0].page_count()
+        first_npages = first_handler.page_count()
         start_page = args.page if first_npages is None else min(first_npages, args.page)
         start_page = max(1, start_page)
+
+        # [DocumentHandler | path str, ...], in the given order - only
+        # start_file_index is an actual handler at this point; see
+        # Viewer.files.
+        files = list(candidates)
+        files[start_file_index] = first_handler
 
         if not sys.stdout.isatty():
             die("stdout must be a terminal")
@@ -7247,7 +7334,7 @@ def main():
             try:
                 fit = "height" if args.fit_height else "width"
                 viewer = run_viewer(
-                    files, 0, start_page, tmpdir, fd, rt.old,
+                    files, start_file_index, start_page, tmpdir, fd, rt.old,
                     fit=fit, border=args.border, wrap=not args.chop_long_lines,
                     eol_mark=args.eol_mark, line_numbers=args.line_numbers,
                     scrollbar=args.scrollbar, follow=args.follow,
