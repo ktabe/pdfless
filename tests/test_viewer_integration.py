@@ -371,3 +371,80 @@ def test_empty_search_pattern_repeats_the_last_one(pty_session, sample_text):
     assert "Traceback" not in out
 
     assert_no_crash(session, [b"q"], initial_wait=0)
+
+
+def test_encrypted_pdf_as_first_file_prompts_and_unlocks(pty_session, sample_encrypted_pdf):
+    """The very first file given is classified/opened before the
+    interactive viewer's raw terminal mode is ever entered (see
+    main()), so a password-protected one prompts via a plain
+    getpass()-style prompt over the real tty, not the status-line one -
+    see test_navigating_to_encrypted_pdf_prompts_on_status_line below
+    for that side."""
+    session = pty_session([sample_encrypted_pdf])
+    time.sleep(2)
+    out = session.read_all(1).decode(errors="replace")
+    assert "Password" in out
+    session.send(b"secret123\r", wait=1.5)
+    out = session.read_all(1).decode(errors="replace")
+    assert "Traceback" not in out
+    assert "\x1b[?1049h" in out  # entered the alternate screen - unlocked and showing normally
+    assert_no_crash(session, [b"q"], initial_wait=0)
+
+
+def test_encrypted_pdf_wrong_password_then_retry_succeeds(pty_session, sample_encrypted_pdf):
+    session = pty_session([sample_encrypted_pdf])
+    time.sleep(2)
+    session.read_all(1)
+    session.send(b"nope\r", wait=1)
+    out = session.read_all(1).decode(errors="replace")
+    assert "incorrect password" in out.lower()
+    session.send(b"secret123\r", wait=1.5)
+    out = session.read_all(1).decode(errors="replace")
+    assert "Traceback" not in out
+    assert "\x1b[?1049h" in out
+    assert_no_crash(session, [b"q"], initial_wait=0)
+
+
+def test_navigating_to_encrypted_pdf_prompts_on_status_line_and_unlocks(
+    pty_session, sample_pdf, sample_encrypted_pdf,
+):
+    """Once the viewer's raw terminal mode is already active, an
+    encrypted PDF reached via :n prompts on the status line instead
+    (see PdfDocument._ensure_unlocked()/_prompt_pdf_password_raw)."""
+    session = pty_session([sample_pdf, sample_encrypted_pdf])
+    time.sleep(3)
+    session.read_all(0.5)
+
+    session.send(b":n", wait=1)
+    out = session.read_all(1).decode(errors="replace")
+    assert "Password" in out
+
+    session.send(b"secret123\r", wait=1.5)
+    out = session.read_all(1).decode(errors="replace")
+    assert "Traceback" not in out
+    assert os.path.basename(sample_encrypted_pdf) in out
+
+    assert_no_crash(session, [b"q"], initial_wait=0)
+
+
+def test_navigating_to_encrypted_pdf_cancel_is_skipped_by_next_file(
+    pty_session, sample_pdf, sample_encrypted_pdf, sample_image,
+):
+    """Cancelling (Esc) the status-line password prompt is treated
+    exactly like any other unusable file - :n's auto-skip keeps
+    stepping past it to the next file in the list, rather than
+    getting stuck or crashing."""
+    session = pty_session([sample_pdf, sample_encrypted_pdf, sample_image])
+    time.sleep(3)
+    session.read_all(0.5)
+
+    session.send(b":n", wait=1)
+    out = session.read_all(1).decode(errors="replace")
+    assert "Password" in out
+
+    session.send(b"\x1b", wait=1.5)  # Esc cancels
+    out = session.read_all(1).decode(errors="replace")
+    assert "Traceback" not in out
+    assert os.path.basename(sample_image) in out
+
+    assert_no_crash(session, [b"q"], initial_wait=0)

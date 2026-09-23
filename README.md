@@ -11,6 +11,7 @@ It has been tested with [iTerm2](https://iterm2.com) and
 
 - Scroll, zoom, and pan with the keyboard or mouse.
 - Search PDF text and follow external and internal PDF links.
+- Support password-protected PDFs.
 - Switch to text mode to read or copy extracted text.
 - Open multiple files and switch between them.
 - Reload the current file automatically when it changes (in follow mode).

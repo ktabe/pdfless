@@ -28,6 +28,7 @@ import base64
 import concurrent.futures
 import contextlib
 import fcntl
+import getpass
 import hashlib
 import html
 import io
@@ -2143,6 +2144,18 @@ class PdfDocument(DocumentHandler):
         r'<word xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" yMax="([\d.]+)">(.*?)</word>'
     )
 
+    def __init__(self, path, encrypted=False):
+        super().__init__(path)
+        self.encrypted = encrypted  # sniff() found this PDF needs a
+        # password - still True until _ensure_unlocked() is given a
+        # correct one (see there); an ordinary, never-encrypted PDF is
+        # simply never True in the first place.
+        self.password = None  # the password that actually unlocked it,
+        # once _ensure_unlocked() succeeds - passed to every later
+        # pdfinfo/pdftoppm/pdftotext call against self.path (harmless,
+        # as an extra -upw, even for a PDF that was never encrypted at
+        # all, since it's None then and _password_args() omits it)
+
     @staticmethod
     def is_pdf_file(path):
         """Sniff the file's own content rather than trusting its
@@ -2158,9 +2171,18 @@ class PdfDocument(DocumentHandler):
             return False
 
     @staticmethod
-    def _pdf_page_count(path):
+    def _password_args(password):
+        """The "-upw <password>" poppler CLI tools (pdfinfo/pdftoppm/
+        pdftotext/...) all share, needed on every call against an
+        encrypted PDF once _ensure_unlocked() has one - [] (no-op) for
+        an unencrypted PDF, where `password` is always None."""
+        return ["-upw", password] if password else []
+
+    @staticmethod
+    def _pdf_page_count(path, password=None):
         out = run_subprocess(
-            ["pdfinfo", path], capture_output=True, text=True, check=True
+            ["pdfinfo", *PdfDocument._password_args(password), path],
+            capture_output=True, text=True, check=True,
         ).stdout
         m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
         if not m:
@@ -2173,17 +2195,61 @@ class PdfDocument(DocumentHandler):
             return None
         try:
             cls._pdf_page_count(path)
+        except subprocess.CalledProcessError as e:
+            if "Incorrect password" not in (e.stderr or ""):
+                raise UnusableFile(f"not a usable PDF ({e})") from e
+            # Encrypted - not actually unusable, just not readable yet;
+            # _ensure_unlocked() prompts for a password (and retries
+            # this same probe with it) the moment anything actually
+            # needs to read the file (page_count(), the first of
+            # those - see Viewer._set_current_file()), not here, so a
+            # file that's merely being classified (as opposed to the
+            # one about to be shown) is never prompted for.
+            return cls(path, encrypted=True)
         except Exception as e:
             raise UnusableFile(f"not a usable PDF ({e})") from e
         return cls(path)
 
+    def _ensure_unlocked(self):
+        """Prompt for this PDF's password, retrying on a wrong one,
+        the first time anything needs to actually read it - a no-op
+        every time after that (whether or not a password was ever
+        needed at all), the same "resolve once, remember on the
+        handler" shape OfficeDocument's own lazy rendering uses.
+        page_count() is always the first such call (see
+        Viewer._set_current_file()), so this is the only place that
+        needs to call it.
+
+        Raises UnusableFile if the user cancels the prompt (Esc/^C/^D)
+        - go_to_file() already treats that exception exactly like any
+        other unusable file: skipped over by :n/:p's auto-skip, or
+        reported in place for a direct jump (x/X)."""
+        if not self.encrypted:
+            return
+        message = None
+        while True:
+            password = _prompt_pdf_password(os.path.basename(self.path), message)
+            if password is None:
+                raise UnusableFile("password required")
+            try:
+                self._pdf_page_count(self.path, password)
+            except subprocess.CalledProcessError as e:
+                if "Incorrect password" not in (e.stderr or ""):
+                    raise UnusableFile(f"not a usable PDF ({e})") from e
+                message = "incorrect password, try again"
+                continue
+            self.password = password
+            self.encrypted = False
+            return
+
     def page_count(self):
-        return self._pdf_page_count(self.path)
+        self._ensure_unlocked()
+        return self._pdf_page_count(self.path, self.password)
 
     def page_size_pt(self, page):
         """(width_pt, height_pt) for `page`."""
         out = run_subprocess(
-            ["pdfinfo", "-f", str(page), "-l", str(page), self.path],
+            ["pdfinfo", *self._password_args(self.password), "-f", str(page), "-l", str(page), self.path],
             capture_output=True,
             text=True,
             check=True,
@@ -2198,7 +2264,7 @@ class PdfDocument(DocumentHandler):
         -layout (which tries to preserve the page's visual line/column
         layout, unlike the flat word-run text used for search)."""
         out = run_subprocess(
-            ["pdftotext", "-f", str(page), "-l", str(page), "-layout", self.path, "-"],
+            ["pdftotext", *self._password_args(self.password), "-f", str(page), "-l", str(page), "-layout", self.path, "-"],
             capture_output=True,
             text=True,
             check=True,
@@ -2212,7 +2278,7 @@ class PdfDocument(DocumentHandler):
         "words": [(start, end, xMin, yMin, xMax, yMax), ...]} (all in points)
         where (start, end) are offsets into "text" for that word."""
         out = run_subprocess(
-            ["pdftotext", "-bbox", self.path, "-"],
+            ["pdftotext", *self._password_args(self.password), "-bbox", self.path, "-"],
             capture_output=True,
             text=True,
             check=True,
@@ -2305,6 +2371,8 @@ class PdfDocument(DocumentHandler):
 
         try:
             reader = PdfReader(self.path)
+            if reader.is_encrypted:
+                reader.decrypt(self.password or "")
         except Exception:
             return empty
 
@@ -2435,7 +2503,7 @@ class PdfDocument(DocumentHandler):
         prefix = os.path.join(cache.tmpdir, f"page-{page}-{round(dpi)}")
         run_subprocess(
             [
-                "pdftoppm", "-png", "-r", str(dpi),
+                "pdftoppm", *self._password_args(self.password), "-png", "-r", str(dpi),
                 "-f", str(page), "-l", str(page),
                 "-singlefile", self.path, prefix,
             ],
@@ -4218,6 +4286,79 @@ def get_term_cells(fd):
     return rows, cols, xpix, ypix
 
 
+def _prompt_pdf_password(filename, message=None):
+    """Ask for `filename`'s PDF password, interactively - via a plain
+    getpass() prompt if the interactive viewer's raw terminal mode
+    hasn't been entered yet (_CTRL_C_FD unset - see RawTerminal), or,
+    once it has (encountering a still-locked encrypted PDF while
+    already paging - see PdfDocument._ensure_unlocked()), via a masked
+    prompt drawn directly on the status line instead, since getpass()
+    would otherwise fight over the tty's raw/echo settings. `message`
+    (e.g. "incorrect password, try again") is shown alongside a retry.
+    Returns the entered password, or None if the user cancelled
+    (Esc/^C/^D in raw mode; ^C/^D or a blank line under getpass())."""
+    if _CTRL_C_FD is None:
+        return _prompt_pdf_password_cooked(filename, message)
+    return _prompt_pdf_password_raw(_CTRL_C_FD, filename, message)
+
+
+def _prompt_pdf_password_cooked(filename, message=None):
+    if message:
+        print(f"pdfless: {message}", file=sys.stderr)
+    try:
+        password = getpass.getpass(f"Password for {filename}: ")
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return password or None
+
+
+def _prompt_pdf_password_raw(fd, filename, message=None):
+    """The raw-mode half of _prompt_pdf_password() - reads its own
+    small, self-contained loop of keypresses directly from `fd`
+    (select()+read_utf8_char(), the same pattern run_viewer()'s main
+    loop uses) rather than going through that loop's own key
+    dispatch, since this is only ever needed the moment a
+    just-navigated-to file (see Viewer.go_to_file()) turns out to be
+    an encrypted PDF - a one-off, modal prompt, not a new steady-state
+    mode that loop itself would need to know about."""
+    rows, cols, _, _ = get_term_cells(fd)
+    buf = ""
+
+    def redraw():
+        prefix = f"{message} - " if message else ""
+        text = truncate_to_width(f"{prefix}Password for {filename}: " + "*" * len(buf), cols)
+        col = min(cols, 1 + display_width(text))
+        sys.stdout.write(
+            f"\x1b[{rows};1H{STATUS_COLOR_ON}\x1b[2K{text}"
+            f"\x1b[{rows};{col}H\x1b[?25h"
+        )
+        sys.stdout.flush()
+
+    redraw()
+    try:
+        while True:
+            r, _, _ = select.select([fd], [], [], 0.3)
+            if not r:
+                continue
+            ch = read_utf8_char(fd)
+            if ch is None:
+                return None
+            if ch in ("\r", "\n"):
+                return buf or None
+            if ch in ("\x1b", "\x03", "\x04"):  # Esc, ^C, ^D
+                return None
+            if ch in ("\x7f", "\x08"):  # Backspace
+                buf = buf[:-1]
+            elif ch.isprintable():
+                buf += ch
+            else:
+                continue
+            redraw()
+    finally:
+        sys.stdout.write("\x1b[?25l")
+        sys.stdout.flush()
+
+
 def query_pixel_size_osc(fd, timeout=0.5):
     """Ask the terminal for its text-area size in pixels via CSI 14t
     (an iTerm2/xterm extension). Returns (width_px, height_px) or None."""
@@ -4561,6 +4702,27 @@ class Viewer:
                 self._handler_cache[index] = None
         return self._handler_cache[index]
 
+    def _is_usable(self, index):
+        """Whether files[index] can actually be switched to -
+        go_to_file() treats a False return exactly like an
+        out-of-range index. Beyond just being classifiable
+        (_classify()), this also forces page_count() to resolve for
+        real: for a password-protected PdfDocument, that's where the
+        user is actually prompted (see PdfDocument._ensure_unlocked()),
+        right here as part of landing on that file, rather than a
+        moment later inside _set_current_file() - go_to_file()'s own
+        step logic then treats a cancelled prompt the same as any
+        other unusable file (skipped over by :n/:p's auto-skip, or
+        reported for a direct jump)."""
+        handler = self._classify(index)
+        if handler is None:
+            return False
+        try:
+            handler.page_count()
+        except UnusableFile:
+            return False
+        return True
+
     def _set_current_file(self):
         """Point path/name/kind/npages/doc_handler/cache at
         self.files[self.file_index] - just the file's identity, not the
@@ -4639,8 +4801,9 @@ class Viewer:
 
         `step` (+-1 from next_file()/previous_file(), 0 from a direct
         jump like x/X) says what to do if files[index] turns out not to
-        be a usable file at all (_classify() returns None - a lazily-
-        sniffed file, not yet known either way): 0 just reports
+        be usable at all (_is_usable() says no - a lazily-sniffed file,
+        not yet known either way, or a password-protected PDF whose
+        prompt (see _is_usable()) was cancelled): 0 just reports
         boundary_message right there, the same as an out-of-range index;
         +-1 instead keeps stepping in that direction looking for the
         next usable one, only giving up once the index itself runs out
@@ -4649,7 +4812,7 @@ class Viewer:
             if index < 0 or index >= len(self.files):
                 self.draw_status(boundary_message)
                 return
-            if self._classify(index) is not None:
+            if self._is_usable(index):
                 break
             if step == 0:
                 self.draw_status(boundary_message)
@@ -7594,33 +7757,43 @@ def main():
         # it via next_file()/previous_file()/go_to_file(). A raised
         # UnusableFile means some handler positively identified a leading
         # candidate's format but couldn't actually use it (e.g. a corrupt
-        # PDF) - specific enough to report and skip, rather than falling
-        # through to try treating it as some other kind.
+        # PDF, or a password-protected one whose prompt - see
+        # PdfDocument._ensure_unlocked(), forced here by the page_count()
+        # call below - was cancelled) - specific enough to report and
+        # skip, rather than falling through to try treating it as some
+        # other kind.
         start_file_index = None
         first_handler = None
+        first_npages = None
         for i, path in enumerate(candidates):
             try:
                 handler = _sniff_file(path, tmpdir, debug=args.debug)
+                if handler is None:
+                    print(
+                        f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
+                        f"file, skipping: {path}",
+                        file=sys.stderr,
+                    )
+                    continue
+                # A None page_count() (an office-kind first file) means
+                # its real page count isn't known until Viewer.__init__
+                # actually renders it, which also clamps self.page
+                # against it then; here just keep whatever page number
+                # was asked for (>= 1). For a PdfDocument, this is also
+                # where a password prompt (if the file turns out to be
+                # encrypted) actually happens - forced here, rather than
+                # left for Viewer.__init__ to trigger, so cancelling it
+                # falls through to the next candidate exactly like any
+                # other unusable file.
+                first_npages = handler.page_count()
             except UnusableFile as e:
                 print(f"pdfless: {e}, skipping: {path}", file=sys.stderr)
-                continue
-            if handler is None:
-                print(
-                    f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
-                    f"file, skipping: {path}",
-                    file=sys.stderr,
-                )
                 continue
             start_file_index, first_handler = i, handler
             break
 
         if start_file_index is None:
             die("no valid PDF, image, text, or Quick-Look-previewable files given")
-        # A None page_count() (an office-kind first file) means its real
-        # page count isn't known until Viewer.__init__ actually renders
-        # it, which also clamps self.page against it then; here just
-        # keep whatever page number was asked for (>= 1).
-        first_npages = first_handler.page_count()
         start_page = args.page if first_npages is None else min(first_npages, args.page)
         start_page = max(1, start_page)
 

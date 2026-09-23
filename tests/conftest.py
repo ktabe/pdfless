@@ -46,6 +46,15 @@ def sample_pdf():
 
 
 @pytest.fixture
+def sample_encrypted_pdf():
+    """Same content as sample_pdf (lorem_ipsum.pdf), password-protected
+    (user password "secret123") via `qpdf --encrypt secret123 secret123
+    256 -- lorem_ipsum.pdf sample_encrypted.pdf` - for exercising
+    PdfDocument's password-prompt handling (see _ensure_unlocked())."""
+    return os.path.join(FIXTURES_DIR, "sample_encrypted.pdf")
+
+
+@pytest.fixture
 def sample_image():
     return os.path.join(FIXTURES_DIR, "sample.png")
 
