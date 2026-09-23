@@ -108,6 +108,82 @@ def test_corrupt_pdf_raises_unusable_file_not_silently_skipped(tmp_path):
     assert raised, "a corrupt PDF should raise UnusableFile, not fall through silently"
 
 
+def test_encrypted_pdf_classifies_as_pdf_without_prompting(sample_encrypted_pdf, tmp_path):
+    """sniff() alone must never prompt for a password - only actually
+    reading the file (page_count(), the first such call - see
+    _ensure_unlocked()) does, so a password-protected PDF that's merely
+    being classified (not the one about to be shown) is left alone."""
+    handler = classify(sample_encrypted_pdf, tmp_path)
+    assert isinstance(handler, pdfless.PdfDocument)
+    assert handler.encrypted
+
+
+def test_encrypted_pdf_unlocks_with_correct_password(sample_encrypted_pdf, tmp_path, monkeypatch):
+    handler = classify(sample_encrypted_pdf, tmp_path)
+    monkeypatch.setattr(pdfless, "_prompt_pdf_password", lambda filename, message=None: "secret123")
+    assert handler.page_count() == 7
+    assert not handler.encrypted
+    assert handler.password == "secret123"
+
+
+def test_encrypted_pdf_retries_after_wrong_password(sample_encrypted_pdf, tmp_path, monkeypatch):
+    attempts = iter(["wrong", "still wrong", "secret123"])
+    monkeypatch.setattr(pdfless, "_prompt_pdf_password", lambda filename, message=None: next(attempts))
+    handler = classify(sample_encrypted_pdf, tmp_path)
+    assert handler.page_count() == 7
+    assert handler.password == "secret123"
+
+
+def test_encrypted_pdf_cancelled_prompt_raises_unusable_file(sample_encrypted_pdf, tmp_path, monkeypatch):
+    """Esc/^C/^D at the prompt (modeled here by _prompt_pdf_password
+    returning None, as both the cooked and raw-mode implementations do
+    on cancellation) is reported the same as any other unusable file -
+    go_to_file() and main()'s own candidate search already both know
+    how to handle that."""
+    monkeypatch.setattr(pdfless, "_prompt_pdf_password", lambda filename, message=None: None)
+    handler = classify(sample_encrypted_pdf, tmp_path)
+    try:
+        handler.page_count()
+        assert False, "cancelling the password prompt should raise UnusableFile"
+    except pdfless.UnusableFile as e:
+        assert "password" in str(e)
+
+
+def test_password_protected_docx_raises_unusable_file_not_silently_skipped(tmp_path):
+    """A password-protected .docx/.pptx/... is an OLE/CFB container
+    (MS-OFFCRYPTO) instead of the plain ZIP it normally is - detected
+    upfront (see is_password_protected_ooxml_or_visio()) so pdfless
+    skips it with a clear reason instead of committing to a soffice/
+    qlmanage render that's bound to fail uninformatively."""
+    bad = tmp_path / "protected.docx"
+    bad.write_bytes(pdfless._CFB_MAGIC + b"\x00" * 32)
+    raised = False
+    try:
+        classify(str(bad), tmp_path)
+    except pdfless.UnusableFile as e:
+        raised = True
+        assert "password" in str(e)
+    assert raised, "a password-protected .docx should raise UnusableFile, not fall through silently"
+
+
+def test_password_protected_vsdx_raises_unusable_file(tmp_path):
+    bad = tmp_path / "protected.vsdx"
+    bad.write_bytes(pdfless._CFB_MAGIC + b"\x00" * 32)
+    raised = False
+    try:
+        classify(str(bad), tmp_path)
+    except pdfless.UnusableFile as e:
+        raised = True
+        assert "password" in str(e)
+    assert raised
+
+
+def test_ordinary_docx_is_unaffected_by_the_cfb_check(sample_docx, tmp_path):
+    """A normal (unencrypted) .docx is a plain ZIP, not CFB - make sure
+    the new upfront check doesn't misclassify it."""
+    assert not pdfless.is_password_protected_ooxml_or_visio(sample_docx)
+
+
 def test_invalid_utf8_non_pdf_file_raises_unusable_file(tmp_path):
     bad = tmp_path / "bad.txt"
     # No NUL byte (so is_probably_text() says yes), but not valid UTF-8.

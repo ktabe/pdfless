@@ -11,6 +11,7 @@ It has been tested with [iTerm2](https://iterm2.com) and
 
 - Scroll, zoom, and pan with the keyboard or mouse.
 - Search PDF text and follow external and internal PDF links.
+- Support password-protected PDFs.
 - Switch to text mode to read or copy extracted text.
 - Open multiple files and switch between them.
 - Reload the current file automatically when it changes (in follow mode).
@@ -283,6 +284,10 @@ Use `-s` to increase the resolution of image-based Quick Look previews and
 `-c` to request continuous scrolling for Quick Look documents. These options
 do not change the pagination or resolution of LibreOffice-only formats or Markdown.
 Excel uses Quick Look's sheet-based view rather than LibreOffice's print layout.
+
+A password-protected Word, PowerPoint, or Visio file (`.docx`/`.pptx`/`.vsdx`
+and their macro-enabled variants) is detected up front and skipped, since
+neither LibreOffice nor Quick Look can render one without its password.
 
 ## Cache
 
