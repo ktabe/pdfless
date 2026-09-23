@@ -149,6 +149,41 @@ def test_encrypted_pdf_cancelled_prompt_raises_unusable_file(sample_encrypted_pd
         assert "password" in str(e)
 
 
+def test_password_protected_docx_raises_unusable_file_not_silently_skipped(tmp_path):
+    """A password-protected .docx/.pptx/... is an OLE/CFB container
+    (MS-OFFCRYPTO) instead of the plain ZIP it normally is - detected
+    upfront (see is_password_protected_ooxml_or_visio()) so pdfless
+    skips it with a clear reason instead of committing to a soffice/
+    qlmanage render that's bound to fail uninformatively."""
+    bad = tmp_path / "protected.docx"
+    bad.write_bytes(pdfless._CFB_MAGIC + b"\x00" * 32)
+    raised = False
+    try:
+        classify(str(bad), tmp_path)
+    except pdfless.UnusableFile as e:
+        raised = True
+        assert "password" in str(e)
+    assert raised, "a password-protected .docx should raise UnusableFile, not fall through silently"
+
+
+def test_password_protected_vsdx_raises_unusable_file(tmp_path):
+    bad = tmp_path / "protected.vsdx"
+    bad.write_bytes(pdfless._CFB_MAGIC + b"\x00" * 32)
+    raised = False
+    try:
+        classify(str(bad), tmp_path)
+    except pdfless.UnusableFile as e:
+        raised = True
+        assert "password" in str(e)
+    assert raised
+
+
+def test_ordinary_docx_is_unaffected_by_the_cfb_check(sample_docx, tmp_path):
+    """A normal (unencrypted) .docx is a plain ZIP, not CFB - make sure
+    the new upfront check doesn't misclassify it."""
+    assert not pdfless.is_password_protected_ooxml_or_visio(sample_docx)
+
+
 def test_invalid_utf8_non_pdf_file_raises_unusable_file(tmp_path):
     bad = tmp_path / "bad.txt"
     # No NUL byte (so is_probably_text() says yes), but not valid UTF-8.

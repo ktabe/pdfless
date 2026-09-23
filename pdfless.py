@@ -911,7 +911,7 @@ def _publish_cached_render(entry_dir, result):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
+def _convert_via_soffice(soffice, path, tmpdir, timeout=60, debug=False):
     """Convert `path` (a Word/RTF/PowerPoint document - see
     OfficeDocument._SOFFICE_EXTENSIONS) to a real PDF via LibreOffice's
     `soffice --convert-to pdf`, natively - no Quick Look/Chrome
@@ -929,10 +929,15 @@ def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
     -env:UserInstallation points at a profile directory scoped to this
     `tmpdir` (unique per render), so concurrent soffice invocations
     (e.g. two files opened around the same time) don't collide over a
-    shared user profile lock."""
+    shared user profile lock.
+
+    With debug=True (-d/--debug), a failure to actually produce a PDF
+    is reported to stderr - see below for why that's not rare (soffice
+    routinely exits 0 without one)."""
     profile_dir = os.path.join(tmpdir, "soffice-profile")
+    name = os.path.basename(path)
     try:
-        run_subprocess(
+        result = run_subprocess(
             [
                 soffice,
                 f"-env:UserInstallation=file://{profile_dir}",
@@ -942,11 +947,27 @@ def _convert_via_soffice(soffice, path, tmpdir, timeout=60):
             ],
             capture_output=True, timeout=timeout,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError) as e:
+        if debug:
+            print(f"pdfless: [debug] {name}: soffice failed to run: {e}", file=sys.stderr, end="\r\n")
         return None
     base = os.path.splitext(os.path.basename(path))[0]
     out_pdf = os.path.join(tmpdir, f"{base}.pdf")
-    return out_pdf if os.path.isfile(out_pdf) else None
+    if os.path.isfile(out_pdf):
+        return out_pdf
+    if debug:
+        # soffice --convert-to typically exits 0 even when it couldn't
+        # actually load the file (e.g. a password-protected document,
+        # or one flagged by its macro-security settings) - the only
+        # sign is stderr/stdout text and no output file, so both are
+        # worth showing here rather than just silently returning None.
+        detail = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()
+        print(
+            f"pdfless: [debug] {name}: soffice produced no output"
+            + (f" - {detail.splitlines()[0]}" if detail else ""),
+            file=sys.stderr, end="\r\n",
+        )
+    return None
 
 
 
@@ -1920,6 +1941,30 @@ def is_probably_text(path, sniff_bytes=8000):
         return False
 
 
+_CFB_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # OLE/Compound File Binary
+
+
+def is_password_protected_ooxml_or_visio(path):
+    """A modern Word/PowerPoint/Visio file (.docx/.pptx/.vsdx/...) is
+    ordinarily a ZIP archive - MS-OFFCRYPTO password protection instead
+    wraps the whole encrypted package in an OLE/CFB container (the same
+    on-disk shape a *legacy* .doc/.ppt/.vsd already has natively,
+    encrypted or not - so this magic-number check only means anything
+    for an extension that's normally plain ZIP; callers only use it for
+    those). Cheap enough to run during sniff()/_probe_preview(), before
+    ever committing to soffice/qlmanage - both fail on a file like this
+    anyway (soffice exits 0 having printed "Error: source file could
+    not be loaded" to stderr; qlmanage exits 0 having simply produced
+    no preview), so without this check the failure only surfaces much
+    later, as an uninformative "Quick Look rendering failed" placeholder
+    - see OfficeDocument._probe_preview()."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(len(_CFB_MAGIC)) == _CFB_MAGIC
+    except OSError:
+        return False
+
+
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -2875,6 +2920,14 @@ class OfficeDocument(DocumentHandler):
     # _soffice_pages_if_eligible().
     _SOFFICE_EXTENSIONS = (".doc", ".docx", ".docm", ".ppt", ".pptx", ".pptm", ".rtf")
 
+    # The subset of _SOFFICE_EXTENSIONS that's ordinarily a ZIP archive
+    # (OOXML) rather than always-OLE/CFB (.doc/.ppt) or plain text
+    # (.rtf) - see is_password_protected_ooxml_or_visio(), which this
+    # is paired with in sniff() to reject a password-protected one
+    # upfront instead of committing to a soffice/qlmanage render that's
+    # bound to fail uninformatively.
+    _OOXML_ZIP_EXTENSIONS = (".docx", ".docm", ".pptx", ".pptm")
+
     OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
     OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
 
@@ -2893,6 +2946,8 @@ class OfficeDocument(DocumentHandler):
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
+        if path.lower().endswith(cls._OOXML_ZIP_EXTENSIONS) and is_password_protected_ooxml_or_visio(path):
+            raise UnusableFile("password-protected Office document, unsupported")
         return cls(path) if cls._probe_preview(path, tmpdir, debug=debug) else None
 
     @staticmethod
@@ -3127,7 +3182,7 @@ class OfficeDocument(DocumentHandler):
             print(f"pdfless: [debug] {name}: using soffice: {soffice}", file=sys.stderr, end="\r\n")
         label = f"{name}: converting via LibreOffice"
         with _DebugTimer(debug, label), progress.spin(label + "..."):
-            out_pdf = _convert_via_soffice(soffice, path, tmpdir)
+            out_pdf = _convert_via_soffice(soffice, path, tmpdir, debug=debug)
         if out_pdf is None:
             return None
         npages = _pdf_page_count_safe(out_pdf)
@@ -3650,10 +3705,19 @@ class SofficeOnlyDocument(OfficeDocument):
 
     _SOFFICE_ONLY_EXTENSIONS = (".odt", ".odp", ".odg", ".ods", ".vsd", ".vsdx", ".wmf")
 
+    # .vsdx is the one _SOFFICE_ONLY_EXTENSIONS format that's ordinarily
+    # a ZIP archive (OOXML) rather than always-OLE/CFB (.vsd, .wmf) or
+    # still a ZIP even when password-protected (.odt/.odp/.odg/.ods -
+    # ODF encryption keeps the outer container as ZIP, encrypting each
+    # entry inside it instead) - see is_password_protected_ooxml_or_visio().
+    _OOXML_ZIP_EXTENSIONS = (".vsdx",)
+
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
         if not path.lower().endswith(cls._SOFFICE_ONLY_EXTENSIONS):
             return None
+        if path.lower().endswith(cls._OOXML_ZIP_EXTENSIONS) and is_password_protected_ooxml_or_visio(path):
+            raise UnusableFile("password-protected Office document, unsupported")
         if find_soffice() is None:
             return None
         return cls(path)

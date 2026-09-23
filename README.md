@@ -285,6 +285,10 @@ Use `-s` to increase the resolution of image-based Quick Look previews and
 do not change the pagination or resolution of LibreOffice-only formats or Markdown.
 Excel uses Quick Look's sheet-based view rather than LibreOffice's print layout.
 
+A password-protected Word, PowerPoint, or Visio file (`.docx`/`.pptx`/`.vsdx`
+and their macro-enabled variants) is detected up front and skipped, since
+neither LibreOffice nor Quick Look can render one without its password.
+
 ## Cache
 
 Rendered output is saved in a persistent cache to reduce loading time when
