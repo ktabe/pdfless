@@ -3180,6 +3180,10 @@ class OfficeDocument(DocumentHandler):
     def page_count(self):
         return None
 
+    # What -d/--debug reports when build_pages() is served from the
+    # persistent cache - each subclass names what that let it skip.
+    _CACHE_HIT_NOTE = "reusing cached render, skipped qlmanage/soffice/Chrome"
+
     def build_pages(
         self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
         progress=None,
@@ -3189,15 +3193,45 @@ class OfficeDocument(DocumentHandler):
         call. Used directly by Viewer.reload() (which always wants a
         fresh render, since the file changed on disk); see
         ensure_pages() for the memoized entry point everything else
-        wants instead."""
-        return self._render_and_remember(
-            self.path, tmpdir, debug=debug, render_scale=render_scale,
-            progress=progress,
+        wants instead.
+
+        The same steps for every subclass, which only supply what
+        differs: _renderer() (the actual render, as a zero-argument
+        callable, or None if it can't even be attempted) and
+        _cache_key_suffix() (how the persistent cache - see
+        _render_result_cached() - tells apart renderings of the same
+        file, or None to skip that cache altogether). The whole render
+        is wrapped in one cache check, so a hit skips all of it -
+        qlmanage, soffice and Chrome alike."""
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        render = self._renderer(tmpdir, debug, render_scale, progress)
+        if render is None:
+            return None
+        key_suffix = self._cache_key_suffix(render_scale)
+        if key_suffix is None:
+            result = render()
+        else:
+            result, from_cache = _render_result_cached(self.path, render, key_suffix=key_suffix)
+            if debug and result is not None and from_cache:
+                _debug_log(f"{os.path.basename(self.path)}: {self._CACHE_HIT_NOTE}")
+        return self._remember_pages(result)
+
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        """build_pages()'s actual render, as a zero-argument callable
+        returning _remember_pages()'s input (or None on failure) - or
+        None if there's no point even trying. Here: the qlmanage/
+        soffice/Chrome pipeline, _render_office_pages()."""
+        return lambda: self._render_office_pages(
+            self.path, tmpdir, debug=debug, render_scale=render_scale, progress=progress,
         )
 
-    def _render_and_remember(self, source_path, tmpdir, **kwargs):
-        pages = self._render_office_pages(source_path, tmpdir, **kwargs)
-        return self._remember_pages(pages)
+    def _cache_key_suffix(self, render_scale):
+        """build_pages()'s persistent-cache key suffix (see
+        _cached_render_dir()), or None for no persistent caching. A
+        screenshot-sliced render bakes in -s/--rendering-scale's pixel
+        resolution, so it's part of the key here."""
+        return f":scale={render_scale}"
 
     def _remember_pages(self, pages):
         """Normalize and remember whatever build_pages()'s underlying
@@ -3361,7 +3395,7 @@ class OfficeDocument(DocumentHandler):
 
     def _render_office_pages(
         self, path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None, continuous=False, use_cache=True,
+        progress=None, continuous=False,
     ):
         """Try to render `path` - any file this Mac's Quick Look
         generators can preview (Word, Excel, PowerPoint, Keynote,
@@ -3421,18 +3455,10 @@ class OfficeDocument(DocumentHandler):
         view - see Viewer.continuous - which stacks the real, paginated
         pages instead.)
 
-        The *entire* pipeline above (soffice attempt included) is
-        wrapped in one persistent-cache check (see
-        _render_result_cached()) keyed on `path` plus render_scale/
-        continuous (see _cached_render_dir()) - a hit skips all of it,
-        qlmanage/soffice/Chrome alike, not just the final render.
-        `use_cache=False` (only passed by RtfOfficeDocument.build_pages()'s
-        own qlmanage/Chrome fallback, against a throwaway converted
-        .docx path) skips this method's own cache check entirely, since
-        that caller already wraps its whole self - including this - in
-        one cache check of its own, keyed on the original .rtf; caching
-        here too would just be an extra, never-reused entry keyed on a
-        temp path nothing will ask for again."""
+        Not cached itself: build_pages() wraps it (and RTF's own
+        fallback around it) in one persistent-cache check, keyed on the
+        original file - RTF's call here is against a throwaway converted
+        .docx that nothing would ever ask for again."""
         if progress is None:
             progress = _ProgressLine(enabled=False)
         name = os.path.basename(path)
@@ -3526,14 +3552,7 @@ class OfficeDocument(DocumentHandler):
             finally:
                 progress.clear()
 
-        if not use_cache:
-            return render()
-
-        key_suffix = f":scale={render_scale}" + (":continuous" if continuous else "")
-        result, from_cache = _render_result_cached(path, render, key_suffix=key_suffix)
-        if debug and result is not None and from_cache:
-            _debug_log(f"{name}: reusing cached render, skipped qlmanage/soffice/Chrome")
-        return result
+        return render()
 
     def ensure_pages(self, tmpdir, **kwargs):
         """Render once and reuse afterward - a no-op on every call after
@@ -3596,12 +3615,12 @@ class OfficeDocument(DocumentHandler):
         # (below) forwards to it directly otherwise, without ever
         # calling this (self.pages holds a same-length placeholder list
         # in that case, not real per-page paths - see
-        # _render_and_remember()).
+        # _remember_pages()).
         return self.pages[page - 1]
 
     def get_page_image(self, cache, page, target_px, fit):
         # A FlowingText document rendered to a real PDF instead of PNGs
-        # (see _render_and_remember()) - re-rasterize it the same way a
+        # (see _remember_pages()) - re-rasterize it the same way a
         # real PdfDocument would, at whatever DPI the current zoom
         # needs, instead of resizing one fixed-resolution screenshot
         # (the DocumentHandler default this falls back to otherwise).
@@ -3675,23 +3694,10 @@ class RtfOfficeDocument(OfficeDocument):
             return None
         return cls(path)
 
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None,
-    ):
-        """The whole render (soffice-against-the-original-.rtf attempt,
-        or the textutil-to-docx-then-qlmanage/Chrome fallback) is
-        wrapped in one persistent-cache check keyed on self.path (the
-        original .rtf), the same way OfficeDocument._render_office_pages()
-        wraps its own pipeline - see there. The nested
-        _render_office_pages() call below passes use_cache=False since
-        it would otherwise be keyed on docx_path, a throwaway temp file
-        different every render, making its own cache entry never worth
-        reading back."""
-        if progress is None:
-            progress = _ProgressLine(enabled=False)
-        name = os.path.basename(self.path)
-
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        """soffice against the original .rtf, or else the textutil-to-
+        docx-then-qlmanage/Chrome fallback - cached by build_pages() on
+        self.path (the original .rtf), never the throwaway .docx."""
         def render():
             # Unlike the textutil-converted-docx path below, soffice reads
             # the original .rtf natively, so its page breaks correspond to
@@ -3712,14 +3718,10 @@ class RtfOfficeDocument(OfficeDocument):
             # is.
             return self._render_office_pages(
                 docx_path, tmpdir, debug=debug, render_scale=render_scale,
-                progress=progress, continuous=True, use_cache=False,
+                progress=progress, continuous=True,
             )
 
-        key_suffix = f":scale={render_scale}"
-        result, from_cache = _render_result_cached(self.path, render, key_suffix=key_suffix)
-        if debug and result is not None and from_cache:
-            _debug_log(f"{name}: reusing cached render, skipped qlmanage/soffice/Chrome")
-        return self._remember_pages(result)
+        return render
 
 
 class SofficeOnlyDocument(OfficeDocument):
@@ -3771,23 +3773,13 @@ class SofficeOnlyDocument(OfficeDocument):
             return None
         return cls(path)
 
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None,
-    ):
-        if progress is None:
-            progress = _ProgressLine(enabled=False)
-        name = os.path.basename(self.path)
+    _CACHE_HIT_NOTE = "reusing cached PDF, skipped LibreOffice"
 
-        def render():
-            return self._try_soffice_pages(self.path, tmpdir, debug, progress)
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        return lambda: self._try_soffice_pages(self.path, tmpdir, debug, progress)
 
-        result, from_cache = _render_result_cached(self.path, render)
-        if debug and result is not None and from_cache:
-            _debug_log(f"{name}: reusing cached PDF, skipped LibreOffice")
-        if result is None:
-            return None
-        return self._remember_pages(result)
+    def _cache_key_suffix(self, render_scale):
+        return ""  # a real PDF, re-rasterized at any scale on demand
 
 
 class SvgDocument(OfficeDocument):
@@ -3822,12 +3814,12 @@ class SvgDocument(OfficeDocument):
             return None
         return cls(path)
 
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None,
-    ):
-        if progress is None:
-            progress = _ProgressLine(enabled=False)
+    _CACHE_HIT_NOTE = "reusing cached PDF, skipped rendering"
+
+    def _cache_key_suffix(self, render_scale):
+        return ""  # a real PDF, re-rasterized at any scale on demand
+
+    def _renderer(self, tmpdir, debug, render_scale, progress):
         name = os.path.basename(self.path)
         chrome = find_chrome()
         if chrome is None:
@@ -3856,15 +3848,7 @@ class SvgDocument(OfficeDocument):
                 ok = _capture_html_pdf(chrome, wrapper_path, width, height, out_pdf)
             return _pdf_render_result(out_pdf, ok)
 
-        result, from_cache = _render_result_cached(self.path, render)
-        if debug and result is not None:
-            _debug_log(
-                f"{name}: "
-                + ("reusing cached PDF, skipped rendering" if from_cache else "cached the converted PDF")
-            )
-        if result is None:
-            return None
-        return self._remember_pages(result)
+        return render
 
     @staticmethod
     def _write_svg_wrapper(wrapper_path, svg_path, width, height):
@@ -4057,19 +4041,23 @@ img { max-width: 100%; height: auto; }
             return None
         return cls(path)
 
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None,
-    ):
-        if progress is None:
-            progress = _ProgressLine(enabled=False)
-        name = os.path.basename(self.path)
-        tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
-        out_pdf = os.path.join(tmpdir, f"markdown-capture-{tag}.pdf")
-        label = f"{name}: rendering to PDF"
-        with _DebugTimer(debug, label), progress.spin(label + "..."):
-            ok = self._render_markdown_pdf(out_pdf)
-        return self._remember_pages(_pdf_render_result(out_pdf, ok))
+    def _cache_key_suffix(self, render_scale):
+        # No persistent cache: WeasyPrint renders a Markdown file in
+        # well under a second (see the class docstring), fast enough
+        # that caching it isn't worth the disk space.
+        return None
+
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        def render():
+            name = os.path.basename(self.path)
+            tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+            out_pdf = os.path.join(tmpdir, f"markdown-capture-{tag}.pdf")
+            label = f"{name}: rendering to PDF"
+            with _DebugTimer(debug, label), progress.spin(label + "..."):
+                ok = self._render_markdown_pdf(out_pdf)
+            return _pdf_render_result(out_pdf, ok)
+
+        return render
 
     def extract_text(self, page):
         return read_plain_text_lines(self.path)
@@ -7178,7 +7166,7 @@ class Viewer:
             )
             if pages:
                 # build_pages() already updated self.doc_handler.pages
-                # (see OfficeDocument._render_and_remember()) - just
+                # (see OfficeDocument._remember_pages()) - just
                 # self.cache.clear() below is needed to drop any now-stale
                 # resized/cached images.
                 self.npages = len(pages)
