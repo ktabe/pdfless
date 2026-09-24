@@ -123,3 +123,100 @@ def test_follow_reloads_when_the_file_changes(sample_pdf, tmp_path, monkeypatch)
     viewer._follow_checked -= pdfless.FOLLOW_INTERVAL
     viewer.poll_follow()
     assert reloads == [1]
+
+
+def test_turning_follow_on_catches_up_with_a_change_at_once(sample_pdf, tmp_path, monkeypatch):
+    """A change made while follow was off is reloaded the moment F turns
+    it on - not FOLLOW_INTERVAL seconds later, and not ignored - while
+    turning it on for an unchanged file reloads nothing."""
+    import shutil
+    path = tmp_path / "doc.pdf"
+    shutil.copy(sample_pdf, path)
+    viewer = make_viewer(pdfless.PdfDocument(str(path)))
+    reloads = []
+    monkeypatch.setattr(viewer, "reload", lambda: reloads.append(1))
+
+    viewer.toggle_follow()  # on - nothing changed yet
+    assert reloads == []
+    viewer.toggle_follow()  # off again
+
+    os.utime(path, (1, 1))  # changed while follow is off
+    viewer.poll_follow()
+    assert reloads == []  # off: not watched
+    viewer.toggle_follow()  # on: caught up at once
+    assert reloads == [1]
+    viewer.poll_follow()  # and not reloaded again for the same change
+    viewer._follow_checked -= pdfless.FOLLOW_INTERVAL
+    viewer.poll_follow()
+    assert reloads == [1]
+
+
+def test_follow_blanks_the_screen_while_the_file_is_gone(sample_pdf, tmp_path, monkeypatch, capsys):
+    """Follow mode's check finding the file deleted blanks the screen,
+    with a status line saying why, instead of leaving the old content up
+    - and reloads it once it's back."""
+    import shutil
+    path = tmp_path / "doc.pdf"
+    shutil.copy(sample_pdf, path)
+    viewer = make_viewer(pdfless.PdfDocument(str(path)))
+    viewer.toggle_follow()
+    reloads = []
+    monkeypatch.setattr(viewer, "reload", lambda: reloads.append(1))
+    capsys.readouterr()
+
+    os.unlink(path)
+    viewer._follow_checked -= pdfless.FOLLOW_INTERVAL
+    viewer.poll_follow()
+    assert viewer.file_missing
+    out = capsys.readouterr().out
+    assert "\x1b[2J" in out and "deleted or moved" in out
+    assert "1337;File" not in out  # no page image, old or new
+    viewer.refresh()  # any redraw meanwhile stays blank
+    assert "1337;File" not in capsys.readouterr().out
+
+    shutil.copy(sample_pdf, path)
+    viewer._follow_checked -= pdfless.FOLLOW_INTERVAL
+    viewer.poll_follow()
+    assert not viewer.file_missing
+    assert reloads == [1]
+
+
+def test_a_failed_read_of_a_deleted_file_blanks_the_screen(sample_pdf, tmp_path, monkeypatch):
+    """Without follow mode, a read that fails because the file is gone
+    (what run_viewer()'s loop hands to _report_unreadable_file()) blanks
+    the screen the same way; the next redraw after the file is back
+    reloads it."""
+    import shutil
+    path = tmp_path / "doc.pdf"
+    shutil.copy(sample_pdf, path)
+    viewer = make_viewer(pdfless.PdfDocument(str(path)))
+    os.unlink(path)
+    try:
+        viewer.go_page(5, 0)  # never rendered before - needs the file
+    except (OSError, pdfless.subprocess.CalledProcessError):
+        pdfless._report_unreadable_file(viewer)
+    else:
+        raise AssertionError("rendering a new page should need the file")
+    assert viewer.file_missing
+
+    reloads = []
+    monkeypatch.setattr(viewer, "reload", lambda: reloads.append(1))
+    viewer.refresh()
+    assert reloads == []  # still gone
+    shutil.copy(sample_pdf, path)
+    viewer.refresh()
+    assert not viewer.file_missing
+    assert reloads == [1]
+
+
+def test_report_unreadable_file_reraises_if_the_file_is_still_there(sample_pdf):
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    try:
+        try:
+            raise OSError("some other failure")
+        except OSError:
+            pdfless._report_unreadable_file(viewer)
+    except OSError as e:
+        assert str(e) == "some other failure"
+    else:
+        raise AssertionError("should have re-raised")

@@ -4741,9 +4741,14 @@ class Viewer:
         self.follow = options.follow  # -f/--follow, or toggled at runtime with F
         # (see toggle_follow()) - poll_follow() reloads the file whenever
         # its mtime changes while this is on
+        self._displayed_mtime = None  # the current file's mtime when
+        # what's on screen was read from it - set by _set_current_file(),
+        # and moved on by _reload_if_changed() whenever it reloads
+        self.file_missing = False  # the file was found deleted or moved
+        # since it was opened - see mark_file_missing(); while True, the
+        # screen is left blank but for a status line saying so
         self._follow_path = None  # the file poll_follow() is watching...
-        self._follow_mtime = None  # ...its mtime when last looked at...
-        self._follow_checked = 0.0  # ...and when that was (monotonic)
+        self._follow_checked = 0.0  # ...and when it last looked (monotonic)
         self.quit_if_one_screen = options.quit_if_one_screen  # -F/--quit-if-one-
         # screen - set before _set_current_file() below so _ViewerProgress
         # can already see it: whether this first file ends up dumped-and-
@@ -4967,6 +4972,10 @@ class Viewer:
         self.path = handler.path
         self.name = os.path.basename(handler.path)
         self.doc_handler = handler
+        # Taken before reading/rendering anything, so a change made while
+        # that's under way still shows up as newer than what's displayed.
+        self._displayed_mtime = self._current_mtime()
+        self.file_missing = False  # whatever the previous file's state
         self.npages = handler.page_count()  # None for a RenderedDocument
         # until _ensure_office_pages() below actually renders it
         self._ensure_office_pages()  # a no-op unless doc_handler is a
@@ -5383,6 +5392,21 @@ class Viewer:
                 self._load_page()
 
     def refresh(self):
+        if self.file_missing:
+            if not os.path.exists(self.path):
+                self._draw_file_missing()
+                return
+            # It's back (without follow mode noticing first, or with it
+            # off) - show what's in it now, not what was there before.
+            self.file_missing = False
+            self._displayed_mtime = self._current_mtime()
+            try:
+                self.reload()  # redraws, and says so on the status line
+            except Exception:
+                # Back, but not readable yet (e.g. still being written) -
+                # stay blank, and try again on the next redraw.
+                self.mark_file_missing()
+            return
         self._load_content()
         if self.help_active:
             self._draw_help()
@@ -7620,38 +7644,65 @@ class Viewer:
             return False
         return True
 
-    def _start_following(self) -> None:
-        """(Re)start follow mode's mtime tracking from the current file
-        and time - whenever follow is turned on (-f, F, O/v) or switches
-        to watching a different file (:n/:p). Otherwise a change that
-        happened while follow was off, or to some other file, would
-        trigger an immediate reload."""
-        self._follow_path = self.path
+    def mark_file_missing(self) -> None:
+        """The file has been found deleted or moved since it was opened
+        (by follow mode's check, or by a read failing - see
+        _report_unreadable_file()): stop showing what was read from it
+        before - blank the screen, with a status line saying why - until
+        it's back (see refresh(), and poll_follow() for follow mode's
+        own catching up)."""
+        self.file_missing = True
+        self._invalidate_screen()
+        self._draw_file_missing()
+
+    def _draw_file_missing(self) -> None:
+        """What refresh() draws while file_missing: a blank screen and a
+        status line saying why - and, with follow mode on, that it'll
+        come back by itself."""
+        note = " - reloads when it's back" if self.follow else ""
+        sys.stdout.write(
+            SGR_RESET + "\x1b[H\x1b[2J"
+            + self.format_status(f"{self.name}: deleted or moved{note}") + "\x1b[?25l"
+        )
+        sys.stdout.flush()
+
+    def _current_mtime(self) -> "float | None":
+        """The current file's mtime right now, or None if it can't be
+        read (e.g. mid save-as-replace, when it briefly doesn't exist)."""
         try:
-            self._follow_mtime = os.path.getmtime(self.path)
+            return os.path.getmtime(self.path)
         except OSError:
-            self._follow_mtime = None
+            return None
+
+    def _start_following(self) -> None:
+        """(Re)start follow mode's watch on the current file - whenever
+        follow is turned on (-f, F, O/v) or switches to watching a
+        different file (:n/:p). The next periodic check is due
+        FOLLOW_INTERVAL seconds from now; what it compares against is
+        _displayed_mtime, the version actually on screen."""
+        self._follow_path = self.path
         self._follow_checked = time.monotonic()
 
-    def poll_follow(self) -> None:
-        """Follow mode's periodic check, called on every pass of
-        run_viewer()'s loop: every FOLLOW_INTERVAL seconds, reload the
-        file if its mtime changed since the last look."""
-        if not self.follow:
-            return
-        if self.path != self._follow_path:
-            self._start_following()  # :n/:p switched files
-            return
-        if time.monotonic() - self._follow_checked < FOLLOW_INTERVAL:
-            return
+    def _reload_if_changed(self) -> bool:
+        """Reload the file if it changed on disk since what's on screen
+        was read from it (_displayed_mtime) - True if it did. Counts as
+        follow mode's latest check either way."""
         self._follow_checked = time.monotonic()
-        try:
-            mtime = os.path.getmtime(self._follow_path)
-        except OSError:
-            return  # e.g. mid save-as-replace; try again next tick
-        if mtime == self._follow_mtime:
-            return
-        self._follow_mtime = mtime
+        mtime = self._current_mtime()
+        if mtime is None:
+            if not os.path.exists(self.path) and not self.file_missing:
+                self.mark_file_missing()
+            return False  # gone (or unreadable); try again next time
+        if self.file_missing:
+            # Back again - whatever its mtime, since what's on screen is
+            # a blank, not the version _displayed_mtime refers to.
+            self.file_missing = False
+        elif mtime == self._displayed_mtime:
+            return False
+        # Moved on before reloading, not after: if the reload fails (see
+        # below), this same version isn't retried on every check - only
+        # a later write, with a newer mtime, is.
+        self._displayed_mtime = mtime
         try:
             self.reload()
         except Exception:
@@ -7660,12 +7711,31 @@ class Viewer:
             # showing the last good render and pick up the change on a
             # later, now-complete write.
             pass
+        return True
+
+    def poll_follow(self) -> None:
+        """Follow mode's periodic check, called on every pass of
+        run_viewer()'s loop: every FOLLOW_INTERVAL seconds, reload the
+        file if it changed since what's on screen was read from it."""
+        if not self.follow:
+            return
+        if self.path != self._follow_path:
+            self._start_following()  # :n/:p switched files
+            return
+        if time.monotonic() - self._follow_checked >= FOLLOW_INTERVAL:
+            self._reload_if_changed()
 
     def toggle_follow(self) -> None:
-        """F: -f/--follow switched on/off at runtime."""
+        """F: -f/--follow switched on/off at runtime. Turning it on
+        catches up at once - if the file changed while follow was off,
+        that change is reloaded right away rather than FOLLOW_INTERVAL
+        seconds later - and checks every FOLLOW_INTERVAL seconds from
+        then on."""
         self.follow = not self.follow
         if self.follow:
             self._start_following()
+            if self._reload_if_changed():
+                return  # reload() has already redrawn
         self.refresh()
 
     def open_in_default_app(self) -> None:
@@ -8008,6 +8078,19 @@ def _leave_screen_seq(alt_screen: bool) -> str:
     )
 
 
+def _report_unreadable_file(viewer: Viewer) -> None:
+    """For run_viewer()'s loop, inside an `except` for a failed read
+    (subprocess.CalledProcessError/OSError): if it failed because the
+    file was deleted or moved out from under us, blank the screen and
+    say so (Viewer.mark_file_missing()), and let the loop carry on - the
+    view comes back once the file does (see Viewer.refresh()). With the
+    file still there it's a real failure, not this, and the exception is
+    re-raised as it was."""
+    if os.path.exists(viewer.path):
+        raise  # the exception being handled, unchanged
+    viewer.mark_file_missing()
+
+
 def _suspend(fd: int, old_termios, keep: bool, viewer: Viewer) -> None:
     """^Z: suspend, like a normal shell job-control app would - raw mode
     disables the tty's own ^Z-to-SIGTSTP translation (see RawTerminal),
@@ -8156,7 +8239,11 @@ def run_viewer(
         viewer.poll_follow()
 
         if viewer.resized:
-            viewer.refresh()
+            try:
+                viewer.refresh()
+            except (subprocess.CalledProcessError, OSError):
+                # e.g. a plain text file re-read at the new size
+                _report_unreadable_file(viewer)
             continue
         if not r:
             # Nothing waiting - a good moment to act on a scrollbar drag
@@ -8167,138 +8254,143 @@ def run_viewer(
         key = read_key(fd)
         if key is None:
             break
-        if isinstance(key, tuple):  # ("MOUSE", kind, col, row)
-            if search_editor is None:
-                viewer.handle_mouse(*key[1:])
-            continue
+        try:
+            if isinstance(key, tuple):  # ("MOUSE", kind, col, row)
+                if search_editor is None:
+                    viewer.handle_mouse(*key[1:])
+                continue
 
-        # The order of the checks from here on is what decides which
-        # meaning a key gets: ^Z beats everything (even typing a search
-        # query), a prompt or pending prefix swallows the next key
-        # whatever it is, and the help screen swallows every other key
-        # but its own.
-        if key == "\x1a":
-            _suspend(fd, old_termios, keep, viewer)
-            continue
+            # The order of the checks from here on is what decides which
+            # meaning a key gets: ^Z beats everything (even typing a search
+            # query), a prompt or pending prefix swallows the next key
+            # whatever it is, and the help screen swallows every other key
+            # but its own.
+            if key == "\x1a":
+                _suspend(fd, old_termios, keep, viewer)
+                continue
 
-        if search_editor is not None:
-            outcome = search_editor.handle(key)
-            if outcome == "submit":
-                query = search_editor.text or last_search_query
-                search_editor = None
-                if query:
-                    last_search_query = query
-                    viewer.start_search(query, backward=search_backward)
-                else:
+            if search_editor is not None:
+                outcome = search_editor.handle(key)
+                if outcome == "submit":
+                    query = search_editor.text or last_search_query
+                    search_editor = None
+                    if query:
+                        last_search_query = query
+                        viewer.start_search(query, backward=search_backward)
+                    else:
+                        viewer.draw_status()
+                elif outcome == "cancel":
+                    search_editor = None
                     viewer.draw_status()
-            elif outcome == "cancel":
-                search_editor = None
-                viewer.draw_status()
-            elif outcome == "changed":
-                viewer.draw_search_prompt(
-                    search_editor.text, search_editor.cursor, backward=search_backward,
-                )
-            continue
+                elif outcome == "changed":
+                    viewer.draw_search_prompt(
+                        search_editor.text, search_editor.cursor, backward=search_backward,
+                    )
+                continue
 
-        if pending_prefix is not None:
-            action = _PREFIX_BINDINGS[pending_prefix].get(key)
-            pending_prefix = None
-            if action is None:
-                viewer.draw_status()
-            elif action(viewer) is False:
+            if pending_prefix is not None:
+                action = _PREFIX_BINDINGS[pending_prefix].get(key)
+                pending_prefix = None
+                if action is None:
+                    viewer.draw_status()
+                elif action(viewer) is False:
+                    break
+                continue
+
+            if key == "\x03":
                 break
-            continue
 
-        if key == "\x03":
-            break
-
-        if viewer.help_active:
-            viewer.handle_help_key(key)
-            continue
-
-        if viewer.handle_global_key(key):
-            continue
-
-        if key == ":" or (key == "-" and viewer.text_mode):
-            # In image mode, "-" already means zoom out (see
-            # Viewer.handle_key()) - only text mode gets the less(1)-style
-            # "-S"/"-N" toggles.
-            pending_prefix = key
-            viewer.draw_status(key)
-            continue
-
-        if key in ("/", "?"):
-            # less(1)'s pair: "/" searches forward from here, "?"
-            # backward. Either way the whole document is searched and N/P
-            # then walk every match - the direction only decides which
-            # match this search lands on first (see
-            # Viewer._match_index_from()). Search always works in text
-            # mode (there's always a flat list of lines to search)
-            # regardless of what the file kind supports in image mode
-            # (doc_handler.supports_search() - a real PDF's bbox index).
-            if viewer.text_mode or viewer.doc_handler.supports_search():
-                search_editor = _LineEditor()
-                search_backward = key == "?"
-                viewer.draw_search_prompt("", 0, backward=search_backward)
-            else:
-                viewer.draw_status("search isn't available for this file type")
-            continue
-
-        if viewer.search_query is not None:
-            if key in ("n", "N"):
-                viewer.repeat_search(forward=True)
+            if viewer.help_active:
+                viewer.handle_help_key(key)
                 continue
-            if key in ("p", "P"):
-                viewer.repeat_search(forward=False)
+
+            if viewer.handle_global_key(key):
                 continue
-            if key in ("q", "\x1b"):
-                # With a search active, "q"/Esc dismiss it (removing the
-                # match box/highlight and its status line) rather than
-                # quitting pdfless outright - quit still works normally on
-                # a second press, once there's no longer a search to clear.
-                viewer.clear_search()
+
+            if key == ":" or (key == "-" and viewer.text_mode):
+                # In image mode, "-" already means zoom out (see
+                # Viewer.handle_key()) - only text mode gets the less(1)-style
+                # "-S"/"-N" toggles.
+                pending_prefix = key
+                viewer.draw_status(key)
+                continue
+
+            if key in ("/", "?"):
+                # less(1)'s pair: "/" searches forward from here, "?"
+                # backward. Either way the whole document is searched and N/P
+                # then walk every match - the direction only decides which
+                # match this search lands on first (see
+                # Viewer._match_index_from()). Search always works in text
+                # mode (there's always a flat list of lines to search)
+                # regardless of what the file kind supports in image mode
+                # (doc_handler.supports_search() - a real PDF's bbox index).
+                if viewer.text_mode or viewer.doc_handler.supports_search():
+                    search_editor = _LineEditor()
+                    search_backward = key == "?"
+                    viewer.draw_search_prompt("", 0, backward=search_backward)
+                else:
+                    viewer.draw_status("search isn't available for this file type")
+                continue
+
+            if viewer.search_query is not None:
+                if key in ("n", "N"):
+                    viewer.repeat_search(forward=True)
+                    continue
+                if key in ("p", "P"):
+                    viewer.repeat_search(forward=False)
+                    continue
+                if key in ("q", "\x1b"):
+                    # With a search active, "q"/Esc dismiss it (removing the
+                    # match box/highlight and its status line) rather than
+                    # quitting pdfless outright - quit still works normally on
+                    # a second press, once there's no longer a search to clear.
+                    viewer.clear_search()
+                    viewer.refresh()
+                    continue
+
+            # A lone "0" (no pending number) resets the zoom/pan instead of
+            # starting a number entry.
+            if key.isdigit() and not (key == "0" and not num_buf):
+                num_buf += key
+                viewer.draw_status(f"number: {num_buf}")
+                continue
+
+            count = int(num_buf) if num_buf else None
+            if key in ("g", "G") and count is not None:
+                # "<number>g"/"<number>G": in text mode, jump straight to that
+                # line of the current page's text. There's no page-image
+                # equivalent of "line", so in image mode the count is simply
+                # dropped and this falls through to plain g/G below (the top/
+                # bottom of the current page).
+                num_buf = ""
+                if viewer.text_mode:
+                    viewer.go_to_text_line(count)
+                    viewer.refresh()
+                    continue
+            elif viewer.handle_count_key(key, count):
+                num_buf = ""
+                continue
+
+            if num_buf:
+                # Any other key cancels a pending number.
+                num_buf = ""
+                viewer.draw_status()
+
+            border_before = viewer.text_border
+            before = viewer._view_state()
+            if not viewer.handle_key(key):
+                break
+            if viewer._view_state() != before:
                 viewer.refresh()
-                continue
+                if viewer.text_border != border_before and viewer.text_wrap:
+                    # "B" toggled text_border, but _draw_text_wrapped() never
+                    # draws a border regardless of it - without this, B looks
+                    # like it does nothing at all while wrapped.
+                    viewer.draw_status("no border while wrapped - see -S/-s")
 
-        # A lone "0" (no pending number) resets the zoom/pan instead of
-        # starting a number entry.
-        if key.isdigit() and not (key == "0" and not num_buf):
-            num_buf += key
-            viewer.draw_status(f"number: {num_buf}")
-            continue
-
-        count = int(num_buf) if num_buf else None
-        if key in ("g", "G") and count is not None:
-            # "<number>g"/"<number>G": in text mode, jump straight to that
-            # line of the current page's text. There's no page-image
-            # equivalent of "line", so in image mode the count is simply
-            # dropped and this falls through to plain g/G below (the top/
-            # bottom of the current page).
-            num_buf = ""
-            if viewer.text_mode:
-                viewer.go_to_text_line(count)
-                viewer.refresh()
-                continue
-        elif viewer.handle_count_key(key, count):
-            num_buf = ""
-            continue
-
-        if num_buf:
-            # Any other key cancels a pending number.
-            num_buf = ""
-            viewer.draw_status()
-
-        border_before = viewer.text_border
-        before = viewer._view_state()
-        if not viewer.handle_key(key):
-            break
-        if viewer._view_state() != before:
-            viewer.refresh()
-            if viewer.text_border != border_before and viewer.text_wrap:
-                # "B" toggled text_border, but _draw_text_wrapped() never
-                # draws a border regardless of it - without this, B looks
-                # like it does nothing at all while wrapped.
-                viewer.draw_status("no border while wrapped - see -S/-s")
+        except (subprocess.CalledProcessError, OSError):
+            # e.g. the text, or the search index, this key needed
+            _report_unreadable_file(viewer)
 
     return viewer
 
