@@ -1456,6 +1456,59 @@ def _detect_fallback_page_xpath(content):
     return "/html/body/div" if matching >= len(top_divs) * 0.9 else None
 
 
+def _read_html(path: str) -> "str | None":
+    """`path`'s contents for the measure helpers below - decoding errors
+    replaced rather than raised - or None if it can't be read at all."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _chrome_dump_title(chrome: str, html_path: str, content: str, script: str,
+                       scratch_name: str, width: "int | None" = None,
+                       timeout: int = 30) -> "str | None":
+    """The measuring technique every _measure_*() helper shares: inject
+    `script` (a <script> that leaves its answer in document.title) just
+    before `content`'s </body> - `content` being html_path's own HTML,
+    already read by the caller - write that to a scratch copy named
+    `scratch_name` next to html_path (so relative references still
+    resolve), load it in headless Chrome with --dump-dom, and return the
+    text of the dumped <title> (still HTML-escaped), or None on any
+    failure. Always cleans up the scratch copy.
+
+    `width`, if given, sets the viewport width (layout can depend on
+    it - see OfficeDocument._measure_slide_offsets()); the height is an
+    arbitrary 1080, since dump-dom doesn't render anything, just loads
+    and serializes the DOM at that viewport size. The 8s virtual time
+    budget is an upper bound on how long a script may wait (e.g. for
+    every <img> to finish decoding) before Chrome gives up and dumps
+    whatever it's got - it only matters as a cap, since a script that
+    finishes sooner ends it sooner."""
+    idx = content.rfind("</body>")
+    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
+    measure_path = os.path.join(os.path.dirname(html_path), scratch_name)
+    try:
+        with open(measure_path, "w", encoding="utf-8") as f:
+            f.write(instrumented)
+    except OSError:
+        return None
+    args = [chrome, "--headless", "--no-sandbox"]
+    if width is not None:
+        args.append(f"--window-size={width},1080")
+    args += ["--dump-dom", "--virtual-time-budget=8000", f"file://{os.path.abspath(measure_path)}"]
+    try:
+        r = run_subprocess(args, capture_output=True, text=True, timeout=timeout, check=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        if os.path.exists(measure_path):
+            os.unlink(measure_path)
+    m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
+    return m.group(1) if m else None
+
+
 def _measure_content_height(chrome, html_path, width, timeout=30):
     """document.body.scrollHeight for `html_path` at `width` (logical
     CSS px) - the same script-injected-title / --dump-dom technique as
@@ -1473,37 +1526,16 @@ def _measure_content_height(chrome, html_path, width, timeout=30):
     and passing an explicit height is the only way. Returns None on
     any failure - the caller falls back to a fixed cap
     (OfficeVariant.OFFICE_MAX_CAPTURE_HEIGHT) instead."""
-    try:
-        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError:
+    content = _read_html(html_path)
+    if content is None:
         return None
-    script = "<script>document.title = String(Math.ceil(document.body.scrollHeight));</script>"
-    idx = content.rfind("</body>")
-    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
-    measure_path = os.path.join(os.path.dirname(html_path), "pdfless-height-measure.html")
-    try:
-        with open(measure_path, "w", encoding="utf-8") as f:
-            f.write(instrumented)
-    except OSError:
-        return None
-    try:
-        r = run_subprocess(
-            [
-                chrome, "--headless", "--no-sandbox",
-                f"--window-size={width},1080",
-                "--dump-dom", "--virtual-time-budget=8000",
-                f"file://{os.path.abspath(measure_path)}",
-            ],
-            capture_output=True, text=True, timeout=timeout, check=True,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-        return None
-    finally:
-        if os.path.exists(measure_path):
-            os.unlink(measure_path)
-    m = re.search(r"<title>(\d+)</title>", r.stdout)
-    return int(m.group(1)) if m else None
+    title = _chrome_dump_title(
+        chrome, html_path, content,
+        "<script>document.title = String(Math.ceil(document.body.scrollHeight));</script>",
+        "pdfless-height-measure.html", width=width, timeout=timeout,
+    )
+    m = re.fullmatch(r"\d+", title.strip()) if title else None
+    return int(m.group(0)) if m else None
 
 
 def _measure_svg_natural_size(chrome, wrapper_path, timeout=20):
@@ -1525,39 +1557,18 @@ def _measure_svg_natural_size(chrome, wrapper_path, timeout=20):
     Returns None on any failure, including an SVG Chrome couldn't
     determine a natural size for at all - the caller falls back to a
     fixed default size."""
-    try:
-        with open(wrapper_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError:
+    content = _read_html(wrapper_path)
+    if content is None:
         return None
     script = (
         '<script>document.getElementById("svg").onload = function() {'
         'document.title = this.naturalWidth + "x" + this.naturalHeight;'
         "};</script>"
     )
-    idx = content.rfind("</body>")
-    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
-    measure_path = os.path.join(os.path.dirname(wrapper_path), "pdfless-svg-measure.html")
-    try:
-        with open(measure_path, "w", encoding="utf-8") as f:
-            f.write(instrumented)
-    except OSError:
-        return None
-    try:
-        r = run_subprocess(
-            [
-                chrome, "--headless", "--no-sandbox",
-                "--dump-dom", "--virtual-time-budget=8000",
-                f"file://{os.path.abspath(measure_path)}",
-            ],
-            capture_output=True, text=True, timeout=timeout, check=True,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-        return None
-    finally:
-        if os.path.exists(measure_path):
-            os.unlink(measure_path)
-    m = re.search(r"<title>(\d+)x(\d+)</title>", r.stdout)
+    title = _chrome_dump_title(
+        chrome, wrapper_path, content, script, "pdfless-svg-measure.html", timeout=timeout,
+    )
+    m = re.fullmatch(r"(\d+)x(\d+)", title.strip()) if title else None
     if not m:
         return None
     width, height = int(m.group(1)), int(m.group(2))
@@ -3306,10 +3317,8 @@ class OfficeDocument(DocumentHandler):
         default, if not given explicitly) can silently disagree with the
         boundaries the real capture ends up with, throwing off every slice
         from that point on."""
-        try:
-            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except OSError:
+        content = _read_html(html_path)
+        if content is None:
             return None
 
         if not page_element_xpath:
@@ -3317,48 +3326,18 @@ class OfficeDocument(DocumentHandler):
             if not page_element_xpath:
                 return None
 
-        idx = content.rfind("</body>")
-        script = _build_slide_measure_script(page_element_xpath)
-        instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
-        measure_path = os.path.join(os.path.dirname(html_path), "pdfless-slide-measure.html")
-        try:
-            with open(measure_path, "w", encoding="utf-8") as f:
-                f.write(instrumented)
-        except OSError:
-            # Same as _measure_content_height(): a failed measurement
-            # is just "couldn't measure" (None), not a crash.
+        # Must match the real capture's width - see the docstring. The
+        # 8s budget (see _chrome_dump_title()) is a cap on how long the
+        # injected script waits for every <img> to finish decoding, which
+        # only matters for a deck with many/large embedded images.
+        title = _chrome_dump_title(
+            chrome, html_path, content, _build_slide_measure_script(page_element_xpath),
+            "pdfless-slide-measure.html", width=width, timeout=30,
+        )
+        if title is None:
             return None
         try:
-            r = run_subprocess(
-                [
-                    chrome, "--headless", "--no-sandbox",
-                    # Must match the real capture's width (see the
-                    # docstring): a tall, arbitrary height is fine since
-                    # dump-dom doesn't render/screenshot anything, just
-                    # loads and serializes the DOM at that viewport size.
-                    f"--window-size={width},1080",
-                    # 8s, not 2s: an upper bound on how long the injected
-                    # script (see _build_slide_measure_script()) is allowed
-                    # to wait for every <img> to finish decoding before
-                    # giving up and dumping whatever it's got - it resolves
-                    # as soon as they're all ready, so this only matters as
-                    # a cap for a deck with many/large embedded images.
-                    "--dump-dom", "--virtual-time-budget=8000",
-                    f"file://{os.path.abspath(measure_path)}",
-                ],
-                capture_output=True, text=True, timeout=30, check=True,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            return None
-        finally:
-            if os.path.exists(measure_path):
-                os.unlink(measure_path)
-
-        m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
-        if not m:
-            return None
-        try:
-            data = json.loads(html.unescape(m.group(1)))
+            data = json.loads(html.unescape(title))
             tops = [float(t) for t in data["tops"]]
             if not tops:
                 return None
