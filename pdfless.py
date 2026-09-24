@@ -4621,10 +4621,12 @@ class Viewer:
         # entry above is actually visited - None means that one turned
         # out not to be a usable file at all.
         self.tmpdir = tmpdir
-        self.follow = follow  # -f/--follow, or toggled at runtime with F -
-        # purely a display flag for status_segments(); the actual mtime-
-        # polling/reload logic lives in run_viewer()'s own loop, which
-        # keeps this in sync when the F key toggles it
+        self.follow = follow  # -f/--follow, or toggled at runtime with F
+        # (see toggle_follow()) - poll_follow() reloads the file whenever
+        # its mtime changes while this is on
+        self._follow_path = None  # the file poll_follow() is watching...
+        self._follow_mtime = None  # ...its mtime when last looked at...
+        self._follow_checked = 0.0  # ...and when that was (monotonic)
         self.quit_if_one_screen = quit_if_one_screen  # -F/--quit-if-one-
         # screen - set before _set_current_file() below so _ViewerProgress
         # can already see it: whether this first file ends up dumped-and-
@@ -4676,6 +4678,8 @@ class Viewer:
         self.rows, self.cols, _, _ = get_term_cells(fd)
         self.page = page
         self._set_current_file()  # sets path/name/npages/cache
+        if self.follow:
+            self._start_following()
         # For an office-kind first file, self.npages was just determined
         # above (by _ensure_office_pages(), lazily) rather than known
         # ahead of time the way main() clamps a PDF/image/text file's
@@ -5336,14 +5340,38 @@ class Viewer:
         self._invalidate_screen()  # help chars overlay the page
         self.refresh()
 
+    def handle_help_key(self, key: str) -> None:
+        """A key pressed while the help screen is up: only "q"/F1 (close
+        it) and the scroll keys (for when KEY_TABLE is taller than the
+        box) do anything. Everything else is swallowed so page keys can't
+        leak through underneath it."""
+        if key in ("q", "F1"):
+            self.hide_help()
+        elif key in FORWARD_LINE_KEYS:
+            self.scroll_help(1)
+        elif key in BACKWARD_LINE_KEYS:
+            self.scroll_help(-1)
+        elif key in FORWARD_WINDOW_KEYS:
+            self.scroll_help(max(1, self.rows - 3))
+        elif key in BACKWARD_WINDOW_KEYS:
+            self.scroll_help(-max(1, self.rows - 3))
+
+    def can_enter_text_mode(self) -> bool:
+        """Whether this file has any text-mode content to show at all -
+        enter_text_mode()'s own precondition, and what run_viewer()'s
+        startup fallback on a terminal without inline images checks
+        before switching to text mode for you."""
+        return (
+            self.doc_handler.supports_text_mode()
+            and self.doc_handler.extract_text(self.page) is not None
+        )
+
     def enter_text_mode(self):
         """Switch to text mode - False (no-op) if there's no text to
         show at all, which for an OfficeDocument means textutil
         couldn't extract anything from this particular file (e.g. a
         spreadsheet or slide deck - see extract_office_text())."""
-        if not self.doc_handler.supports_text_mode():
-            return False
-        if self.doc_handler.extract_text(self.page) is None:
+        if not self.can_enter_text_mode():
             return False
         self.text_mode = True
         # Mouse reporting is only useful (and only turned on) for
@@ -7478,6 +7506,210 @@ class Viewer:
             return False
         return True
 
+    def _start_following(self) -> None:
+        """(Re)start follow mode's mtime tracking from the current file
+        and time - whenever follow is turned on (-f, F, O/v) or switches
+        to watching a different file (:n/:p). Otherwise a change that
+        happened while follow was off, or to some other file, would
+        trigger an immediate reload."""
+        self._follow_path = self.path
+        try:
+            self._follow_mtime = os.path.getmtime(self.path)
+        except OSError:
+            self._follow_mtime = None
+        self._follow_checked = time.monotonic()
+
+    def poll_follow(self) -> None:
+        """Follow mode's periodic check, called on every pass of
+        run_viewer()'s loop: every FOLLOW_INTERVAL seconds, reload the
+        file if its mtime changed since the last look."""
+        if not self.follow:
+            return
+        if self.path != self._follow_path:
+            self._start_following()  # :n/:p switched files
+            return
+        if time.monotonic() - self._follow_checked < FOLLOW_INTERVAL:
+            return
+        self._follow_checked = time.monotonic()
+        try:
+            mtime = os.path.getmtime(self._follow_path)
+        except OSError:
+            return  # e.g. mid save-as-replace; try again next tick
+        if mtime == self._follow_mtime:
+            return
+        self._follow_mtime = mtime
+        try:
+            self.reload()
+        except Exception:
+            # The file may have been mid-write when we noticed the mtime
+            # change (e.g. pdftoppm/pdfinfo saw a truncated file); keep
+            # showing the last good render and pick up the change on a
+            # later, now-complete write.
+            pass
+
+    def toggle_follow(self) -> None:
+        """F: -f/--follow switched on/off at runtime."""
+        self.follow = not self.follow
+        if self.follow:
+            self._start_following()
+        self.refresh()
+
+    def open_in_default_app(self) -> None:
+        """O/v: hand the current file off to macOS's own default app for
+        it (Preview/Word/Excel/...), and switch follow mode on (if it
+        wasn't already) so an edit made there comes back automatically.
+        self.path is always the original file, never a temporary
+        rendered PDF, so this opens the same thing pdfless was pointed
+        at in the first place, even for a soffice/Chrome-rendered format."""
+        if not _open_in_default_app(self.path):
+            self.draw_status(
+                "opening the file in its own app needs macOS"
+                if sys.platform != "darwin" else f"couldn't open {self.path}"
+            )
+            return
+        if not self.follow:
+            self.follow = True
+            self._start_following()
+        self.refresh()
+
+    def text_toggle_refusal(self) -> "str | None":
+        """Why t/T can't switch modes right now, as a status message - or
+        None if they can try (enter_text_mode() may still find there's
+        no text after all)."""
+        if self.doc_handler.starts_in_text_mode():
+            # Always-on text mode already - toggling would try to switch
+            # to an image view this kind doesn't have.
+            return "this is already a plain text file"
+        if self.text_mode and not iterm2_like():
+            # Already in text mode - possibly run_viewer()'s startup
+            # fallback put it there - and image mode wouldn't show
+            # anything on this terminal anyway, so refuse to cross back
+            # rather than switching to a blank screen.
+            return "image mode needs iTerm2/WezTerm - not supported on this terminal"
+        if not self.doc_handler.supports_text_mode():
+            return "text mode isn't available for this file type"
+        return None
+
+    def handle_global_key(self, key: str) -> bool:
+        """The keys that mean the same in image and text mode and need
+        nothing from run_viewer()'s own loop state - True if `key` was
+        one of them (and has been handled, redraw included)."""
+        if key in ("\x0c", "FOCUS_IN"):
+            # ^L: repaint the screen (e.g. after other output garbled it)
+            # without otherwise changing anything. FOCUS_IN is the same
+            # fix, triggered automatically - see FOCUS_ON's comment for
+            # why a focus change (under tmux, especially) can otherwise
+            # leave this pane blank, and for why only this direction,
+            # not FOCUS_OUT, is safe to redraw on.
+            self.refresh()
+        elif key == "FOCUS_OUT":
+            pass
+        elif key == "r":
+            self.toggle_scrollbar()
+            self.refresh()
+        elif key == "c":
+            self.toggle_continuous()
+        elif key == "F":
+            self.toggle_follow()
+        elif key in ("O", "v"):
+            self.open_in_default_app()
+        elif key == "F1":
+            # less(1) puts its help on "h"/"H", which pdfless can't - both
+            # are panning keys here (less has nothing to pan). "?" isn't
+            # free either, being less's backward search, so help lives on
+            # F1, with ":h" as a second way in for terminals that send
+            # something unexpected for F1.
+            self.show_help()
+        elif key in ("t", "T"):
+            # T is t and C combined into one press/undo - see
+            # toggle_clean_text_mode().
+            refusal = self.text_toggle_refusal()
+            toggle = self.toggle_text_mode if key == "t" else self.toggle_clean_text_mode
+            if refusal is None and not toggle():
+                refusal = "no text could be extracted from this file"
+            if refusal is not None:
+                self.draw_status(refusal)
+        else:
+            return False
+        return True
+
+    def handle_count_key(self, key: str, count: "int | None") -> bool:
+        """The keys a typed-in number (`count`, or None) can come before,
+        other than g/G - True if `key` was one of them (and has been
+        handled)."""
+        if key in ("<", ">", "HOME", "END"):
+            # "<"/">" (HOME/END are aliases): jump to the first/last page
+            # of the whole document - "<number><" or "<number>>" jumps
+            # straight to that page instead, in either mode.
+            go = self.go_to_page_text if self.text_mode else self.go_page
+            if count is not None:
+                go(count, 0)
+            elif key in ("<", "HOME"):
+                go(1, 0)
+            else:
+                go(self.npages, None)
+            self.refresh()
+        elif key in ("{", "}"):
+            # One-keystroke equivalents of ":p"/":n" - mirroring "["/"]"
+            # (PDF link-history back/forward), the shifted key just above
+            # each on a US keyboard.
+            if key == "{":
+                self.previous_file()
+            else:
+                self.next_file()
+        elif key == "x":
+            # "x" jumps to the first file in the list; "<number>x" jumps
+            # straight to that file (1-based, matching "<number><"'s page
+            # numbering) - meaningful only with more than one file, but
+            # harmless otherwise (go_to_file() just reports there's
+            # nowhere to go).
+            self.go_to_file(count - 1 if count is not None else 0, "no such file")
+        elif key == "X":
+            self.go_to_file(len(self.files) - 1, "no such file")
+        else:
+            return False
+        return True
+
+    def handle_mouse(self, kind: str, col: int, row: int) -> None:
+        """One decoded mouse event (see decode_sgr_mouse()): the wheel
+        scrolls the help box while it's up, and otherwise clicks/drags/
+        the wheel/the back and forward buttons act on the page."""
+        if self.help_active:
+            if kind == "MOUSE_WHEEL_UP":
+                self.scroll_help(-1)
+            elif kind == "MOUSE_WHEEL_DOWN":
+                self.scroll_help(1)
+        elif kind == "MOUSE_CLICK":
+            self.handle_click(col, row)
+        elif kind == "MOUSE_DRAG":
+            if self.handle_drag(row):
+                # A drag arrives as a burst of motion events, and acting
+                # on one costs a page rasterize - so let the burst drain
+                # first and only act on where the pointer actually ended up.
+                ready, _, _ = select.select([self.fd], [], [], 0)
+                if not ready:
+                    self.flush_scrollbar_drag()
+        elif kind == "MOUSE_RELEASE":
+            self.end_scrollbar_drag()
+        elif kind == "MOUSE_WHEEL_UP":
+            self.handle_wheel(-1)
+        elif kind == "MOUSE_WHEEL_DOWN":
+            self.handle_wheel(1)
+        elif kind == "MOUSE_BACK":
+            self.go_back()
+        elif kind == "MOUSE_FORWARD":
+            self.go_forward()
+
+    def _view_state(self) -> tuple:
+        """Everything handle_key()/handle_key_text() can change that
+        affects what's on screen - run_viewer() compares it before and
+        after a key to decide whether a redraw is needed."""
+        return (
+            self.page, self.scroll, self.zoom, self.x_offset, self.fit,
+            self.text_mode, self.text_scroll, self.text_x_offset, self.text_border,
+            self.text_wrap, self.eol_mark, self.line_numbers, self.scrollbar,
+        )
+
     def handle_key(self, key):
         if self.text_mode:
             return self.handle_key_text(key)
@@ -7530,6 +7762,170 @@ class Viewer:
         return True
 
 
+def read_key(fd: int) -> "str | tuple | None":
+    """Read one keypress from `fd`: a plain character, a named key
+    (decode_csi_key()/read_ss3_key() - "UP", "F1", ...; "ESC-v" for
+    Meta-v, "backward one window"), or ("MOUSE", kind, col, row) for an
+    SGR mouse event (see decode_sgr_mouse()). "" for an escape sequence
+    nothing here recognizes, None once the input is gone for good."""
+    key = read_utf8_char(fd)
+    if key != "\x1b":
+        return key
+    # Possibly ESC-v, an SS3 sequence (F1), or a CSI one (arrow/Home/
+    # End/PageUp/PageDown, plain or Shift-ed; F1 on some terminals; a
+    # mouse event) - or just a lone Esc, if nothing follows it quickly.
+    r, _, _ = select.select([fd], [], [], 0.1)
+    if not r:
+        return key
+    nxt = os.read(fd, 1)
+    if nxt == b"v":
+        return "ESC-v"
+    if nxt == b"O":
+        return read_ss3_key(fd) or ""
+    if nxt == b"[":
+        seq = read_csi_sequence(fd)
+        mouse = decode_sgr_mouse(seq) if seq else None
+        if mouse:
+            return ("MOUSE", *mouse)
+        return decode_csi_key(seq) or ""
+    return key
+
+
+class _LineEditor:
+    """The search prompt's one line of input after "/" or "?": typed
+    characters go in at the cursor, with readline's own bindings for
+    moving and deleting - ^B/^F/LEFT/RIGHT move the cursor, ^A/^E/HOME/
+    END jump it to the start/end, backspace and ^D/DEL delete before/
+    under it, and ^U/^K kill from it to the start/end (DEL is the one
+    exception to readline, added for the plain Delete key on keyboards
+    without an easy ^D). Enter submits, Esc/^C cancel, and so does
+    backspace on an already-empty line. Every other key is swallowed, so
+    nothing leaks through as a page command while the prompt is up."""
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.cursor = 0  # index into text the next edit applies at
+
+    def handle(self, key: str) -> "str | None":
+        """Apply `key`: returns "submit", "cancel", "changed" (redraw the
+        prompt), or None if it did nothing."""
+        text, cursor = self.text, self.cursor
+        if key in ("\r", "\n"):
+            return "submit"
+        if key in ("\x1b", "\x03"):
+            return "cancel"
+        if key in ("\x7f", "\x08"):
+            if cursor > 0:
+                text, cursor = text[:cursor - 1] + text[cursor:], cursor - 1
+            elif not text:
+                return "cancel"
+        elif key in ("\x02", "LEFT"):  # ^B
+            cursor = max(0, cursor - 1)
+        elif key in ("\x06", "RIGHT"):  # ^F
+            cursor = min(len(text), cursor + 1)
+        elif key in ("\x01", "HOME"):  # ^A: jump to the start
+            cursor = 0
+        elif key in ("\x05", "END"):  # ^E: jump to the end
+            cursor = len(text)
+        elif key in ("\x04", "DEL"):  # ^D / Delete: delete under the cursor
+            text = text[:cursor] + text[cursor + 1:]
+        elif key == "\x15":  # ^U: kill from the cursor to the start
+            text, cursor = text[cursor:], 0
+        elif key == "\x0b":  # ^K: kill from the cursor to the end
+            text = text[:cursor]
+        elif len(key) == 1 and key.isprintable():
+            text, cursor = text[:cursor] + key + text[cursor:], cursor + 1
+        if (text, cursor) == (self.text, self.cursor):
+            return None
+        self.text, self.cursor = text, cursor
+        return "changed"
+
+
+def _toggle_and_refresh(toggle):
+    """A _PREFIX_BINDINGS action: call Viewer method `toggle`, then redraw."""
+    def action(viewer):
+        toggle(viewer)
+        viewer.refresh()
+    return action
+
+
+# The keys that can follow a one-key prefix, each mapped to what it does
+# (an action returning False means quit). Any other key cancels quietly.
+# ":" is less(1)'s :n/:p (next/previous file - also on "}"/"{") and :q,
+# plus pdfless's own :h for the help screen (F1 is the primary way in).
+# "-" (text mode only - it's zoom-out in image mode) is less(1)'s own
+# runtime "-<option-letter>" toggle syntax, kept only for
+# -S/--chop-long-lines and -N/--line-numbers compatibility; "s"/"#"
+# alone are the primary keys for those.
+_PREFIX_BINDINGS = {
+    ":": {
+        "n": Viewer.next_file,
+        "p": Viewer.previous_file,
+        "h": Viewer.show_help,
+        "q": lambda viewer: False,
+    },
+    "-": {
+        "S": _toggle_and_refresh(Viewer.toggle_text_wrap),
+        "s": _toggle_and_refresh(Viewer.toggle_text_wrap),
+        "N": _toggle_and_refresh(Viewer.toggle_line_numbers),
+        "n": _toggle_and_refresh(Viewer.toggle_line_numbers),
+    },
+}
+
+
+def _enter_screen_seq(alt_screen: bool, mouse: bool) -> str:
+    """What to write to take over the terminal for the viewer: the
+    alternate screen (unless `alt_screen` is False - --keep's resume
+    after ^Z), a hidden cursor, alternate scroll and focus reporting, and
+    mouse reporting if `mouse` (image mode only - see MOUSE_ON)."""
+    return (
+        ("\x1b[?1049h" if alt_screen else "") + "\x1b[?25l"
+        + ALT_SCROLL_ON + FOCUS_ON + (MOUSE_ON if mouse else "")
+    )
+
+
+def _leave_screen_seq(alt_screen: bool) -> str:
+    """_enter_screen_seq() undone: every reporting mode off, the cursor
+    back, and the alternate screen left (unless `alt_screen` is False -
+    --keep, which leaves the last page on screen)."""
+    return (
+        MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h"
+        + ("\x1b[?1049l" if alt_screen else "")
+    )
+
+
+def _suspend(fd: int, old_termios, keep: bool, viewer: Viewer) -> None:
+    """^Z: suspend, like a normal shell job-control app would - raw mode
+    disables the tty's own ^Z-to-SIGTSTP translation (see RawTerminal),
+    so this does it by hand: give the terminal back and cooked-mode the
+    tty before actually stopping, then reverse all of that once `fg`
+    resumes us. --keep leaves the alternate screen buffer alone, so the
+    page stays on screen while suspended (the same trick main() uses to
+    leave it up after quitting); otherwise the shell prompt lands on the
+    real scrollback."""
+    sys.stdout.write(_leave_screen_seq(alt_screen=not keep))
+    sys.stdout.flush()
+    termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
+    # SIGSTOP rather than SIGTSTP: the cleanup above already does
+    # everything SIGTSTP's catchability would be for, so there's no
+    # downside to using the one stop signal that's guaranteed to actually
+    # stop the process - it can't be caught, blocked, or ignored, unlike
+    # SIGTSTP (which, at least on some setups, can silently fail to stop
+    # it on the first try). Sent to the whole process group (pid 0), not
+    # just our own pid: when launched via `uv run --script` (its
+    # shebang), this process is a *child* of uv, which is what the shell
+    # actually sees as the foreground job - stopping only ourselves would
+    # leave uv running and still attached to the tty, so the shell would
+    # never notice anything stopped.
+    os.kill(0, signal.SIGSTOP)
+    # ... stopped here until `fg` sends SIGCONT ...
+    tty.setraw(fd)
+    sys.stdout.write(_enter_screen_seq(alt_screen=not keep, mouse=not viewer.text_mode))
+    sys.stdout.flush()
+    viewer.request_resize()  # the terminal may have been resized while
+    # stopped, and its contents are gone either way
+
+
 def run_viewer(
     files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
     border=True, wrap=True, eol_mark=True, line_numbers=False, scrollbar=True,
@@ -7569,10 +7965,7 @@ def run_viewer(
         # text mode where this file has one; run_viewer()'s own "t"/"T"
         # handling below keeps you there afterwards (see there).
         name = os.path.basename(viewer.path)
-        has_text = (
-            viewer.doc_handler.supports_text_mode()
-            and viewer.doc_handler.extract_text(viewer.page) is not None
-        )
+        has_text = viewer.can_enter_text_mode()
         if has_text:
             warning = f"{name}: this terminal doesn't support inline images (needs iTerm2/WezTerm) - showing text mode instead"
         else:
@@ -7634,8 +8027,7 @@ def run_viewer(
         # first file's dump-or-interactive question was still open.
         viewer.quit_if_one_screen = False
 
-    initial_mouse = MOUSE_OFF if viewer.text_mode else MOUSE_ON
-    sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON + FOCUS_ON)
+    sys.stdout.write(_enter_screen_seq(alt_screen=True, mouse=not viewer.text_mode))
     sys.stdout.flush()
     viewer.entered_alt_screen = True
 
@@ -7644,66 +8036,20 @@ def run_viewer(
 
     signal.signal(signal.SIGWINCH, on_winch)
 
+    # The run loop's own input state - at most one of these is active at
+    # a time: a number being typed in (a count for the next key - see
+    # Viewer.handle_count_key()), a one-key prefix awaiting its second
+    # key (see _PREFIX_BINDINGS), or a search query being typed.
     num_buf = ""
-    search_buf = None  # None: not typing; otherwise the query in progress
-    search_cursor = 0  # index into search_buf the next inserted/deleted
-    # character applies at - only meaningful while search_buf is not None
-    search_backward = False  # whether that query was opened with "?" (not "/")
+    pending_prefix = None  # ":" or "-", or None
+    search_editor = None  # a _LineEditor while the "/"/"?" prompt is up
+    search_backward = False  # whether that prompt was opened with "?"
     last_search_query = None  # remembered across searches, for a bare "/"/"?"
-    colon_pending = False  # True right after ":", awaiting n/p/h
-    dash_pending = False  # True right after "-" in text mode, awaiting "S"
-
-    last_follow_path = viewer.path
-    try:
-        last_mtime = os.path.getmtime(last_follow_path) if follow else None
-    except OSError:
-        last_mtime = None
-    last_follow_check = time.monotonic()
-
-    def start_following():
-        """(Re)start follow's mtime tracking from the current file/time -
-        shared by "F" turning follow on and "O"/"v" doing the same as a
-        side effect of handing the file to an external app. Otherwise a
-        change that happened while follow was off (a stale last_mtime)
-        would trigger an immediate reload the moment it's turned on."""
-        nonlocal last_follow_path, last_mtime, last_follow_check
-        last_follow_path = viewer.path
-        try:
-            last_mtime = os.path.getmtime(last_follow_path)
-        except OSError:
-            last_mtime = None
-        last_follow_check = time.monotonic()
 
     viewer.refresh()
     while True:
         r, _, _ = select.select([fd], [], [], 0.3)
-
-        if follow and viewer.path != last_follow_path:
-            # :n/:p switched to a different file - start tracking that
-            # one instead, rather than comparing its mtime against
-            # whatever the previous file's was.
-            last_follow_path = viewer.path
-            try:
-                last_mtime = os.path.getmtime(last_follow_path)
-            except OSError:
-                last_mtime = None
-            last_follow_check = time.monotonic()
-        elif follow and time.monotonic() - last_follow_check >= FOLLOW_INTERVAL:
-            last_follow_check = time.monotonic()
-            try:
-                mtime = os.path.getmtime(last_follow_path)
-            except OSError:
-                mtime = None  # e.g. mid save-as-replace; try again next tick
-            if mtime is not None and mtime != last_mtime:
-                last_mtime = mtime
-                try:
-                    viewer.reload()
-                except Exception:
-                    # The file may have been mid-write when we noticed the
-                    # mtime change (e.g. pdftoppm/pdfinfo saw a truncated
-                    # file); keep showing the last good render and pick
-                    # up the change on a later, now-complete write.
-                    pass
+        viewer.poll_follow()
 
         if viewer.resized:
             viewer.refresh()
@@ -7711,367 +8057,85 @@ def run_viewer(
         if not r:
             # Nothing waiting - a good moment to act on a scrollbar drag
             # whose motion events stopped without a release arriving
-            # (see the MOUSE_DRAG handling below); a no-op otherwise.
+            # (see Viewer.handle_mouse()); a no-op otherwise.
             viewer.flush_scrollbar_drag()
             continue
-        key = read_utf8_char(fd)
+        key = read_key(fd)
         if key is None:
             break
-        if key == "\x1b":
-            # Possibly ESC-v (Meta-v, "backward one window"), an SS3
-            # sequence (F1), or a CSI one (arrow/Home/End/PageUp/
-            # PageDown, plain or Shift-ed; F1 on some terminals).
-            r2, _, _ = select.select([fd], [], [], 0.1)
-            if r2:
-                nxt = os.read(fd, 1)
-                if nxt == b"v":
-                    key = "ESC-v"
-                elif nxt == b"O":
-                    key = read_ss3_key(fd) or ""
-                elif nxt == b"[":
-                    seq = read_csi_sequence(fd)
-                    mouse = decode_sgr_mouse(seq) if seq else None
-                    if mouse:
-                        kind, mcol, mrow = mouse
-                        if search_buf is None:
-                            if viewer.help_active:
-                                if kind == "MOUSE_WHEEL_UP":
-                                    viewer.scroll_help(-1)
-                                elif kind == "MOUSE_WHEEL_DOWN":
-                                    viewer.scroll_help(1)
-                            elif kind == "MOUSE_CLICK":
-                                viewer.handle_click(mcol, mrow)
-                            elif kind == "MOUSE_DRAG":
-                                if viewer.handle_drag(mrow):
-                                    # A drag arrives as a burst of motion
-                                    # events, and acting on one costs a
-                                    # page rasterize - so let the burst
-                                    # drain first and only act on where
-                                    # the pointer actually ended up.
-                                    ready, _, _ = select.select([fd], [], [], 0)
-                                    if not ready:
-                                        viewer.flush_scrollbar_drag()
-                            elif kind == "MOUSE_RELEASE":
-                                viewer.end_scrollbar_drag()
-                            elif kind == "MOUSE_WHEEL_UP":
-                                viewer.handle_wheel(-1)
-                            elif kind == "MOUSE_WHEEL_DOWN":
-                                viewer.handle_wheel(1)
-                            elif kind == "MOUSE_BACK":
-                                viewer.go_back()
-                            elif kind == "MOUSE_FORWARD":
-                                viewer.go_forward()
-                        continue
-                    key = decode_csi_key(seq) or ""
-
-        if key == "\x1a":
-            # ^Z: suspend, like a normal shell job-control app would -
-            # raw mode disables the tty's own ^Z-to-SIGTSTP translation
-            # (see RawTerminal), so this does it by hand: leave the
-            # mouse modes and cooked-mode the tty before actually
-            # stopping, then reverse all of that once `fg` resumes us.
-            # Takes priority over everything else (even typing a search
-            # query), same as a real terminal's ^Z would.
-            #
-            # --keep leaves the alternate screen buffer alone (no
-            # \x1b[?1049l) so the page stays on screen while suspended,
-            # the same trick main() uses to leave it up after quitting;
-            # otherwise leave the alternate screen like normal, so the
-            # shell prompt lands on the real scrollback instead.
-            leave_screen = "" if keep else "\x1b[?1049l"
-            sys.stdout.write(MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h" + leave_screen)
-            sys.stdout.flush()
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
-            # SIGSTOP rather than SIGTSTP: the cleanup above already does
-            # everything SIGTSTP's catchability would be for, so there's
-            # no downside to using the one stop signal that's guaranteed
-            # to actually stop the process - it can't be caught, blocked,
-            # or ignored, unlike SIGTSTP (which, at least on some
-            # setups, can silently fail to stop it on the first try).
-            # Sent to the whole process group (pid 0), not just our own
-            # pid: when launched via `uv run --script` (its shebang),
-            # this process is a *child* of uv, which is what the shell
-            # actually sees as the foreground job - stopping only
-            # ourselves would leave uv running and still attached to the
-            # tty, so the shell would never notice anything stopped.
-            os.kill(0, signal.SIGSTOP)
-            # ... stopped here until `fg` sends SIGCONT ...
-            tty.setraw(fd)
-            enter_screen = "" if keep else "\x1b[?1049h"
-            sys.stdout.write(
-                enter_screen + "\x1b[?25l" + ALT_SCROLL_ON + FOCUS_ON
-                + ("" if viewer.text_mode else MOUSE_ON)
-            )
-            sys.stdout.flush()
-            viewer.request_resize()  # the terminal may have been resized
-            # while stopped, and its contents are gone either way
+        if isinstance(key, tuple):  # ("MOUSE", kind, col, row)
+            if search_editor is None:
+                viewer.handle_mouse(*key[1:])
             continue
 
-        if search_buf is not None:
-            # Typing a search pattern after "/" or "?": collect
-            # characters until Enter confirms it, Esc/^C cancels,
-            # backspace edits it (or also cancels, if the pattern is
-            # already empty), ^B/^F/LEFT/RIGHT move search_cursor within
-            # it, ^A/^E/HOME/END jump it to the start/end, ^D/DEL delete
-            # the character under search_cursor, and ^U/^K kill from
-            # search_cursor to the start/end - readline's own bindings
-            # for these (DEL is the one exception, added for the plain
-            # Delete key on keyboards without an easy ^D). Every other
-            # key is swallowed so it can't leak through as a page
-            # command while the prompt is up.
-            if key in ("\r", "\n"):
-                query = search_buf or last_search_query
-                search_buf = None
+        # The order of the checks from here on is what decides which
+        # meaning a key gets: ^Z beats everything (even typing a search
+        # query), a prompt or pending prefix swallows the next key
+        # whatever it is, and the help screen swallows every other key
+        # but its own.
+        if key == "\x1a":
+            _suspend(fd, old_termios, keep, viewer)
+            continue
+
+        if search_editor is not None:
+            outcome = search_editor.handle(key)
+            if outcome == "submit":
+                query = search_editor.text or last_search_query
+                search_editor = None
                 if query:
                     last_search_query = query
                     viewer.start_search(query, backward=search_backward)
                 else:
                     viewer.draw_status()
-            elif key in ("\x1b", "\x03"):
-                search_buf = None
+            elif outcome == "cancel":
+                search_editor = None
                 viewer.draw_status()
-            elif key in ("\x7f", "\x08"):
-                if search_cursor > 0:
-                    search_buf = search_buf[:search_cursor - 1] + search_buf[search_cursor:]
-                    search_cursor -= 1
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-                elif not search_buf:
-                    search_buf = None
-                    viewer.draw_status()
-            elif key in ("\x02", "LEFT"):  # ^B
-                if search_cursor > 0:
-                    search_cursor -= 1
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key in ("\x06", "RIGHT"):  # ^F
-                if search_cursor < len(search_buf):
-                    search_cursor += 1
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key in ("\x01", "HOME"):  # ^A: jump to the start
-                if search_cursor > 0:
-                    search_cursor = 0
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key in ("\x05", "END"):  # ^E: jump to the end
-                if search_cursor < len(search_buf):
-                    search_cursor = len(search_buf)
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key in ("\x04", "DEL"):  # ^D / Delete: delete the character under search_cursor
-                if search_cursor < len(search_buf):
-                    search_buf = search_buf[:search_cursor] + search_buf[search_cursor + 1:]
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key == "\x15":  # ^U: kill from search_cursor to the start
-                if search_cursor > 0:
-                    search_buf = search_buf[search_cursor:]
-                    search_cursor = 0
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key == "\x0b":  # ^K: kill from search_cursor to the end
-                if search_cursor < len(search_buf):
-                    search_buf = search_buf[:search_cursor]
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif len(key) == 1 and key.isprintable():
-                search_buf = search_buf[:search_cursor] + key + search_buf[search_cursor:]
-                search_cursor += 1
-                viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
+            elif outcome == "changed":
+                viewer.draw_search_prompt(
+                    search_editor.text, search_editor.cursor, backward=search_backward,
+                )
             continue
 
-        if colon_pending:
-            # ":" was just pressed - less(1)'s :n/:p, next/previous file
-            # (only meaningful with more than one file on the command
-            # line; harmless otherwise, since go_to_file() just reports
-            # there's nowhere to go - also bound to "{"/"}", a one-
-            # keystroke equivalent, see below), :q to quit, plus
-            # pdfless's own ":h" for the help screen. Any other key
-            # cancels quietly.
-            colon_pending = False
-            if key == "n":
-                viewer.next_file()
-            elif key == "p":
-                viewer.previous_file()
-            elif key == "h":
-                viewer.show_help()  # the spelt-out way in; F1 is primary
-            elif key == "q":
-                break  # less(1)'s ":q" - same as the plain "q" quit key
-            else:
+        if pending_prefix is not None:
+            action = _PREFIX_BINDINGS[pending_prefix].get(key)
+            pending_prefix = None
+            if action is None:
                 viewer.draw_status()
-            continue
-
-        if dash_pending:
-            # "-" was just pressed in text mode - less(1)'s own runtime
-            # "-<option-letter>" toggle syntax, kept only for
-            # -S/--chop-long-lines and -N/--line-numbers compatibility
-            # with less(1); "s"/"#" alone (see handle_key_text()) are the
-            # primary ways to toggle wrap/line-numbers. eol-mark and the
-            # border have no dash-toggle of their own - just "E"/"B".
-            # Any other key cancels quietly.
-            dash_pending = False
-            if key in ("S", "s"):
-                viewer.toggle_text_wrap()
-                viewer.refresh()
-            elif key in ("N", "n"):
-                viewer.toggle_line_numbers()
-                viewer.refresh()
-            else:
-                viewer.draw_status()
+            elif action(viewer) is False:
+                break
             continue
 
         if key == "\x03":
             break
 
         if viewer.help_active:
-            # While the help screen is up, only "q"/F1 and the scroll
-            # keys (for when KEY_TABLE is taller than the box) do
-            # anything. Everything else is swallowed so page keys can't
-            # leak through underneath it.
-            if key in ("q", "F1"):
-                viewer.hide_help()
-            elif key in FORWARD_LINE_KEYS:
-                viewer.scroll_help(1)
-            elif key in BACKWARD_LINE_KEYS:
-                viewer.scroll_help(-1)
-            elif key in FORWARD_WINDOW_KEYS:
-                viewer.scroll_help(max(1, viewer.rows - 3))
-            elif key in BACKWARD_WINDOW_KEYS:
-                viewer.scroll_help(-max(1, viewer.rows - 3))
+            viewer.handle_help_key(key)
             continue
 
-        if key == "\x0c":  # ^L: repaint the screen (e.g. after other
-            # output has garbled it), without otherwise changing anything
-            viewer.refresh()
+        if viewer.handle_global_key(key):
             continue
 
-        if key == "FOCUS_IN":
-            # Same fix as ^L, triggered automatically: see FOCUS_ON's
-            # comment for why a focus change (under tmux, especially)
-            # can otherwise leave this pane blank - and for why only
-            # this direction, not FOCUS_OUT, is safe to redraw on.
-            viewer.refresh()
-            continue
-        if key == "FOCUS_OUT":
-            continue
-
-        if key == "r":
-            # Applies in both image and text mode (see
-            # Viewer.toggle_scrollbar()), so handled here at the top
-            # level rather than inside handle_key()/handle_key_text().
-            viewer.toggle_scrollbar()
-            viewer.refresh()
-            continue
-
-        if key == "c":
-            # -c/--continuous toggled at runtime - applies to both image
-            # and text mode (see Viewer.toggle_continuous()), so handled
-            # here rather than inside handle_key()/handle_key_text().
-            viewer.toggle_continuous()
-            continue
-
-        if key == "F":
-            # Same -f/--follow behavior as the command-line flag, toggled
-            # at runtime; applies in both image and text mode, so handled
-            # here rather than inside handle_key()/handle_key_text().
-            follow = not follow
-            viewer.follow = follow
-            if follow:
-                start_following()
-            viewer.refresh()
-            continue
-
-        if key in ("O", "v"):
-            # Hand the current file off to macOS's own default app for
-            # it (Preview/Word/Excel/...), and switch follow mode on (if
-            # it wasn't already) so an edit made there comes back
-            # automatically - the same reload path -f/--follow and "F"
-            # already use. viewer.path is always the original file (see
-            # DocumentHandler.__init__/Viewer.path), never a temporary
-            # rendered PDF, so this opens the same thing the user
-            # pointed pdfless at in the first place, even for a
-            # soffice/Chrome-rendered format.
-            if not _open_in_default_app(viewer.path):
-                viewer.draw_status(
-                    "opening the file in its own app needs macOS"
-                    if sys.platform != "darwin" else f"couldn't open {viewer.path}"
-                )
-                continue
-            if not follow:
-                follow = True
-                viewer.follow = True
-                start_following()
-            viewer.refresh()
-            continue
-
-        if key == "F1":
-            # less(1) puts its help on "h"/"H", which pdfless can't -
-            # both are panning keys here (less has nothing to pan). "?"
-            # isn't free either, being less's backward search, so help
-            # lives on F1, with ":h" as a second way in for terminals
-            # that send something unexpected for F1.
-            viewer.show_help()
-            continue
-
-        if key == ":":
-            colon_pending = True
-            viewer.draw_status(":")
-            continue
-
-        if key == "-" and viewer.text_mode:
+        if key == ":" or (key == "-" and viewer.text_mode):
             # In image mode, "-" already means zoom out (see
-            # Viewer.handle_key()) - only text mode gets the
-            # less(1)-style "-S" toggle.
-            dash_pending = True
-            viewer.draw_status("-")
-            continue
-
-        if key == "t":
-            if viewer.doc_handler.starts_in_text_mode():
-                # Always-on text mode already - toggling would try to
-                # switch to an image view this kind doesn't have.
-                viewer.draw_status("this is already a plain text file")
-            elif viewer.text_mode and not iterm2_like():
-                # Already in text mode - possibly the run_viewer() startup
-                # fallback above put it there - and image mode wouldn't
-                # show anything on this terminal anyway (see there), so
-                # refuse to cross back rather than switching to a blank
-                # screen.
-                viewer.draw_status("image mode needs iTerm2/WezTerm - not supported on this terminal")
-            elif viewer.doc_handler.supports_text_mode():
-                if not viewer.toggle_text_mode():
-                    viewer.draw_status("no text could be extracted from this file")
-            else:
-                viewer.draw_status("text mode isn't available for this file type")
-            continue
-
-        if key == "T":
-            # t and C combined into one press/undo - see
-            # Viewer.toggle_clean_text_mode(). Same eligibility checks
-            # as "t" above; there's no separate image view to enter for
-            # a kind that's always in text mode, so this is a no-op
-            # there too.
-            if viewer.doc_handler.starts_in_text_mode():
-                viewer.draw_status("this is already a plain text file")
-            elif viewer.text_mode and not iterm2_like():
-                viewer.draw_status("image mode needs iTerm2/WezTerm - not supported on this terminal")
-            elif viewer.doc_handler.supports_text_mode():
-                if not viewer.toggle_clean_text_mode():
-                    viewer.draw_status("no text could be extracted from this file")
-            else:
-                viewer.draw_status("text mode isn't available for this file type")
+            # Viewer.handle_key()) - only text mode gets the less(1)-style
+            # "-S"/"-N" toggles.
+            pending_prefix = key
+            viewer.draw_status(key)
             continue
 
         if key in ("/", "?"):
             # less(1)'s pair: "/" searches forward from here, "?"
-            # backward. Either way the whole document is searched and
-            # N/P then walk every match - the direction only decides
-            # which match this search lands on first (see
-            # Viewer._match_index_from()).
-            #
-            # Search always works in text mode (there's always a flat
-            # list of lines to search, self.text_lines) regardless of
-            # what the underlying file kind otherwise supports in image
-            # mode (doc_handler.supports_search() - currently PDF only,
-            # via its own page/bbox index).
+            # backward. Either way the whole document is searched and N/P
+            # then walk every match - the direction only decides which
+            # match this search lands on first (see
+            # Viewer._match_index_from()). Search always works in text
+            # mode (there's always a flat list of lines to search)
+            # regardless of what the file kind supports in image mode
+            # (doc_handler.supports_search() - a real PDF's bbox index).
             if viewer.text_mode or viewer.doc_handler.supports_search():
-                search_buf = ""
-                search_cursor = 0
+                search_editor = _LineEditor()
                 search_backward = key == "?"
-                viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
+                viewer.draw_search_prompt("", 0, backward=search_backward)
             else:
                 viewer.draw_status("search isn't available for this file type")
             continue
@@ -8083,108 +8147,48 @@ def run_viewer(
             if key in ("p", "P"):
                 viewer.repeat_search(forward=False)
                 continue
+            if key in ("q", "\x1b"):
+                # With a search active, "q"/Esc dismiss it (removing the
+                # match box/highlight and its status line) rather than
+                # quitting pdfless outright - quit still works normally on
+                # a second press, once there's no longer a search to clear.
+                viewer.clear_search()
+                viewer.refresh()
+                continue
 
-        if key in ("q", "\x1b") and viewer.search_query is not None:
-            # With a search active, "q"/Esc dismiss it (removing the
-            # match box/highlight and its status line) rather than
-            # quitting pdfless outright - quit still works normally on
-            # a second press, once there's no longer a search to clear.
-            viewer.clear_search()
-            viewer.refresh()
-            continue
-
-        # A lone "0" (no pending page number) resets the zoom/pan instead
-        # of starting a number entry.
+        # A lone "0" (no pending number) resets the zoom/pan instead of
+        # starting a number entry.
         if key.isdigit() and not (key == "0" and not num_buf):
             num_buf += key
             viewer.draw_status(f"number: {num_buf}")
             continue
 
-        if key in ("g", "G") and num_buf:
-            # "<number>g"/"<number>G": in text mode, jump straight to
-            # that line of the current page's text (a new capability -
-            # there's no page-image equivalent of "line", so the count
-            # is simply ignored there and this falls through to plain
-            # g/G below: jump to the top/bottom of the current page).
+        count = int(num_buf) if num_buf else None
+        if key in ("g", "G") and count is not None:
+            # "<number>g"/"<number>G": in text mode, jump straight to that
+            # line of the current page's text. There's no page-image
+            # equivalent of "line", so in image mode the count is simply
+            # dropped and this falls through to plain g/G below (the top/
+            # bottom of the current page).
+            num_buf = ""
             if viewer.text_mode:
-                viewer.go_to_text_line(int(num_buf))
-                num_buf = ""
+                viewer.go_to_text_line(count)
                 viewer.refresh()
                 continue
+        elif viewer.handle_count_key(key, count):
             num_buf = ""
-
-        if key in ("<", ">", "HOME", "END"):
-            # "<"/">" (HOME/END are aliases): jump to the first/last
-            # page of the whole document - "<number><" or "<number>>"
-            # jumps straight to that page instead, in either mode.
-            first = key in ("<", "HOME")
-            if num_buf:
-                target = int(num_buf)
-                num_buf = ""
-                if viewer.text_mode:
-                    viewer.go_to_page_text(target, 0)
-                else:
-                    viewer.go_page(target, 0)
-            elif viewer.text_mode:
-                if first:
-                    viewer.go_to_page_text(1, 0)
-                else:
-                    viewer.go_to_page_text(viewer.npages, None)
-            else:
-                if first:
-                    viewer.go_page(1, 0)
-                else:
-                    viewer.go_page(viewer.npages, None)
-            viewer.refresh()
-            continue
-
-        if key in ("{", "}"):
-            # One-keystroke equivalents of ":p"/":n" - mirroring "["/"]"
-            # (PDF link-history back/forward), the shifted key just above
-            # each on a US keyboard.
-            if key == "{":
-                viewer.previous_file()
-            else:
-                viewer.next_file()
-            continue
-
-        if key == "x":
-            # "x" jumps to the first file in the list; "<number>x" jumps
-            # straight to that file (1-based, matching "<number><"'s
-            # page numbering) - meaningful only with more than one file,
-            # but harmless otherwise (go_to_file() just reports there's
-            # nowhere to go).
-            target = int(num_buf) - 1 if num_buf else 0
-            num_buf = ""
-            viewer.go_to_file(target, "no such file")
-            continue
-
-        if key == "X":
-            # "X" jumps to the last file in the list, mirroring "x" for
-            # the first.
-            num_buf = ""
-            viewer.go_to_file(len(viewer.files) - 1, "no such file")
             continue
 
         if num_buf:
-            # Any other key cancels a pending page number.
+            # Any other key cancels a pending number.
             num_buf = ""
             viewer.draw_status()
 
         border_before = viewer.text_border
-        before = (
-            viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
-            viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers, viewer.scrollbar,
-        )
+        before = viewer._view_state()
         if not viewer.handle_key(key):
             break
-        after = (
-            viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
-            viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers, viewer.scrollbar,
-        )
-        if after != before:
+        if viewer._view_state() != before:
             viewer.refresh()
             if viewer.text_border != border_before and viewer.text_wrap:
                 # "B" toggled text_border, but _draw_text_wrapped() never
@@ -8516,13 +8520,11 @@ def main():
                         # status line and bring the cursor back so the
                         # shell prompt lands cleanly below the image.
                         sys.stdout.write(
-                            MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF
-                            + f"\x1b[{viewer.rows};1H\x1b[2K\x1b[?25h"
+                            _leave_screen_seq(alt_screen=False)
+                            + f"\x1b[{viewer.rows};1H\x1b[2K"
                         )
                     else:
-                        sys.stdout.write(
-                            MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h\x1b[?1049l"
-                        )
+                        sys.stdout.write(_leave_screen_seq(alt_screen=True))
                     sys.stdout.flush()
                 # else: the alternate screen was never entered (-F/--quit-
                 # if-one-screen's dump-and-quit path) - nothing to restore.
