@@ -336,3 +336,37 @@ def test_unpaginated_text_mode_is_a_single_page(sample_pdf, monkeypatch):
         assert viewer.text_scroll == viewer.text_scroll_min
         page_field = next(t for t, _c in viewer.status_segments() if t.startswith(" page"))
         assert page_field == " page 1/1 "
+
+
+def test_scrolling_reads_each_page_size_only_once(sample_pdf, monkeypatch):
+    """page_size_pt() is needed on every get_page_image() call, and the
+    continuous layout asks for every page on screen on every draw - each
+    page's size must come from pdfinfo just once, not once per scroll."""
+    reads = []
+    real_read = pdfless.PdfDocument._read_page_size_pt
+
+    def counting_read(self, page):
+        reads.append(page)
+        return real_read(self, page)
+
+    monkeypatch.setattr(pdfless.PdfDocument, "_read_page_size_pt", counting_read)
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf), monkeypatch)
+    for _ in range(3 * viewer.img.height // viewer.cell_h_px):
+        viewer.scroll_down(viewer.cell_h_px)
+        viewer.refresh()
+    assert viewer.page >= 3
+    assert sorted(reads) == sorted(set(reads))  # no page read twice
+
+    viewer.doc_handler.forget_page_sizes()  # what reload() does
+    viewer.refresh()
+    assert len(reads) > len(set(reads))  # re-read after the file changed
+
+
+def test_go_page_none_means_the_bottom_of_the_page(sample_pdf, monkeypatch):
+    """go_page(page, None) lands on the page's bottom by itself - never
+    leaving self.scroll as None for the caller to patch up."""
+    for continuous in (False, True):
+        viewer = make_viewer(pdfless.PdfDocument(sample_pdf), monkeypatch, continuous=continuous)
+        viewer.go_page(2, None)
+        assert viewer.page == 2
+        assert viewer.scroll == viewer.scroll_max > 0

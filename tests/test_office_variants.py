@@ -521,3 +521,16 @@ def test_svg_falls_back_to_plain_text_without_chrome(sample_svg, tmp_path, monke
     handler = classify(sample_svg, tmp_path)
     assert isinstance(handler, pdfless.TextDocument)
     assert not isinstance(handler, pdfless.SvgDocument)
+
+
+def test_find_chrome_never_picks_vivaldi_from_path(monkeypatch):
+    """Vivaldi's headless mode doesn't work, so it's excluded from
+    CHROME_CANDIDATES - and must not sneak back in via the PATH fallback
+    either, on a machine where it's the only Chromium-family browser."""
+    monkeypatch.setattr(pdfless, "CHROME_CANDIDATES", ())
+    monkeypatch.setattr(pdfless, "_default_browser_bundle_id", lambda: None)
+    monkeypatch.setattr(
+        pdfless.shutil, "which",
+        lambda name: "/usr/bin/" + name if name.startswith("vivaldi") else None,
+    )
+    assert pdfless.find_chrome() is None

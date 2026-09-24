@@ -626,8 +626,9 @@ def find_chrome():
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     for name in (
+        # No Vivaldi here either, for the same reason as in
+        # CHROME_CANDIDATES: its headless mode doesn't work.
         "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
-        "vivaldi", "vivaldi-stable",
     ):
         found = shutil.which(name)
         if found:
@@ -1094,7 +1095,10 @@ def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
         src_path = os.path.join(os.path.dirname(path), ref)
         if not os.path.isfile(src_path):
             return path, ref, None
-        prefix = os.path.join(tmpdir, f"qlimg-{hashlib.md5(src_path.encode()).hexdigest()[:12]}")
+        # surrogateescape, like every other path tag here: a filename
+        # that isn't valid UTF-8 would make a plain .encode() raise.
+        tag = hashlib.md5(src_path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        prefix = os.path.join(tmpdir, f"qlimg-{tag}")
         png_path = prefix + ".png"
 
         if ref.lower().endswith(".pdf"):
@@ -2236,6 +2240,9 @@ class PdfDocument(DocumentHandler):
         # pdfinfo/pdftoppm/pdftotext call against self.path (harmless,
         # as an extra -upw, even for a PDF that was never encrypted at
         # all, since it's None then and _password_args() omits it)
+        self._page_sizes = {}  # page -> (width_pt, height_pt), filled in
+        # by page_size_pt() one page at a time as pages are first needed,
+        # and cleared by forget_page_sizes() when the file changes
 
     @staticmethod
     def is_pdf_file(path):
@@ -2327,8 +2334,25 @@ class PdfDocument(DocumentHandler):
         self._ensure_unlocked()
         return self._pdf_page_count(self.path, self.password)
 
-    def page_size_pt(self, page):
-        """(width_pt, height_pt) for `page`."""
+    def page_size_pt(self, page: int) -> "tuple[float, float]":
+        """(width_pt, height_pt) for `page` - remembered after the first
+        ask, since get_page_image() needs it on every call (even a page-
+        cache hit, to know which cache key to look up) and -c/--continuous
+        asks for every page on screen on every single draw: without
+        this, each scroll step would run one pdfinfo per visible page,
+        twice over."""
+        size = self._page_sizes.get(page)
+        if size is None:
+            size = self._page_sizes[page] = self._read_page_size_pt(page)
+        return size
+
+    def forget_page_sizes(self) -> None:
+        """Drop page_size_pt()'s remembered sizes - for Viewer.reload(),
+        when the file changed on disk and its pages may have too."""
+        self._page_sizes.clear()
+
+    def _read_page_size_pt(self, page: int) -> "tuple[float, float]":
+        """page_size_pt()'s actual pdfinfo run, for one page."""
         out = run_subprocess(
             ["pdfinfo", *self._password_args(self.password), "-f", str(page), "-l", str(page), self.path],
             capture_output=True,
@@ -3300,8 +3324,13 @@ class OfficeDocument(DocumentHandler):
         script = _build_slide_measure_script(page_element_xpath)
         instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
         measure_path = os.path.join(os.path.dirname(html_path), "pdfless-slide-measure.html")
-        with open(measure_path, "w", encoding="utf-8") as f:
-            f.write(instrumented)
+        try:
+            with open(measure_path, "w", encoding="utf-8") as f:
+                f.write(instrumented)
+        except OSError:
+            # Same as _measure_content_height(): a failed measurement
+            # is just "couldn't measure" (None), not a crash.
+            return None
         try:
             r = run_subprocess(
                 [
@@ -3325,7 +3354,8 @@ class OfficeDocument(DocumentHandler):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return None
         finally:
-            os.unlink(measure_path)
+            if os.path.exists(measure_path):
+                os.unlink(measure_path)
 
         m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
         if not m:
@@ -6957,9 +6987,13 @@ class Viewer:
         sys.stdout.flush()
 
     def go_page(self, page, scroll):
+        """Show `page` in image mode: `scroll` is how far down into it
+        to start, or None for its bottom (scroll_max - valid only once
+        _load_page() has loaded it, which is why the caller can't just
+        pass self.scroll_max itself), the same as go_to_page_text()."""
         self.page = max(1, min(self.npages, page))
         self._load_page()
-        self.scroll = scroll
+        self.scroll = self.scroll_max if scroll is None else scroll
 
     def _pdf_source(self):
         """The PdfDocument to defer to for anything that only makes
@@ -7193,6 +7227,7 @@ class Viewer:
         any in-progress search is cleared too, since its match list may
         no longer correspond to anything in the new file."""
         if self.is_pdf:
+            self.doc_handler.forget_page_sizes()
             self.npages = self.doc_handler.page_count()
             self.page = max(1, min(self.npages, self.page))
         elif isinstance(self.doc_handler, OfficeDocument):
@@ -7466,7 +7501,6 @@ class Viewer:
             self.scroll = max(0, self.scroll - step)
         elif self.page > 1:
             self.go_page(self.page - 1, None)
-            self.scroll = self.scroll_max
 
     def handle_key_text(self, key):
         """Key handling while in text mode: page/line navigation plus
@@ -8199,7 +8233,6 @@ def run_viewer(
                     viewer.go_page(1, 0)
                 else:
                     viewer.go_page(viewer.npages, None)
-                    viewer.scroll = viewer.scroll_max
             viewer.refresh()
             continue
 
