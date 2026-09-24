@@ -2095,9 +2095,9 @@ class DocumentHandler:
 
     def page_count(self):
         """Number of pages, or None if unknown until the file is
-        actually rendered (only OfficeDocument - its page count isn't
-        known until Quick Look + Chrome have run; see
-        Viewer._ensure_office_pages())."""
+        actually rendered (only a RenderedDocument - its page count
+        isn't known until soffice/Quick Look/Chrome/WeasyPrint have run;
+        see Viewer._ensure_office_pages())."""
         raise NotImplementedError
 
     def extract_text(self, page):
@@ -2915,7 +2915,33 @@ class ImageDocument(DocumentHandler):
             return [_CONTROL_CHAR_RE.sub(_caret_notation, line) for line in lines]
 
 
-class TextDocument(DocumentHandler):
+class _RawTextView:
+    """Text mode as the file's own raw text, one flowing blob - shared
+    by TextDocument (that *is* the whole document) and MarkdownDocument
+    (its raw Markdown source, beside the rendered image view). Mixed in
+    ahead of the DocumentHandler base, so these win over its defaults
+    (and over RenderedDocument's PDF-delegating ones)."""
+
+    def extract_text(self, page):
+        return read_plain_text_lines(self.path)
+
+    def text_mode_is_paginated(self):
+        return False
+
+    def default_text_border(self, border_default):
+        # No real "page" boundary in a plain text file worth bordering,
+        # regardless of --no-border.
+        return False
+
+    def default_text_wrap(self, wrap_default):
+        # This *is* the actual file content being paged through (unlike
+        # a PDF's extracted text or an Office document's textutil
+        # dump), so it defaults to wrapping like less(1) itself does -
+        # unless -S/--chop-long-lines said otherwise.
+        return wrap_default
+
+
+class TextDocument(_RawTextView, DocumentHandler):
     kind = "text"
 
     @classmethod
@@ -2931,9 +2957,6 @@ class TextDocument(DocumentHandler):
     def page_count(self):
         return 1
 
-    def extract_text(self, page):
-        return read_plain_text_lines(self.path)
-
     def supports_text_mode(self):
         return True
 
@@ -2942,18 +2965,6 @@ class TextDocument(DocumentHandler):
 
     def starts_in_text_mode(self):
         return True
-
-    def default_text_border(self, border_default):
-        # No real "page" boundary in a plain text file worth bordering,
-        # regardless of --no-border.
-        return False
-
-    def default_text_wrap(self, wrap_default):
-        # This *is* the actual file content being paged through (unlike
-        # a PDF's extracted text or an Office document's textutil
-        # dump), so it defaults to wrapping like less(1) itself does -
-        # unless -S/--chop-long-lines said otherwise.
-        return wrap_default
 
 
 class RtfDocument(TextDocument):
@@ -2995,16 +3006,259 @@ class RtfDocument(TextDocument):
         return extract_office_text(self.path) or super().extract_text(page)
 
 
-class OfficeDocument(DocumentHandler):
-    """Anything this Mac's Quick Look generators can preview (Word,
-    Excel, PowerPoint, Keynote, Pages, ...) via qlmanage + a local
-    Chrome. page_count() is deliberately None - unknown until
-    build_pages() actually renders it (see
-    Viewer._ensure_office_pages()). The actual rendering
-    (_render_office_pages()) picks one of the ExcelWorkbook/SlideDeck/
-    FlowingText OfficeVariant strategies and delegates to it."""
+class RenderedDocument(DocumentHandler):
+    """A file that has to be rendered - into a real PDF, or a list of
+    page images - before it can be shown at all: OfficeDocument (Quick
+    Look/soffice/Chrome), SofficeOnlyDocument (soffice), SvgDocument
+    (Chrome) and MarkdownDocument (WeasyPrint). What they share is the
+    lazy rendering itself - page_count() is None, since the page count
+    isn't known until build_pages() has actually run (see
+    Viewer._ensure_office_pages()) - and, once a render produced a real
+    PDF, a PdfDocument delegate that page images, text and search all go
+    through. Each subclass supplies only how to render (_renderer()) and
+    how to cache it (_cache_key_suffix()) - see build_pages()."""
 
     kind = "office"
+
+    OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
+    OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.pages = None  # [png_path, ...] once rendered - see
+        # build_pages()/ensure_pages(); None until the first render.
+        self._pdf_delegate = None  # a PdfDocument wrapping a real,
+        # print-to-pdf-rendered PDF, when FlowingText managed one (see
+        # _render_office_pages()) - get_page_image() forwards to it
+        # instead of treating self.pages as a list of PNGs, so these
+        # pages stay crisp at any zoom the same way a real PDF does.
+        # self.pages is still set (to a same-length placeholder list)
+        # in that case, purely so len(self.pages) keeps working for
+        # Viewer._ensure_office_pages()/reload().
+
+    def _render_error_placeholder(self, tmpdir, message):
+        """A single-page fallback for when _render_office_pages()
+        succeeds at sniff()/_probe_preview() time (qlmanage has a
+        generator for this file) but then fails for real later (e.g.
+        Chrome crashes or times out on this particular render) -
+        rendering happening lazily, on first display rather than
+        upfront, means a failure here can't just fall back to skipping
+        the file the way main() does for one that never looked
+        previewable in the first place. Returns a one-item list of PNG
+        paths, the same shape _render_office_pages() itself returns on
+        success, so callers don't need to special-case this."""
+        from PIL import ImageDraw
+
+        img = Image.new("RGB", (900, 200), "white")
+        draw = ImageDraw.Draw(img)
+        draw.text((20, 20), f"could not render {os.path.basename(self.path)}", fill="black")
+        draw.text((20, 50), message, fill="black")
+        out_path = os.path.join(
+            tmpdir,
+            f"office-error-{hashlib.md5(self.path.encode('utf-8', 'surrogateescape')).hexdigest()[:12]}.png",
+        )
+        img.save(out_path)
+        return [out_path]
+
+    def page_count(self):
+        return None
+
+    # What -d/--debug reports when build_pages() is served from the
+    # persistent cache - each subclass names what that let it skip.
+    _CACHE_HIT_NOTE = "reusing cached render, skipped rendering"
+
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        """build_pages()'s actual render, as a zero-argument callable
+        returning _remember_pages()'s input - a ("pdf", pdf_path, npages)
+        tuple or a list of per-page image paths, or None on failure - or
+        None if there's no point even trying. Every subclass has its own."""
+        raise NotImplementedError
+
+    def _cache_key_suffix(self, render_scale):
+        """build_pages()'s persistent-cache key suffix (see
+        _cached_render_dir()), or None for no persistent caching. By
+        default "": a real PDF is re-rasterized at whatever scale the
+        view needs, so one rendering serves every -s/--rendering-scale."""
+        return ""
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None,
+    ):
+        """Render fresh - always, regardless of self.pages - remembering
+        the result for _source_for_page() and any later ensure_pages()
+        call. Used directly by Viewer.reload() (which always wants a
+        fresh render, since the file changed on disk); see
+        ensure_pages() for the memoized entry point everything else
+        wants instead.
+
+        The same steps for every subclass, which only supply what
+        differs: _renderer() (the actual render, as a zero-argument
+        callable, or None if it can't even be attempted) and
+        _cache_key_suffix() (how the persistent cache - see
+        _render_result_cached() - tells apart renderings of the same
+        file, or None to skip that cache altogether). The whole render
+        is wrapped in one cache check, so a hit skips all of it -
+        qlmanage, soffice and Chrome alike."""
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        render = self._renderer(tmpdir, debug, render_scale, progress)
+        if render is None:
+            return None
+        key_suffix = self._cache_key_suffix(render_scale)
+        if key_suffix is None:
+            result = render()
+        else:
+            result, from_cache = _render_result_cached(self.path, render, key_suffix=key_suffix)
+            if debug and result is not None and from_cache:
+                _debug_log(f"{os.path.basename(self.path)}: {self._CACHE_HIT_NOTE}")
+        return self._remember_pages(result)
+
+    def _remember_pages(self, pages):
+        """Normalize and remember whatever build_pages()'s underlying
+        rendering produced - either a ("pdf", pdf_path, npages) tuple
+        (FlowingText's own PDF path, or soffice - see
+        _try_soffice_pages()) or a plain list of per-page PNG paths -
+        into self.pages/self._pdf_delegate, and return the same
+        same-length list of paths every caller of build_pages()/
+        ensure_pages() (which only ever does len(pages)) already
+        expects."""
+        if pages:
+            if isinstance(pages, tuple) and pages[0] == "pdf":
+                # A real PDF (Chrome's --print-to-pdf or soffice) -
+                # wrap it as a PdfDocument delegate (see
+                # get_page_image()) and normalize back to a
+                # same-length list of paths.
+                _, pdf_path, npages = pages
+                self._pdf_delegate = PdfDocument(pdf_path)
+                pages = [pdf_path] * npages
+            else:
+                self._pdf_delegate = None
+            self.pages = pages
+        return pages
+
+    def _try_soffice_pages(self, path, tmpdir, debug, progress):
+        """Render `path` to a real PDF via LibreOffice's `soffice
+        --convert-to pdf` (see _convert_via_soffice() for why
+        --headless is never used) - the mechanism _soffice_pages_if_eligible()
+        decides whether to even attempt. Preferred over the qlmanage/
+        Chrome pipeline when available - soffice paginates natively
+        (real page breaks/slide boundaries matching the original
+        document) and needs no embedded-picture workaround (see
+        _rasterize_broken_img_sources()) at all.
+
+        A pure, uncached render - persistent caching (see
+        _render_result_cached()) is handled by this method's own
+        callers (_render_office_pages(), and RtfOfficeDocument.
+        build_pages()'s own direct attempt against the original .rtf),
+        each wrapping their *entire* qlmanage-preview-generation-and-
+        all pipeline in one cache check, not just this one step -
+        caching only this step would still pay for qlmanage/measuring
+        on every soffice-eligible file's cache hit, for no reason (this
+        step, when eligible, always pre-empts qlmanage entirely anyway).
+
+        Returns the same ("pdf", pdf_path, npages) tuple shape
+        FlowingText._build_pdf_pages() already produces, or None if
+        soffice isn't installed or the conversion/page-count reading
+        failed for any reason - callers always fall back to the
+        existing qlmanage/Chrome pipeline in that case."""
+        name = os.path.basename(path)
+        progress.update(f"{name}: looking for LibreOffice...")
+        soffice = find_soffice()
+        if soffice is None:
+            return None
+        if debug:
+            _debug_log(f"{name}: using soffice: {soffice}")
+        label = f"{name}: converting via LibreOffice"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            out_pdf = _convert_via_soffice(soffice, path, tmpdir, debug=debug)
+        if out_pdf is None:
+            return None
+        return _pdf_render_result(out_pdf)
+
+    def ensure_pages(self, tmpdir, **kwargs):
+        """Render once and reuse afterward - a no-op on every call after
+        the first (see Viewer._ensure_office_pages(), which only needs
+        this once per file no matter how many times it's revisited)."""
+        if self.pages is None:
+            self.build_pages(tmpdir, **kwargs)
+        return self.pages
+
+    def extract_text(self, page):
+        if self._pdf_delegate is not None:
+            # A real PDF page (soffice or Chrome's --print-to-pdf) -
+            # use its own per-page text (pdftotext -layout), so page
+            # breaks - lost once extract_office_text()'s textutil
+            # flattens the whole document into one blob - come through
+            # correctly (see also text_mode_is_paginated()).
+            return self._pdf_delegate.extract_text(page)
+        # textutil (see extract_office_text()) has no notion of pages -
+        # the whole document, or None for a format it can't handle at
+        # all (a spreadsheet or slide deck).
+        return extract_office_text(self.path)
+
+    def extract_text_pages(self, npages: int) -> "list[list[str]] | None":
+        if self._pdf_delegate is not None:
+            # One pdftotext run over the rendered PDF, not one per page.
+            return self._pdf_delegate.extract_text_pages(npages)
+        return super().extract_text_pages(npages)
+
+    def supports_text_mode(self):
+        return True
+
+    def supports_search(self):
+        # Real per-page/bbox search (build_search_index()/
+        # find_search_matches() below) only works against a real PDF -
+        # a screenshot-based OfficeVariant (always true for Excel/
+        # Keynote/Pages/Numbers; for Word/RTF/PowerPoint, only when
+        # neither soffice nor Chrome's --print-to-pdf could be used)
+        # has no such index to search.
+        return self._pdf_delegate is not None
+
+    def text_mode_is_paginated(self):
+        return self._pdf_delegate is not None
+
+    def build_search_index(self):
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.build_search_index()
+        return None
+
+    def find_search_matches(self, index, query):
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.find_search_matches(index, query)
+        return []
+
+    def _source_for_page(self, cache, page):
+        # One pre-rendered PNG per page (see OfficeDocument._render_office_pages()) -
+        # unlike ImageDocument, there's no single fixed path, so this
+        # reads self.pages (kept in sync by build_pages()/
+        # ensure_pages()) rather than a path fixed at construction time.
+        # Only reached when self._pdf_delegate is None - get_page_image()
+        # (below) forwards to it directly otherwise, without ever
+        # calling this (self.pages holds a same-length placeholder list
+        # in that case, not real per-page paths - see
+        # _remember_pages()).
+        return self.pages[page - 1]
+
+    def get_page_image(self, cache, page, target_px, fit):
+        # A FlowingText document rendered to a real PDF instead of PNGs
+        # (see _remember_pages()) - re-rasterize it the same way a
+        # real PdfDocument would, at whatever DPI the current zoom
+        # needs, instead of resizing one fixed-resolution screenshot
+        # (the DocumentHandler default this falls back to otherwise).
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.get_page_image(cache, page, target_px, fit)
+        return super().get_page_image(cache, page, target_px, fit)
+
+
+class OfficeDocument(RenderedDocument):
+    """Anything this Mac's Quick Look generators can preview (Word,
+    Excel, PowerPoint, Keynote, Pages, ...) via qlmanage + a local
+    Chrome - or, for Word/RTF/PowerPoint, soffice when it's installed
+    (see _soffice_pages_if_eligible()). The actual rendering
+    (_render_office_pages()) picks one of the ExcelWorkbook/SlideDeck/
+    FlowingText OfficeVariant strategies and delegates to it; the lazy
+    rendering and PDF delegation around it come from RenderedDocument."""
 
     # Extensions where soffice's own --convert-to pdf pagination lands
     # on the same "page" boundary the qlmanage/Chrome pipeline already
@@ -3031,22 +3285,6 @@ class OfficeDocument(DocumentHandler):
     # upfront instead of committing to a soffice/qlmanage render that's
     # bound to fail uninformatively.
     _OOXML_ZIP_EXTENSIONS = (".docx", ".docm", ".pptx", ".pptm")
-
-    OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
-    OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
-
-    def __init__(self, path):
-        super().__init__(path)
-        self.pages = None  # [png_path, ...] once rendered - see
-        # build_pages()/ensure_pages(); None until the first render.
-        self._pdf_delegate = None  # a PdfDocument wrapping a real,
-        # print-to-pdf-rendered PDF, when FlowingText managed one (see
-        # _render_office_pages()) - get_page_image() forwards to it
-        # instead of treating self.pages as a list of PNGs, so these
-        # pages stay crisp at any zoom the same way a real PDF does.
-        # self.pages is still set (to a same-length placeholder list)
-        # in that case, purely so len(self.pages) keeps working for
-        # Viewer._ensure_office_pages()/reload().
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
@@ -3155,69 +3393,9 @@ class OfficeDocument(DocumentHandler):
             return False
         return OfficeDocument._generate_ql_preview(path, tmpdir, debug=debug) is not None
 
-    def _render_error_placeholder(self, tmpdir, message):
-        """A single-page fallback for when _render_office_pages()
-        succeeds at sniff()/_probe_preview() time (qlmanage has a
-        generator for this file) but then fails for real later (e.g.
-        Chrome crashes or times out on this particular render) -
-        rendering happening lazily, on first display rather than
-        upfront, means a failure here can't just fall back to skipping
-        the file the way main() does for one that never looked
-        previewable in the first place. Returns a one-item list of PNG
-        paths, the same shape _render_office_pages() itself returns on
-        success, so callers don't need to special-case this."""
-        from PIL import ImageDraw
-
-        img = Image.new("RGB", (900, 200), "white")
-        draw = ImageDraw.Draw(img)
-        draw.text((20, 20), f"could not render {os.path.basename(self.path)}", fill="black")
-        draw.text((20, 50), message, fill="black")
-        out_path = os.path.join(
-            tmpdir,
-            f"office-error-{hashlib.md5(self.path.encode('utf-8', 'surrogateescape')).hexdigest()[:12]}.png",
-        )
-        img.save(out_path)
-        return [out_path]
-
-    def page_count(self):
-        return None
-
     # What -d/--debug reports when build_pages() is served from the
     # persistent cache - each subclass names what that let it skip.
     _CACHE_HIT_NOTE = "reusing cached render, skipped qlmanage/soffice/Chrome"
-
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None,
-    ):
-        """Render fresh - always, regardless of self.pages - remembering
-        the result for _source_for_page() and any later ensure_pages()
-        call. Used directly by Viewer.reload() (which always wants a
-        fresh render, since the file changed on disk); see
-        ensure_pages() for the memoized entry point everything else
-        wants instead.
-
-        The same steps for every subclass, which only supply what
-        differs: _renderer() (the actual render, as a zero-argument
-        callable, or None if it can't even be attempted) and
-        _cache_key_suffix() (how the persistent cache - see
-        _render_result_cached() - tells apart renderings of the same
-        file, or None to skip that cache altogether). The whole render
-        is wrapped in one cache check, so a hit skips all of it -
-        qlmanage, soffice and Chrome alike."""
-        if progress is None:
-            progress = _ProgressLine(enabled=False)
-        render = self._renderer(tmpdir, debug, render_scale, progress)
-        if render is None:
-            return None
-        key_suffix = self._cache_key_suffix(render_scale)
-        if key_suffix is None:
-            result = render()
-        else:
-            result, from_cache = _render_result_cached(self.path, render, key_suffix=key_suffix)
-            if debug and result is not None and from_cache:
-                _debug_log(f"{os.path.basename(self.path)}: {self._CACHE_HIT_NOTE}")
-        return self._remember_pages(result)
 
     def _renderer(self, tmpdir, debug, render_scale, progress):
         """build_pages()'s actual render, as a zero-argument callable
@@ -3234,29 +3412,6 @@ class OfficeDocument(DocumentHandler):
         screenshot-sliced render bakes in -s/--rendering-scale's pixel
         resolution, so it's part of the key here."""
         return f":scale={render_scale}"
-
-    def _remember_pages(self, pages):
-        """Normalize and remember whatever build_pages()'s underlying
-        rendering produced - either a ("pdf", pdf_path, npages) tuple
-        (FlowingText's own PDF path, or soffice - see
-        _try_soffice_pages()) or a plain list of per-page PNG paths -
-        into self.pages/self._pdf_delegate, and return the same
-        same-length list of paths every caller of build_pages()/
-        ensure_pages() (which only ever does len(pages)) already
-        expects."""
-        if pages:
-            if isinstance(pages, tuple) and pages[0] == "pdf":
-                # A real PDF (Chrome's --print-to-pdf or soffice) -
-                # wrap it as a PdfDocument delegate (see
-                # get_page_image()) and normalize back to a
-                # same-length list of paths.
-                _, pdf_path, npages = pages
-                self._pdf_delegate = PdfDocument(pdf_path)
-                pages = [pdf_path] * npages
-            else:
-                self._pdf_delegate = None
-            self.pages = pages
-        return pages
 
     def _soffice_pages_if_eligible(self, path, tmpdir, debug, progress, continuous):
         """The one place that decides whether _try_soffice_pages() is
@@ -3279,45 +3434,6 @@ class OfficeDocument(DocumentHandler):
         if continuous or not path.lower().endswith(self._SOFFICE_EXTENSIONS):
             return None
         return self._try_soffice_pages(path, tmpdir, debug, progress)
-
-    def _try_soffice_pages(self, path, tmpdir, debug, progress):
-        """Render `path` to a real PDF via LibreOffice's `soffice
-        --convert-to pdf` (see _convert_via_soffice() for why
-        --headless is never used) - the mechanism _soffice_pages_if_eligible()
-        decides whether to even attempt. Preferred over the qlmanage/
-        Chrome pipeline when available - soffice paginates natively
-        (real page breaks/slide boundaries matching the original
-        document) and needs no embedded-picture workaround (see
-        _rasterize_broken_img_sources()) at all.
-
-        A pure, uncached render - persistent caching (see
-        _render_result_cached()) is handled by this method's own
-        callers (_render_office_pages(), and RtfOfficeDocument.
-        build_pages()'s own direct attempt against the original .rtf),
-        each wrapping their *entire* qlmanage-preview-generation-and-
-        all pipeline in one cache check, not just this one step -
-        caching only this step would still pay for qlmanage/measuring
-        on every soffice-eligible file's cache hit, for no reason (this
-        step, when eligible, always pre-empts qlmanage entirely anyway).
-
-        Returns the same ("pdf", pdf_path, npages) tuple shape
-        FlowingText._build_pdf_pages() already produces, or None if
-        soffice isn't installed or the conversion/page-count reading
-        failed for any reason - callers always fall back to the
-        existing qlmanage/Chrome pipeline in that case."""
-        name = os.path.basename(path)
-        progress.update(f"{name}: looking for LibreOffice...")
-        soffice = find_soffice()
-        if soffice is None:
-            return None
-        if debug:
-            _debug_log(f"{name}: using soffice: {soffice}")
-        label = f"{name}: converting via LibreOffice"
-        with _DebugTimer(debug, label), progress.spin(label + "..."):
-            out_pdf = _convert_via_soffice(soffice, path, tmpdir, debug=debug)
-        if out_pdf is None:
-            return None
-        return _pdf_render_result(out_pdf)
 
     def _measure_slide_offsets(self, chrome, html_path, page_element_xpath, width):
         """For a document whose Quick Look preview has distinct page/slide
@@ -3556,80 +3672,6 @@ class OfficeDocument(DocumentHandler):
 
         return render()
 
-    def ensure_pages(self, tmpdir, **kwargs):
-        """Render once and reuse afterward - a no-op on every call after
-        the first (see Viewer._ensure_office_pages(), which only needs
-        this once per file no matter how many times it's revisited)."""
-        if self.pages is None:
-            self.build_pages(tmpdir, **kwargs)
-        return self.pages
-
-    def extract_text(self, page):
-        if self._pdf_delegate is not None:
-            # A real PDF page (soffice or Chrome's --print-to-pdf) -
-            # use its own per-page text (pdftotext -layout), so page
-            # breaks - lost once extract_office_text()'s textutil
-            # flattens the whole document into one blob - come through
-            # correctly (see also text_mode_is_paginated()).
-            return self._pdf_delegate.extract_text(page)
-        # textutil (see extract_office_text()) has no notion of pages -
-        # the whole document, or None for a format it can't handle at
-        # all (a spreadsheet or slide deck).
-        return extract_office_text(self.path)
-
-    def extract_text_pages(self, npages: int) -> "list[list[str]] | None":
-        if self._pdf_delegate is not None:
-            # One pdftotext run over the rendered PDF, not one per page.
-            return self._pdf_delegate.extract_text_pages(npages)
-        return super().extract_text_pages(npages)
-
-    def supports_text_mode(self):
-        return True
-
-    def supports_search(self):
-        # Real per-page/bbox search (build_search_index()/
-        # find_search_matches() below) only works against a real PDF -
-        # a screenshot-based OfficeVariant (always true for Excel/
-        # Keynote/Pages/Numbers; for Word/RTF/PowerPoint, only when
-        # neither soffice nor Chrome's --print-to-pdf could be used)
-        # has no such index to search.
-        return self._pdf_delegate is not None
-
-    def text_mode_is_paginated(self):
-        return self._pdf_delegate is not None
-
-    def build_search_index(self):
-        if self._pdf_delegate is not None:
-            return self._pdf_delegate.build_search_index()
-        return None
-
-    def find_search_matches(self, index, query):
-        if self._pdf_delegate is not None:
-            return self._pdf_delegate.find_search_matches(index, query)
-        return []
-
-    def _source_for_page(self, cache, page):
-        # One pre-rendered PNG per page (see OfficeDocument._render_office_pages()) -
-        # unlike ImageDocument, there's no single fixed path, so this
-        # reads self.pages (kept in sync by build_pages()/
-        # ensure_pages()) rather than a path fixed at construction time.
-        # Only reached when self._pdf_delegate is None - get_page_image()
-        # (below) forwards to it directly otherwise, without ever
-        # calling this (self.pages holds a same-length placeholder list
-        # in that case, not real per-page paths - see
-        # _remember_pages()).
-        return self.pages[page - 1]
-
-    def get_page_image(self, cache, page, target_px, fit):
-        # A FlowingText document rendered to a real PDF instead of PNGs
-        # (see _remember_pages()) - re-rasterize it the same way a
-        # real PdfDocument would, at whatever DPI the current zoom
-        # needs, instead of resizing one fixed-resolution screenshot
-        # (the DocumentHandler default this falls back to otherwise).
-        if self._pdf_delegate is not None:
-            return self._pdf_delegate.get_page_image(cache, page, target_px, fit)
-        return super().get_page_image(cache, page, target_px, fit)
-
 
 class RtfOfficeDocument(OfficeDocument):
     """An RTF file, rendered as an image. Preferably via soffice
@@ -3726,7 +3768,7 @@ class RtfOfficeDocument(OfficeDocument):
         return render
 
 
-class SofficeOnlyDocument(OfficeDocument):
+class SofficeOnlyDocument(RenderedDocument):
     """Formats macOS Quick Look has no generator for at all - an ODF
     document, a Visio drawing, or a WMF vector metafile (confirmed by
     hand: qlmanage crashes outright on a real .odt, and produces no
@@ -3784,7 +3826,7 @@ class SofficeOnlyDocument(OfficeDocument):
         return ""  # a real PDF, re-rasterized at any scale on demand
 
 
-class SvgDocument(OfficeDocument):
+class SvgDocument(RenderedDocument):
     """A standalone SVG file, rendered to a real PDF via headless
     Chrome directly - no Quick Look or LibreOffice involved at all.
     Quick Look's own preview for an SVG is just a Preview.url redirect
@@ -3872,7 +3914,7 @@ class SvgDocument(OfficeDocument):
             f.write(html)
 
 
-class MarkdownDocument(OfficeDocument):
+class MarkdownDocument(_RawTextView, RenderedDocument):
     """A Markdown file, rendered to a real PDF via the `markdown` +
     `weasyprint` Python libraries (see _render_markdown_pdf() below) - no
     Quick Look, Chrome, or LibreOffice involved at all, and
@@ -4060,18 +4102,6 @@ img { max-width: 100%; height: auto; }
             return _pdf_render_result(out_pdf, ok)
 
         return render
-
-    def extract_text(self, page):
-        return read_plain_text_lines(self.path)
-
-    def text_mode_is_paginated(self):
-        return False
-
-    def default_text_border(self, border_default):
-        return False
-
-    def default_text_wrap(self, wrap_default):
-        return wrap_default
 
     def search_resets_on_text_mode_toggle(self):
         return True
@@ -4904,11 +4934,11 @@ class Viewer:
         self.path = handler.path
         self.name = os.path.basename(handler.path)
         self.doc_handler = handler
-        self.npages = handler.page_count()  # None for an OfficeDocument
+        self.npages = handler.page_count()  # None for a RenderedDocument
         # until _ensure_office_pages() below actually renders it
-        self._ensure_office_pages()  # a no-op unless doc_handler is an
-        # OfficeDocument, and sets self.npages for real in that case
-        # (memoized on the handler itself - see OfficeDocument.pages -
+        self._ensure_office_pages()  # a no-op unless doc_handler is a
+        # RenderedDocument, and sets self.npages for real in that case
+        # (memoized on the handler itself - see RenderedDocument.pages -
         # so a revisit to an already-rendered file is still cheap)
         self.cache = PageCache(self.tmpdir, handler)
         self._text_pages = None  # the previous file's text
@@ -4918,11 +4948,12 @@ class Viewer:
 
     def _ensure_office_pages(self):
         """With multiple files on the command line, an office-kind one
-        (Word/Excel/PowerPoint/etc. via Quick Look) is only actually
+        (a RenderedDocument - Word/Excel/PowerPoint/etc. via Quick Look,
+        ODF via soffice, SVG, Markdown) is only actually
         rendered the moment it's about to be displayed - not upfront for
         every such file regardless of whether it's ever looked at - so
         this is where that render happens, the first time doc_handler is
-        an OfficeDocument. A no-op every time after that (doc_handler.
+        a RenderedDocument. A no-op every time after that (doc_handler.
         ensure_pages() remembers its own result on the handler itself,
         the same as a file that's always been rendered up front would
         be) other than resetting self.npages, which is cheap.
@@ -4937,7 +4968,7 @@ class Viewer:
         without leaving anything for a subsequent dump to clean up - see
         Viewer.dump_and_quit() and run_viewer()'s own quit_if_one_screen
         handling, which resets this flag once the outcome is known."""
-        if not isinstance(self.doc_handler, OfficeDocument):
+        if not isinstance(self.doc_handler, RenderedDocument):
             return
         progress = (
             _ProgressLine(not self.debug) if self.quit_if_one_screen
@@ -7003,9 +7034,9 @@ class Viewer:
     def _pdf_source(self):
         """The PdfDocument to defer to for anything that only makes
         sense against a real PDF (page_size_pt(), build_link_index()) -
-        either self.doc_handler itself, or the PdfDocument an
-        OfficeDocument rendered to under the hood (see
-        OfficeDocument.get_page_image()'s _pdf_delegate - a plain
+        either self.doc_handler itself, or the PdfDocument a
+        RenderedDocument rendered to under the hood (see
+        RenderedDocument.get_page_image()'s _pdf_delegate - a plain
         <a href> in the original Word/RTF document survives
         Chrome's --print-to-pdf as a real PDF link annotation, so this
         lets it be treated exactly like a real PDF's hyperlinks
@@ -7234,7 +7265,7 @@ class Viewer:
             self.doc_handler.forget_page_sizes()
             self.npages = self.doc_handler.page_count()
             self.page = max(1, min(self.npages, self.page))
-        elif isinstance(self.doc_handler, OfficeDocument):
+        elif isinstance(self.doc_handler, RenderedDocument):
             # Unlike a PDF, an office-preview's pages are pre-rendered
             # PNGs on disk (see OfficeDocument._render_office_pages()) rather than
             # generated on demand - those need regenerating too, not
