@@ -25,8 +25,10 @@ Look generators can preview - Word, Excel, PowerPoint, Keynote, Pages,
 
 import argparse
 import base64
+import bisect
 import concurrent.futures
 import contextlib
+import dataclasses
 import fcntl
 import getpass
 import hashlib
@@ -65,7 +67,9 @@ Image.MAX_IMAGE_PIXELS = None
 __version__ = "1.1.0"
 
 STATUS_COLOR_ON = "\x1b[44;97m"  # white on blue - used for one-off messages
-STATUS_COLOR_OFF = "\x1b[0m"
+# Resets every SGR attribute (color, reverse video, ...) at once - how
+# every colored piece of output here ends, whatever set the color.
+SGR_RESET = "\x1b[0m"
 
 # The default status line is split into differently-colored fields so
 # filename/page/loc%/zoom% each stand out, with the trailing key-hints
@@ -82,25 +86,35 @@ STATUS_COLOR_HELP = "\x1b[100;37m"  # light grey on dark grey
 # Text-mode search match: no image to draw a box marker over there, so
 # the matched substring itself is highlighted with a background color.
 TEXT_HIGHLIGHT_COLOR = "\x1b[43;30m"  # black on yellow
-TEXT_HIGHLIGHT_RESET = "\x1b[0m"
 
 # PDF (image) mode search match: same yellow, as a foreground color for
 # the box-drawing border characters (there's no text to paint a
 # background behind, just the underlying page image).
 SEARCH_MARKER_COLOR = "\x1b[93m"  # bright yellow
-SEARCH_MARKER_RESET = "\x1b[0m"
 
 # Wrap mode (_draw_text_wrapped()): marks a real newline (the last
 # display row of a raw line) with U+21B5 (↵), distinct from a row that's
 # just a soft-wrap continuation of the same line.
 NEWLINE_MARKER = "↵"
 NEWLINE_MARKER_COLOR = "\x1b[34m"  # blue
-NEWLINE_MARKER_RESET = "\x1b[0m"
+EOL_MARK = NEWLINE_MARKER_COLOR + NEWLINE_MARKER + SGR_RESET  # ready to append
 
 # -N/--line-numbers: a right-aligned gutter at the start of each text-mode
 # row (see Viewer._line_number_gutter_width()).
 LINE_NUMBER_COLOR = "\x1b[90m"  # gray
-LINE_NUMBER_RESET = "\x1b[0m"
+
+# -c/--continuous: what fills the space between two stacked pages in
+# the page image (and beside a page narrower than the widest one on
+# screen) - a mid gray, like a PDF viewer's own continuous-scroll
+# backdrop, so a page's white edge stays visible against it on either
+# a dark or a light terminal theme. The text-mode equivalent is a
+# separator row drawn in PAGE_SEPARATOR_COLOR (see
+# Viewer._text_separator_rule()).
+CONTINUOUS_GAP_COLOR = (128, 128, 128)
+PAGE_SEPARATOR_COLOR = "\x1b[90m"  # gray
+# The "N/M" page number within that separator row - green, the same hue
+# as the status line's own page field, so it reads as the same thing.
+PAGE_NUMBER_COLOR = "\x1b[1;32m"  # bold green
 
 # The scrollbar's two kinds of cell, ready to write (see
 # Viewer._scrollbar_column()). The thumb is a reverse-video space
@@ -292,6 +306,8 @@ Keys:
                           the scrollbar and the line numbers at once,
                           and put back whatever was on before on a
                           second press
+  c                       toggle continuous view (pages one after
+                          another, instead of one page at a time)
   r                       toggle the scrollbar
   F                       toggle follow mode (auto-reload on file change)
                         <MISCELLANEOUS COMMANDS>
@@ -431,6 +447,18 @@ def _default_browser_bundle_id():
     return None
 
 
+def _debug_log(msg: str) -> None:
+    """Print one -d/--debug line to stderr ("pdfless: [debug] <msg>") -
+    the caller decides whether debug is on. end="\r\n", not the default
+    "\n": this runs while the terminal's in raw mode (office rendering
+    only ever happens from inside the interactive viewer - even a
+    first/only file is rendered lazily, from Viewer.__init__), where a
+    bare "\n" doesn't return the cursor to column 1 (that's OPOST's
+    job, and raw mode turns it off) - every line after the first would
+    print staggered one column further right than the last otherwise."""
+    print(f"pdfless: [debug] {msg}", file=sys.stderr, end="\r\n")
+
+
 class _DebugTimer:
     """Prints how long one stage of OfficeDocument._render_office_pages() took, when
     -d/--debug is on - e.g. "pdfless: [debug] slides.pptx: rendering:
@@ -448,18 +476,7 @@ class _DebugTimer:
 
     def __exit__(self, *exc):
         if self.debug:
-            # end="\r\n", not the default "\n": this prints while the
-            # terminal's in raw mode (OfficeDocument._render_office_pages() only ever
-            # runs from inside the interactive viewer now - even a
-            # first/only file is rendered lazily, from Viewer.__init__),
-            # where a bare "\n" doesn't return the cursor to column 1
-            # (that's OPOST's job, and raw mode turns it off) - every
-            # line after the first would print staggered one column
-            # further right than the last otherwise.
-            print(
-                f"pdfless: [debug] {self.label}: {time.monotonic() - self.t0:.2f}s",
-                file=sys.stderr, end="\r\n",
-            )
+            _debug_log(f"{self.label}: {time.monotonic() - self.t0:.2f}s")
 
 
 class _ProgressLine:
@@ -587,7 +604,7 @@ class _ViewerProgress:
         # self.cols afterward wouldn't touch any spill onto the row above.
         if self.enabled:
             sys.stdout.write(
-                f"\x1b[{self.viewer.rows};1H\x1b[2K{STATUS_COLOR_OFF}\x1b[?25l"
+                f"\x1b[{self.viewer.rows};1H\x1b[2K{SGR_RESET}\x1b[?25l"
             )
             sys.stdout.flush()
 
@@ -608,8 +625,9 @@ def find_chrome():
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     for name in (
+        # No Vivaldi here either, for the same reason as in
+        # CHROME_CANDIDATES: its headless mode doesn't work.
         "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
-        "vivaldi", "vivaldi-stable",
     ):
         found = shutil.which(name)
         if found:
@@ -663,18 +681,32 @@ _HEIGHT_ATTR_RE = re.compile(r'\bheight="([\d.]+)"', re.IGNORECASE)
 OFFICE_EMBEDDED_IMG_MAX_PX = 6000
 
 
+# pdfinfo's own output lines for the page count and a page's size -
+# shared by PdfDocument and the failure-tolerant helpers below. The size
+# line reads "Page size:" for a plain run and "Page    N size:" once
+# -f/-l ask for specific pages, hence the optional page number.
+_PDFINFO_PAGES_RE = re.compile(r"^Pages:\s+(\d+)", re.MULTILINE)
+_PDFINFO_SIZE_RE = re.compile(r"^Page\s*(?:\d+\s+)?size:\s+([\d.]+) x ([\d.]+)", re.MULTILINE)
+
+
+def _pdfinfo_safe(pdf_path: str) -> "str | None":
+    """pdfinfo's output for `pdf_path`, or None if it couldn't be run
+    (timed out, or not there at all) - for the helpers below, which
+    only ever read PDFs pdfless itself (or Quick Look) just produced."""
+    try:
+        return run_subprocess(
+            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
 def _pdf_page_size_pt_safe(pdf_path):
     """Like PdfDocument.page_size_pt(), but tolerant of failure (returns None
     rather than die()ing the whole program) - for sizing a picture
     embedded in a Quick Look preview, where a bad reading just means
     falling back to a default DPI rather than aborting entirely."""
-    try:
-        out = run_subprocess(
-            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
-        ).stdout
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    m = re.search(r"^Page\s*(?:\d+\s+)?size:\s+([\d.]+) x ([\d.]+)", out, re.MULTILINE)
+    m = _PDFINFO_SIZE_RE.search(_pdfinfo_safe(pdf_path) or "")
     return (float(m.group(1)), float(m.group(2))) if m else None
 
 
@@ -684,14 +716,21 @@ def _pdf_page_count_safe(pdf_path):
     back how many pages Chrome's --print-to-pdf produced (see
     FlowingText.build_pages()), where a bad reading just means falling
     back to the screenshot-based path rather than aborting entirely."""
-    try:
-        out = run_subprocess(
-            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
-        ).stdout
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
+    m = _PDFINFO_PAGES_RE.search(_pdfinfo_safe(pdf_path) or "")
     return int(m.group(1)) if m else None
+
+
+def _pdf_render_result(out_pdf: str, ok: bool = True) -> "tuple | None":
+    """The ("pdf", out_pdf, npages) result a PDF-producing renderer
+    (soffice, Chrome's --print-to-pdf, WeasyPrint) hands back, once it's
+    written `out_pdf` - or None, deleting whatever it left behind, if it
+    reported failure (`ok` False) or the file has no readable pages."""
+    npages = _pdf_page_count_safe(out_pdf) if ok else None
+    if not npages:
+        if os.path.exists(out_pdf):
+            os.unlink(out_pdf)
+        return None
+    return ("pdf", out_pdf, npages)
 
 
 OFFICE_CACHE_MAX_ENTRIES = 50  # persistent rendered-pages cache (see
@@ -762,8 +801,9 @@ def _cached_render_dir(path, key_suffix=""):
     on every edit - see _render_result_cached() for how staleness
     against the current file is actually detected. `key_suffix`, if
     given, distinguishes multiple different possible renderings of the
-    very same file: -c/--continuous (a real-PDF result differs - one
-    oversized page vs. paginated normally) and -s/--rendering-scale (a
+    very same file: the internal continuous=True rendering (a real-PDF
+    result differs - one oversized page vs. paginated normally) and
+    -s/--rendering-scale (a
     screenshot-sliced result bakes in a fixed pixel resolution, unlike
     a real-PDF one, always re-rasterized on demand at whatever the
     current zoom needs) - caching one under a key the other could also
@@ -949,7 +989,7 @@ def _convert_via_soffice(soffice, path, tmpdir, timeout=60, debug=False):
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         if debug:
-            print(f"pdfless: [debug] {name}: soffice failed to run: {e}", file=sys.stderr, end="\r\n")
+            _debug_log(f"{name}: soffice failed to run: {e}")
         return None
     base = os.path.splitext(os.path.basename(path))[0]
     out_pdf = os.path.join(tmpdir, f"{base}.pdf")
@@ -962,10 +1002,9 @@ def _convert_via_soffice(soffice, path, tmpdir, timeout=60, debug=False):
         # sign is stderr/stdout text and no output file, so both are
         # worth showing here rather than just silently returning None.
         detail = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()
-        print(
-            f"pdfless: [debug] {name}: soffice produced no output"
-            + (f" - {detail.splitlines()[0]}" if detail else ""),
-            file=sys.stderr, end="\r\n",
+        _debug_log(
+            f"{name}: soffice produced no output"
+            + (f" - {detail.splitlines()[0]}" if detail else "")
         )
     return None
 
@@ -1075,7 +1114,10 @@ def _rasterize_broken_img_sources(html_path, tmpdir, on_progress=None):
         src_path = os.path.join(os.path.dirname(path), ref)
         if not os.path.isfile(src_path):
             return path, ref, None
-        prefix = os.path.join(tmpdir, f"qlimg-{hashlib.md5(src_path.encode()).hexdigest()[:12]}")
+        # surrogateescape, like every other path tag here: a filename
+        # that isn't valid UTF-8 would make a plain .encode() raise.
+        tag = hashlib.md5(src_path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        prefix = os.path.join(tmpdir, f"qlimg-{tag}")
         png_path = prefix + ".png"
 
         if ref.lower().endswith(".pdf"):
@@ -1416,6 +1458,59 @@ def _detect_fallback_page_xpath(content):
     return "/html/body/div" if matching >= len(top_divs) * 0.9 else None
 
 
+def _read_html(path: str) -> "str | None":
+    """`path`'s contents for the measure helpers below - decoding errors
+    replaced rather than raised - or None if it can't be read at all."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _chrome_dump_title(chrome: str, html_path: str, content: str, script: str,
+                       scratch_name: str, width: "int | None" = None,
+                       timeout: int = 30) -> "str | None":
+    """The measuring technique every _measure_*() helper shares: inject
+    `script` (a <script> that leaves its answer in document.title) just
+    before `content`'s </body> - `content` being html_path's own HTML,
+    already read by the caller - write that to a scratch copy named
+    `scratch_name` next to html_path (so relative references still
+    resolve), load it in headless Chrome with --dump-dom, and return the
+    text of the dumped <title> (still HTML-escaped), or None on any
+    failure. Always cleans up the scratch copy.
+
+    `width`, if given, sets the viewport width (layout can depend on
+    it - see OfficeDocument._measure_slide_offsets()); the height is an
+    arbitrary 1080, since dump-dom doesn't render anything, just loads
+    and serializes the DOM at that viewport size. The 8s virtual time
+    budget is an upper bound on how long a script may wait (e.g. for
+    every <img> to finish decoding) before Chrome gives up and dumps
+    whatever it's got - it only matters as a cap, since a script that
+    finishes sooner ends it sooner."""
+    idx = content.rfind("</body>")
+    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
+    measure_path = os.path.join(os.path.dirname(html_path), scratch_name)
+    try:
+        with open(measure_path, "w", encoding="utf-8") as f:
+            f.write(instrumented)
+    except OSError:
+        return None
+    args = [chrome, "--headless", "--no-sandbox"]
+    if width is not None:
+        args.append(f"--window-size={width},1080")
+    args += ["--dump-dom", "--virtual-time-budget=8000", f"file://{os.path.abspath(measure_path)}"]
+    try:
+        r = run_subprocess(args, capture_output=True, text=True, timeout=timeout, check=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        if os.path.exists(measure_path):
+            os.unlink(measure_path)
+    m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
+    return m.group(1) if m else None
+
+
 def _measure_content_height(chrome, html_path, width, timeout=30):
     """document.body.scrollHeight for `html_path` at `width` (logical
     CSS px) - the same script-injected-title / --dump-dom technique as
@@ -1433,37 +1528,16 @@ def _measure_content_height(chrome, html_path, width, timeout=30):
     and passing an explicit height is the only way. Returns None on
     any failure - the caller falls back to a fixed cap
     (OfficeVariant.OFFICE_MAX_CAPTURE_HEIGHT) instead."""
-    try:
-        with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError:
+    content = _read_html(html_path)
+    if content is None:
         return None
-    script = "<script>document.title = String(Math.ceil(document.body.scrollHeight));</script>"
-    idx = content.rfind("</body>")
-    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
-    measure_path = os.path.join(os.path.dirname(html_path), "pdfless-height-measure.html")
-    try:
-        with open(measure_path, "w", encoding="utf-8") as f:
-            f.write(instrumented)
-    except OSError:
-        return None
-    try:
-        r = run_subprocess(
-            [
-                chrome, "--headless", "--no-sandbox",
-                f"--window-size={width},1080",
-                "--dump-dom", "--virtual-time-budget=8000",
-                f"file://{os.path.abspath(measure_path)}",
-            ],
-            capture_output=True, text=True, timeout=timeout, check=True,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-        return None
-    finally:
-        if os.path.exists(measure_path):
-            os.unlink(measure_path)
-    m = re.search(r"<title>(\d+)</title>", r.stdout)
-    return int(m.group(1)) if m else None
+    title = _chrome_dump_title(
+        chrome, html_path, content,
+        "<script>document.title = String(Math.ceil(document.body.scrollHeight));</script>",
+        "pdfless-height-measure.html", width=width, timeout=timeout,
+    )
+    m = re.fullmatch(r"\d+", title.strip()) if title else None
+    return int(m.group(0)) if m else None
 
 
 def _measure_svg_natural_size(chrome, wrapper_path, timeout=20):
@@ -1485,39 +1559,18 @@ def _measure_svg_natural_size(chrome, wrapper_path, timeout=20):
     Returns None on any failure, including an SVG Chrome couldn't
     determine a natural size for at all - the caller falls back to a
     fixed default size."""
-    try:
-        with open(wrapper_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError:
+    content = _read_html(wrapper_path)
+    if content is None:
         return None
     script = (
         '<script>document.getElementById("svg").onload = function() {'
         'document.title = this.naturalWidth + "x" + this.naturalHeight;'
         "};</script>"
     )
-    idx = content.rfind("</body>")
-    instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
-    measure_path = os.path.join(os.path.dirname(wrapper_path), "pdfless-svg-measure.html")
-    try:
-        with open(measure_path, "w", encoding="utf-8") as f:
-            f.write(instrumented)
-    except OSError:
-        return None
-    try:
-        r = run_subprocess(
-            [
-                chrome, "--headless", "--no-sandbox",
-                "--dump-dom", "--virtual-time-budget=8000",
-                f"file://{os.path.abspath(measure_path)}",
-            ],
-            capture_output=True, text=True, timeout=timeout, check=True,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-        return None
-    finally:
-        if os.path.exists(measure_path):
-            os.unlink(measure_path)
-    m = re.search(r"<title>(\d+)x(\d+)</title>", r.stdout)
+    title = _chrome_dump_title(
+        chrome, wrapper_path, content, script, "pdfless-svg-measure.html", timeout=timeout,
+    )
+    m = re.fullmatch(r"(\d+)x(\d+)", title.strip()) if title else None
     if not m:
         return None
     width, height = int(m.group(1)), int(m.group(2))
@@ -1724,8 +1777,7 @@ class SlideDeck(OfficeVariant):
     a shape-based guess (_detect_fallback_page_xpath()) - only then is
     it trusted to paginate; a guessed boundary has been observed to
     drift/overflow on some real decks, so it's rendered as a single
-    continuous page instead, the same as -c/--continuous forces for
-    any deck."""
+    continuous page instead."""
 
     def __init__(self, chrome, html_path, width, height, tag, name, slide_offsets, confident):
         super().__init__(chrome, html_path, width, height, tag, name)
@@ -1817,7 +1869,9 @@ class FlowingText(OfficeVariant):
         - one page's error shifts every one after it; print-mode's
         aren't, each page break is independent).
 
-        continuous=True (-c/--continuous) instead measures the
+        continuous=True (only RtfOfficeDocument's own qlmanage/Chrome
+        fallback asks for it - see _render_office_pages()) instead
+        measures the
         document's real total height first (_measure_content_height())
         and requests one oversized page sized to fit it - a
         continuously-flowing document has no real page boundaries of
@@ -1855,12 +1909,7 @@ class FlowingText(OfficeVariant):
         label = f"{self.name}: rendering to PDF"
         with _DebugTimer(debug, label), progress.spin(label + "..."):
             ok = _capture_html_pdf(self.chrome, self.html_path, self.width, page_height, out_pdf)
-        npages = _pdf_page_count_safe(out_pdf) if ok else None
-        if not npages:
-            if os.path.exists(out_pdf):
-                os.unlink(out_pdf)
-            return None
-        return ("pdf", out_pdf, npages)
+        return _pdf_render_result(out_pdf, ok)
 
     def _build_pages_via_screenshot(self, tmpdir, debug, render_scale, progress, continuous):
         if render_scale == OFFICE_RENDER_SCALE:
@@ -2046,9 +2095,9 @@ class DocumentHandler:
 
     def page_count(self):
         """Number of pages, or None if unknown until the file is
-        actually rendered (only OfficeDocument - its page count isn't
-        known until Quick Look + Chrome have run; see
-        Viewer._ensure_office_pages())."""
+        actually rendered (only a RenderedDocument - its page count
+        isn't known until soffice/Quick Look/Chrome/WeasyPrint have run;
+        see Viewer._ensure_office_pages())."""
         raise NotImplementedError
 
     def extract_text(self, page):
@@ -2057,6 +2106,22 @@ class DocumentHandler:
         text_mode_is_paginated()), which ignores `page` entirely. None
         means there's nothing to show (the 't' key reports that)."""
         return None
+
+    def extract_text_pages(self, npages: int) -> "list[list[str]] | None":
+        """Every page's text-mode content at once, as a list of `npages`
+        line lists (page 1 first) - what the continuous text view (see
+        Viewer._text_continuous()) stitches together. Only meaningful
+        for a handler whose text is paginated (text_mode_is_paginated());
+        by default just extract_text() once per page - PdfDocument
+        overrides it to do the whole document in one pdftotext run.
+        None if any page has nothing to show."""
+        pages = []
+        for page in range(1, npages + 1):
+            lines = self.extract_text(page)
+            if lines is None:
+                return None
+            pages.append(lines)
+        return pages
 
     def supports_text_mode(self):
         """Whether 't' should even try entering text mode at all - the
@@ -2200,6 +2265,9 @@ class PdfDocument(DocumentHandler):
         # pdfinfo/pdftoppm/pdftotext call against self.path (harmless,
         # as an extra -upw, even for a PDF that was never encrypted at
         # all, since it's None then and _password_args() omits it)
+        self._page_sizes = {}  # page -> (width_pt, height_pt), filled in
+        # by page_size_pt() one page at a time as pages are first needed,
+        # and cleared by forget_page_sizes() when the file changes
 
     @staticmethod
     def is_pdf_file(path):
@@ -2224,12 +2292,24 @@ class PdfDocument(DocumentHandler):
         return ["-upw", password] if password else []
 
     @staticmethod
+    def _poppler_stdout(tool: str, path: str, password: "str | None", *options: str,
+                        to_stdout: bool = False) -> str:
+        """Run poppler's `tool` (pdfinfo/pdftotext) on `path` and return
+        what it printed: `options` go before the path, the -upw password
+        (see _password_args()) first of all, and `to_stdout` adds the "-"
+        output-file argument pdftotext needs to print instead of writing
+        a .txt file. Raises CalledProcessError on failure, with stderr
+        captured - sniff()/_ensure_unlocked() read it to tell a wrong
+        password apart from a broken file."""
+        args = [tool, *PdfDocument._password_args(password), *options, path]
+        if to_stdout:
+            args.append("-")
+        return run_subprocess(args, capture_output=True, text=True, check=True).stdout
+
+    @staticmethod
     def _pdf_page_count(path, password=None):
-        out = run_subprocess(
-            ["pdfinfo", *PdfDocument._password_args(password), path],
-            capture_output=True, text=True, check=True,
-        ).stdout
-        m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
+        out = PdfDocument._poppler_stdout("pdfinfo", path, password)
+        m = _PDFINFO_PAGES_RE.search(out)
         if not m:
             die("could not determine page count")
         return int(m.group(1))
@@ -2291,15 +2371,29 @@ class PdfDocument(DocumentHandler):
         self._ensure_unlocked()
         return self._pdf_page_count(self.path, self.password)
 
-    def page_size_pt(self, page):
-        """(width_pt, height_pt) for `page`."""
-        out = run_subprocess(
-            ["pdfinfo", *self._password_args(self.password), "-f", str(page), "-l", str(page), self.path],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        m = re.search(r"^Page\s*(?:\d+\s+)?size:\s+([\d.]+) x ([\d.]+)", out, re.MULTILINE)
+    def page_size_pt(self, page: int) -> "tuple[float, float]":
+        """(width_pt, height_pt) for `page` - remembered after the first
+        ask, since get_page_image() needs it on every call (even a page-
+        cache hit, to know which cache key to look up) and -c/--continuous
+        asks for every page on screen on every single draw: without
+        this, each scroll step would run one pdfinfo per visible page,
+        twice over."""
+        size = self._page_sizes.get(page)
+        if size is None:
+            size = self._page_sizes[page] = self._read_page_size_pt(page)
+        return size
+
+    def forget_page_sizes(self) -> None:
+        """Drop page_size_pt()'s remembered sizes - for Viewer.reload(),
+        when the file changed on disk and its pages may have too."""
+        self._page_sizes.clear()
+
+    def _read_page_size_pt(self, page: int) -> "tuple[float, float]":
+        """page_size_pt()'s actual pdfinfo run, for one page."""
+        out = self._poppler_stdout(
+            "pdfinfo", self.path, self.password, "-f", str(page), "-l", str(page),
+        )
+        m = _PDFINFO_SIZE_RE.search(out)
         if not m:
             die(f"could not determine page size for page {page}")
         return float(m.group(1)), float(m.group(2))
@@ -2308,13 +2402,32 @@ class PdfDocument(DocumentHandler):
         """Plain-text rendering of one page, via poppler's pdftotext
         -layout (which tries to preserve the page's visual line/column
         layout, unlike the flat word-run text used for search)."""
-        out = run_subprocess(
-            ["pdftotext", *self._password_args(self.password), "-f", str(page), "-l", str(page), "-layout", self.path, "-"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+        out = self._poppler_stdout(
+            "pdftotext", self.path, self.password,
+            "-f", str(page), "-l", str(page), "-layout", to_stdout=True,
+        )
         return out.splitlines()
+
+    def extract_text_pages(self, npages: int) -> "list[list[str]]":
+        """The whole document's extract_text() at once: one pdftotext
+        -layout run instead of `npages` of them, split back into pages
+        at the form feed pdftotext ends every page with. Each piece
+        keeps its own trailing form feed so splitlines() treats it
+        exactly as extract_text() does for that page on its own - the
+        two must agree line for line, since search highlighting maps a
+        match's page-relative line position between them."""
+        out = self._poppler_stdout(
+            "pdftotext", self.path, self.password, "-layout", to_stdout=True,
+        )
+        pieces = out.split("\f")
+        pages = [piece + "\f" for piece in pieces[:-1]]
+        if pieces[-1]:
+            pages.append(pieces[-1])  # no trailing form feed after the last page
+        pages = [piece.splitlines() for piece in pages]
+        # pdftotext and page_count() (pdfinfo) should always agree, but
+        # never let a disagreement leave a page with no entry at all.
+        pages += [[] for _ in range(npages - len(pages))]
+        return pages[:npages]
 
     def build_search_index(self):
         """Extract per-page text and word positions (via poppler's pdftotext
@@ -2322,12 +2435,9 @@ class PdfDocument(DocumentHandler):
         {"width_pt": float, "height_pt": float, "text": str,
         "words": [(start, end, xMin, yMin, xMax, yMax), ...]} (all in points)
         where (start, end) are offsets into "text" for that word."""
-        out = run_subprocess(
-            ["pdftotext", *self._password_args(self.password), "-bbox", self.path, "-"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+        out = self._poppler_stdout(
+            "pdftotext", self.path, self.password, "-bbox", to_stdout=True,
+        )
 
         pages = []
         for width, height, body in self._BBOX_PAGE_RE.findall(out):
@@ -2805,7 +2915,33 @@ class ImageDocument(DocumentHandler):
             return [_CONTROL_CHAR_RE.sub(_caret_notation, line) for line in lines]
 
 
-class TextDocument(DocumentHandler):
+class _RawTextView:
+    """Text mode as the file's own raw text, one flowing blob - shared
+    by TextDocument (that *is* the whole document) and MarkdownDocument
+    (its raw Markdown source, beside the rendered image view). Mixed in
+    ahead of the DocumentHandler base, so these win over its defaults
+    (and over RenderedDocument's PDF-delegating ones)."""
+
+    def extract_text(self, page):
+        return read_plain_text_lines(self.path)
+
+    def text_mode_is_paginated(self):
+        return False
+
+    def default_text_border(self, border_default):
+        # No real "page" boundary in a plain text file worth bordering,
+        # regardless of --no-border.
+        return False
+
+    def default_text_wrap(self, wrap_default):
+        # This *is* the actual file content being paged through (unlike
+        # a PDF's extracted text or an Office document's textutil
+        # dump), so it defaults to wrapping like less(1) itself does -
+        # unless -S/--chop-long-lines said otherwise.
+        return wrap_default
+
+
+class TextDocument(_RawTextView, DocumentHandler):
     kind = "text"
 
     @classmethod
@@ -2821,9 +2957,6 @@ class TextDocument(DocumentHandler):
     def page_count(self):
         return 1
 
-    def extract_text(self, page):
-        return read_plain_text_lines(self.path)
-
     def supports_text_mode(self):
         return True
 
@@ -2832,18 +2965,6 @@ class TextDocument(DocumentHandler):
 
     def starts_in_text_mode(self):
         return True
-
-    def default_text_border(self, border_default):
-        # No real "page" boundary in a plain text file worth bordering,
-        # regardless of --no-border.
-        return False
-
-    def default_text_wrap(self, wrap_default):
-        # This *is* the actual file content being paged through (unlike
-        # a PDF's extracted text or an Office document's textutil
-        # dump), so it defaults to wrapping like less(1) itself does -
-        # unless -S/--chop-long-lines said otherwise.
-        return wrap_default
 
 
 class RtfDocument(TextDocument):
@@ -2875,32 +2996,269 @@ class RtfDocument(TextDocument):
     def sniff(cls, path, tmpdir, debug=False):
         if not cls.is_rtf_file(path):
             return None
-        if not is_probably_text(path):
-            # Vanishingly unlikely for genuine RTF (it's pure ASCII by
-            # spec) - but keep the same NUL-byte safety net
-            # TextDocument itself applies, rather than trusting the RTF
-            # signature alone.
-            return None
-        try:
-            read_plain_text_lines(path)  # just to validate it decodes
-        except Exception as e:
-            raise UnusableFile(f"not valid UTF-8 text ({e})") from e
-        return cls(path)
+        # The rest is TextDocument's own check - vanishingly unlikely to
+        # fail for genuine RTF (it's pure ASCII by spec), but kept as the
+        # same NUL-byte/decoding safety net rather than trusting the RTF
+        # signature alone.
+        return super().sniff(path, tmpdir, debug)
 
     def extract_text(self, page):
         return extract_office_text(self.path) or super().extract_text(page)
 
 
-class OfficeDocument(DocumentHandler):
-    """Anything this Mac's Quick Look generators can preview (Word,
-    Excel, PowerPoint, Keynote, Pages, ...) via qlmanage + a local
-    Chrome. page_count() is deliberately None - unknown until
-    build_pages() actually renders it (see
-    Viewer._ensure_office_pages()). The actual rendering
-    (_render_office_pages()) picks one of the ExcelWorkbook/SlideDeck/
-    FlowingText OfficeVariant strategies and delegates to it."""
+class RenderedDocument(DocumentHandler):
+    """A file that has to be rendered - into a real PDF, or a list of
+    page images - before it can be shown at all: OfficeDocument (Quick
+    Look/soffice/Chrome), SofficeOnlyDocument (soffice), SvgDocument
+    (Chrome) and MarkdownDocument (WeasyPrint). What they share is the
+    lazy rendering itself - page_count() is None, since the page count
+    isn't known until build_pages() has actually run (see
+    Viewer._ensure_office_pages()) - and, once a render produced a real
+    PDF, a PdfDocument delegate that page images, text and search all go
+    through. Each subclass supplies only how to render (_renderer()) and
+    how to cache it (_cache_key_suffix()) - see build_pages()."""
 
     kind = "office"
+
+    OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
+    OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.pages = None  # [png_path, ...] once rendered - see
+        # build_pages()/ensure_pages(); None until the first render.
+        self._pdf_delegate = None  # a PdfDocument wrapping a real,
+        # print-to-pdf-rendered PDF, when FlowingText managed one (see
+        # _render_office_pages()) - get_page_image() forwards to it
+        # instead of treating self.pages as a list of PNGs, so these
+        # pages stay crisp at any zoom the same way a real PDF does.
+        # self.pages is still set (to a same-length placeholder list)
+        # in that case, purely so len(self.pages) keeps working for
+        # Viewer._ensure_office_pages()/reload().
+
+    def _render_error_placeholder(self, tmpdir, message):
+        """A single-page fallback for when _render_office_pages()
+        succeeds at sniff()/_probe_preview() time (qlmanage has a
+        generator for this file) but then fails for real later (e.g.
+        Chrome crashes or times out on this particular render) -
+        rendering happening lazily, on first display rather than
+        upfront, means a failure here can't just fall back to skipping
+        the file the way main() does for one that never looked
+        previewable in the first place. Returns a one-item list of PNG
+        paths, the same shape _render_office_pages() itself returns on
+        success, so callers don't need to special-case this."""
+        from PIL import ImageDraw
+
+        img = Image.new("RGB", (900, 200), "white")
+        draw = ImageDraw.Draw(img)
+        draw.text((20, 20), f"could not render {os.path.basename(self.path)}", fill="black")
+        draw.text((20, 50), message, fill="black")
+        out_path = os.path.join(
+            tmpdir,
+            f"office-error-{hashlib.md5(self.path.encode('utf-8', 'surrogateescape')).hexdigest()[:12]}.png",
+        )
+        img.save(out_path)
+        return [out_path]
+
+    def page_count(self):
+        return None
+
+    # What -d/--debug reports when build_pages() is served from the
+    # persistent cache - each subclass names what that let it skip.
+    _CACHE_HIT_NOTE = "reusing cached render, skipped rendering"
+
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        """build_pages()'s actual render, as a zero-argument callable
+        returning _remember_pages()'s input - a ("pdf", pdf_path, npages)
+        tuple or a list of per-page image paths, or None on failure - or
+        None if there's no point even trying. Every subclass has its own."""
+        raise NotImplementedError
+
+    def _cache_key_suffix(self, render_scale):
+        """build_pages()'s persistent-cache key suffix (see
+        _cached_render_dir()), or None for no persistent caching. By
+        default "": a real PDF is re-rasterized at whatever scale the
+        view needs, so one rendering serves every -s/--rendering-scale."""
+        return ""
+
+    def build_pages(
+        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
+        progress=None,
+    ):
+        """Render fresh - always, regardless of self.pages - remembering
+        the result for _source_for_page() and any later ensure_pages()
+        call. Used directly by Viewer.reload() (which always wants a
+        fresh render, since the file changed on disk); see
+        ensure_pages() for the memoized entry point everything else
+        wants instead.
+
+        The same steps for every subclass, which only supply what
+        differs: _renderer() (the actual render, as a zero-argument
+        callable, or None if it can't even be attempted) and
+        _cache_key_suffix() (how the persistent cache - see
+        _render_result_cached() - tells apart renderings of the same
+        file, or None to skip that cache altogether). The whole render
+        is wrapped in one cache check, so a hit skips all of it -
+        qlmanage, soffice and Chrome alike."""
+        if progress is None:
+            progress = _ProgressLine(enabled=False)
+        render = self._renderer(tmpdir, debug, render_scale, progress)
+        if render is None:
+            return None
+        key_suffix = self._cache_key_suffix(render_scale)
+        if key_suffix is None:
+            result = render()
+        else:
+            result, from_cache = _render_result_cached(self.path, render, key_suffix=key_suffix)
+            if debug and result is not None and from_cache:
+                _debug_log(f"{os.path.basename(self.path)}: {self._CACHE_HIT_NOTE}")
+        return self._remember_pages(result)
+
+    def _remember_pages(self, pages):
+        """Normalize and remember whatever build_pages()'s underlying
+        rendering produced - either a ("pdf", pdf_path, npages) tuple
+        (FlowingText's own PDF path, or soffice - see
+        _try_soffice_pages()) or a plain list of per-page PNG paths -
+        into self.pages/self._pdf_delegate, and return the same
+        same-length list of paths every caller of build_pages()/
+        ensure_pages() (which only ever does len(pages)) already
+        expects."""
+        if pages:
+            if isinstance(pages, tuple) and pages[0] == "pdf":
+                # A real PDF (Chrome's --print-to-pdf or soffice) -
+                # wrap it as a PdfDocument delegate (see
+                # get_page_image()) and normalize back to a
+                # same-length list of paths.
+                _, pdf_path, npages = pages
+                self._pdf_delegate = PdfDocument(pdf_path)
+                pages = [pdf_path] * npages
+            else:
+                self._pdf_delegate = None
+            self.pages = pages
+        return pages
+
+    def _try_soffice_pages(self, path, tmpdir, debug, progress):
+        """Render `path` to a real PDF via LibreOffice's `soffice
+        --convert-to pdf` (see _convert_via_soffice() for why
+        --headless is never used) - the mechanism _soffice_pages_if_eligible()
+        decides whether to even attempt. Preferred over the qlmanage/
+        Chrome pipeline when available - soffice paginates natively
+        (real page breaks/slide boundaries matching the original
+        document) and needs no embedded-picture workaround (see
+        _rasterize_broken_img_sources()) at all.
+
+        A pure, uncached render - persistent caching (see
+        _render_result_cached()) is handled by this method's own
+        callers (_render_office_pages(), and RtfOfficeDocument.
+        build_pages()'s own direct attempt against the original .rtf),
+        each wrapping their *entire* qlmanage-preview-generation-and-
+        all pipeline in one cache check, not just this one step -
+        caching only this step would still pay for qlmanage/measuring
+        on every soffice-eligible file's cache hit, for no reason (this
+        step, when eligible, always pre-empts qlmanage entirely anyway).
+
+        Returns the same ("pdf", pdf_path, npages) tuple shape
+        FlowingText._build_pdf_pages() already produces, or None if
+        soffice isn't installed or the conversion/page-count reading
+        failed for any reason - callers always fall back to the
+        existing qlmanage/Chrome pipeline in that case."""
+        name = os.path.basename(path)
+        progress.update(f"{name}: looking for LibreOffice...")
+        soffice = find_soffice()
+        if soffice is None:
+            return None
+        if debug:
+            _debug_log(f"{name}: using soffice: {soffice}")
+        label = f"{name}: converting via LibreOffice"
+        with _DebugTimer(debug, label), progress.spin(label + "..."):
+            out_pdf = _convert_via_soffice(soffice, path, tmpdir, debug=debug)
+        if out_pdf is None:
+            return None
+        return _pdf_render_result(out_pdf)
+
+    def ensure_pages(self, tmpdir, **kwargs):
+        """Render once and reuse afterward - a no-op on every call after
+        the first (see Viewer._ensure_office_pages(), which only needs
+        this once per file no matter how many times it's revisited)."""
+        if self.pages is None:
+            self.build_pages(tmpdir, **kwargs)
+        return self.pages
+
+    def extract_text(self, page):
+        if self._pdf_delegate is not None:
+            # A real PDF page (soffice or Chrome's --print-to-pdf) -
+            # use its own per-page text (pdftotext -layout), so page
+            # breaks - lost once extract_office_text()'s textutil
+            # flattens the whole document into one blob - come through
+            # correctly (see also text_mode_is_paginated()).
+            return self._pdf_delegate.extract_text(page)
+        # textutil (see extract_office_text()) has no notion of pages -
+        # the whole document, or None for a format it can't handle at
+        # all (a spreadsheet or slide deck).
+        return extract_office_text(self.path)
+
+    def extract_text_pages(self, npages: int) -> "list[list[str]] | None":
+        if self._pdf_delegate is not None:
+            # One pdftotext run over the rendered PDF, not one per page.
+            return self._pdf_delegate.extract_text_pages(npages)
+        return super().extract_text_pages(npages)
+
+    def supports_text_mode(self):
+        return True
+
+    def supports_search(self):
+        # Real per-page/bbox search (build_search_index()/
+        # find_search_matches() below) only works against a real PDF -
+        # a screenshot-based OfficeVariant (always true for Excel/
+        # Keynote/Pages/Numbers; for Word/RTF/PowerPoint, only when
+        # neither soffice nor Chrome's --print-to-pdf could be used)
+        # has no such index to search.
+        return self._pdf_delegate is not None
+
+    def text_mode_is_paginated(self):
+        return self._pdf_delegate is not None
+
+    def build_search_index(self):
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.build_search_index()
+        return None
+
+    def find_search_matches(self, index, query):
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.find_search_matches(index, query)
+        return []
+
+    def _source_for_page(self, cache, page):
+        # One pre-rendered PNG per page (see OfficeDocument._render_office_pages()) -
+        # unlike ImageDocument, there's no single fixed path, so this
+        # reads self.pages (kept in sync by build_pages()/
+        # ensure_pages()) rather than a path fixed at construction time.
+        # Only reached when self._pdf_delegate is None - get_page_image()
+        # (below) forwards to it directly otherwise, without ever
+        # calling this (self.pages holds a same-length placeholder list
+        # in that case, not real per-page paths - see
+        # _remember_pages()).
+        return self.pages[page - 1]
+
+    def get_page_image(self, cache, page, target_px, fit):
+        # A FlowingText document rendered to a real PDF instead of PNGs
+        # (see _remember_pages()) - re-rasterize it the same way a
+        # real PdfDocument would, at whatever DPI the current zoom
+        # needs, instead of resizing one fixed-resolution screenshot
+        # (the DocumentHandler default this falls back to otherwise).
+        if self._pdf_delegate is not None:
+            return self._pdf_delegate.get_page_image(cache, page, target_px, fit)
+        return super().get_page_image(cache, page, target_px, fit)
+
+
+class OfficeDocument(RenderedDocument):
+    """Anything this Mac's Quick Look generators can preview (Word,
+    Excel, PowerPoint, Keynote, Pages, ...) via qlmanage + a local
+    Chrome - or, for Word/RTF/PowerPoint, soffice when it's installed
+    (see _soffice_pages_if_eligible()). The actual rendering
+    (_render_office_pages()) picks one of the ExcelWorkbook/SlideDeck/
+    FlowingText OfficeVariant strategies and delegates to it; the lazy
+    rendering and PDF delegation around it come from RenderedDocument."""
 
     # Extensions where soffice's own --convert-to pdf pagination lands
     # on the same "page" boundary the qlmanage/Chrome pipeline already
@@ -2927,22 +3285,6 @@ class OfficeDocument(DocumentHandler):
     # upfront instead of committing to a soffice/qlmanage render that's
     # bound to fail uninformatively.
     _OOXML_ZIP_EXTENSIONS = (".docx", ".docm", ".pptx", ".pptm")
-
-    OFFICE_DEFAULT_WIDTH = 816  # 8.5in at 96dpi, if the plist has no Width
-    OFFICE_DEFAULT_HEIGHT = 1056  # 11in at 96dpi, if the plist has no Height
-
-    def __init__(self, path):
-        super().__init__(path)
-        self.pages = None  # [png_path, ...] once rendered - see
-        # build_pages()/ensure_pages(); None until the first render.
-        self._pdf_delegate = None  # a PdfDocument wrapping a real,
-        # print-to-pdf-rendered PDF, when FlowingText managed one (see
-        # _render_office_pages()) - get_page_image() forwards to it
-        # instead of treating self.pages as a list of PNGs, so these
-        # pages stay crisp at any zoom the same way a real PDF does.
-        # self.pages is still set (to a same-length placeholder list)
-        # in that case, purely so len(self.pages) keeps working for
-        # Viewer._ensure_office_pages()/reload().
 
     @classmethod
     def sniff(cls, path, tmpdir, debug=False):
@@ -2983,10 +3325,7 @@ class OfficeDocument(DocumentHandler):
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             if debug:
-                print(
-                    f"pdfless: [debug] {name}: qlmanage failed to run: {e}",
-                    file=sys.stderr, end="\r\n",
-                )
+                _debug_log(f"{name}: qlmanage failed to run: {e}")
             return None
         bundle = os.path.join(outdir, f"{os.path.basename(path)}.qlpreview")
         html_path = os.path.join(bundle, "Preview.html")
@@ -3003,10 +3342,7 @@ class OfficeDocument(DocumentHandler):
                 )
                 stderr_lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
                 detail = f" - {stderr_lines[0]}" if stderr_lines else ""
-                print(
-                    f"pdfless: [debug] {name}: qlmanage {how}{detail}",
-                    file=sys.stderr, end="\r\n",
-                )
+                _debug_log(f"{name}: qlmanage {how}{detail}")
             return None
 
         width = height = page_element_xpath = None
@@ -3057,74 +3393,25 @@ class OfficeDocument(DocumentHandler):
             return False
         return OfficeDocument._generate_ql_preview(path, tmpdir, debug=debug) is not None
 
-    def _render_error_placeholder(self, tmpdir, message):
-        """A single-page fallback for when _render_office_pages()
-        succeeds at sniff()/_probe_preview() time (qlmanage has a
-        generator for this file) but then fails for real later (e.g.
-        Chrome crashes or times out on this particular render) -
-        rendering happening lazily, on first display rather than
-        upfront, means a failure here can't just fall back to skipping
-        the file the way main() does for one that never looked
-        previewable in the first place. Returns a one-item list of PNG
-        paths, the same shape _render_office_pages() itself returns on
-        success, so callers don't need to special-case this."""
-        from PIL import ImageDraw
+    # What -d/--debug reports when build_pages() is served from the
+    # persistent cache - each subclass names what that let it skip.
+    _CACHE_HIT_NOTE = "reusing cached render, skipped qlmanage/soffice/Chrome"
 
-        img = Image.new("RGB", (900, 200), "white")
-        draw = ImageDraw.Draw(img)
-        draw.text((20, 20), f"could not render {os.path.basename(self.path)}", fill="black")
-        draw.text((20, 50), message, fill="black")
-        out_path = os.path.join(
-            tmpdir,
-            f"office-error-{hashlib.md5(self.path.encode('utf-8', 'surrogateescape')).hexdigest()[:12]}.png",
-        )
-        img.save(out_path)
-        return [out_path]
-
-    def page_count(self):
-        return None
-
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None, continuous=False,
-    ):
-        """Render fresh - always, regardless of self.pages - remembering
-        the result for _source_for_page() and any later ensure_pages()
-        call. Used directly by Viewer.reload() (which always wants a
-        fresh render, since the file changed on disk); see
-        ensure_pages() for the memoized entry point everything else
-        wants instead."""
-        return self._render_and_remember(
-            self.path, tmpdir, debug=debug, render_scale=render_scale,
-            progress=progress, continuous=continuous,
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        """build_pages()'s actual render, as a zero-argument callable
+        returning _remember_pages()'s input (or None on failure) - or
+        None if there's no point even trying. Here: the qlmanage/
+        soffice/Chrome pipeline, _render_office_pages()."""
+        return lambda: self._render_office_pages(
+            self.path, tmpdir, debug=debug, render_scale=render_scale, progress=progress,
         )
 
-    def _render_and_remember(self, source_path, tmpdir, **kwargs):
-        pages = self._render_office_pages(source_path, tmpdir, **kwargs)
-        return self._remember_pages(pages)
-
-    def _remember_pages(self, pages):
-        """Normalize and remember whatever build_pages()'s underlying
-        rendering produced - either a ("pdf", pdf_path, npages) tuple
-        (FlowingText's own PDF path, or soffice - see
-        _try_soffice_pages()) or a plain list of per-page PNG paths -
-        into self.pages/self._pdf_delegate, and return the same
-        same-length list of paths every caller of build_pages()/
-        ensure_pages() (which only ever does len(pages)) already
-        expects."""
-        if pages:
-            if isinstance(pages, tuple) and pages[0] == "pdf":
-                # A real PDF (Chrome's --print-to-pdf or soffice) -
-                # wrap it as a PdfDocument delegate (see
-                # get_page_image()) and normalize back to a
-                # same-length list of paths.
-                _, pdf_path, npages = pages
-                self._pdf_delegate = PdfDocument(pdf_path)
-                pages = [pdf_path] * npages
-            else:
-                self._pdf_delegate = None
-            self.pages = pages
-        return pages
+    def _cache_key_suffix(self, render_scale):
+        """build_pages()'s persistent-cache key suffix (see
+        _cached_render_dir()), or None for no persistent caching. A
+        screenshot-sliced render bakes in -s/--rendering-scale's pixel
+        resolution, so it's part of the key here."""
+        return f":scale={render_scale}"
 
     def _soffice_pages_if_eligible(self, path, tmpdir, debug, progress, continuous):
         """The one place that decides whether _try_soffice_pages() is
@@ -3147,49 +3434,6 @@ class OfficeDocument(DocumentHandler):
         if continuous or not path.lower().endswith(self._SOFFICE_EXTENSIONS):
             return None
         return self._try_soffice_pages(path, tmpdir, debug, progress)
-
-    def _try_soffice_pages(self, path, tmpdir, debug, progress):
-        """Render `path` to a real PDF via LibreOffice's `soffice
-        --convert-to pdf` (see _convert_via_soffice() for why
-        --headless is never used) - the mechanism _soffice_pages_if_eligible()
-        decides whether to even attempt. Preferred over the qlmanage/
-        Chrome pipeline when available - soffice paginates natively
-        (real page breaks/slide boundaries matching the original
-        document) and needs no embedded-picture workaround (see
-        _rasterize_broken_img_sources()) at all.
-
-        A pure, uncached render - persistent caching (see
-        _render_result_cached()) is handled by this method's own
-        callers (_render_office_pages(), and RtfOfficeDocument.
-        build_pages()'s own direct attempt against the original .rtf),
-        each wrapping their *entire* qlmanage-preview-generation-and-
-        all pipeline in one cache check, not just this one step -
-        caching only this step would still pay for qlmanage/measuring
-        on every soffice-eligible file's cache hit, for no reason (this
-        step, when eligible, always pre-empts qlmanage entirely anyway).
-
-        Returns the same ("pdf", pdf_path, npages) tuple shape
-        FlowingText._build_pdf_pages() already produces, or None if
-        soffice isn't installed or the conversion/page-count reading
-        failed for any reason - callers always fall back to the
-        existing qlmanage/Chrome pipeline in that case."""
-        name = os.path.basename(path)
-        progress.update(f"{name}: looking for LibreOffice...")
-        soffice = find_soffice()
-        if soffice is None:
-            return None
-        if debug:
-            print(f"pdfless: [debug] {name}: using soffice: {soffice}", file=sys.stderr, end="\r\n")
-        label = f"{name}: converting via LibreOffice"
-        with _DebugTimer(debug, label), progress.spin(label + "..."):
-            out_pdf = _convert_via_soffice(soffice, path, tmpdir, debug=debug)
-        if out_pdf is None:
-            return None
-        npages = _pdf_page_count_safe(out_pdf)
-        if not npages:
-            os.unlink(out_pdf)
-            return None
-        return ("pdf", out_pdf, npages)
 
     def _measure_slide_offsets(self, chrome, html_path, page_element_xpath, width):
         """For a document whose Quick Look preview has distinct page/slide
@@ -3225,10 +3469,8 @@ class OfficeDocument(DocumentHandler):
         default, if not given explicitly) can silently disagree with the
         boundaries the real capture ends up with, throwing off every slice
         from that point on."""
-        try:
-            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except OSError:
+        content = _read_html(html_path)
+        if content is None:
             return None
 
         if not page_element_xpath:
@@ -3236,42 +3478,18 @@ class OfficeDocument(DocumentHandler):
             if not page_element_xpath:
                 return None
 
-        idx = content.rfind("</body>")
-        script = _build_slide_measure_script(page_element_xpath)
-        instrumented = content[:idx] + script + content[idx:] if idx != -1 else content + script
-        measure_path = os.path.join(os.path.dirname(html_path), "pdfless-slide-measure.html")
-        with open(measure_path, "w", encoding="utf-8") as f:
-            f.write(instrumented)
-        try:
-            r = run_subprocess(
-                [
-                    chrome, "--headless", "--no-sandbox",
-                    # Must match the real capture's width (see the
-                    # docstring): a tall, arbitrary height is fine since
-                    # dump-dom doesn't render/screenshot anything, just
-                    # loads and serializes the DOM at that viewport size.
-                    f"--window-size={width},1080",
-                    # 8s, not 2s: an upper bound on how long the injected
-                    # script (see _build_slide_measure_script()) is allowed
-                    # to wait for every <img> to finish decoding before
-                    # giving up and dumping whatever it's got - it resolves
-                    # as soon as they're all ready, so this only matters as
-                    # a cap for a deck with many/large embedded images.
-                    "--dump-dom", "--virtual-time-budget=8000",
-                    f"file://{os.path.abspath(measure_path)}",
-                ],
-                capture_output=True, text=True, timeout=30, check=True,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            return None
-        finally:
-            os.unlink(measure_path)
-
-        m = re.search(r"<title>(.*?)</title>", r.stdout, re.S)
-        if not m:
+        # Must match the real capture's width - see the docstring. The
+        # 8s budget (see _chrome_dump_title()) is a cap on how long the
+        # injected script waits for every <img> to finish decoding, which
+        # only matters for a deck with many/large embedded images.
+        title = _chrome_dump_title(
+            chrome, html_path, content, _build_slide_measure_script(page_element_xpath),
+            "pdfless-slide-measure.html", width=width, timeout=30,
+        )
+        if title is None:
             return None
         try:
-            data = json.loads(html.unescape(m.group(1)))
+            data = json.loads(html.unescape(title))
             tops = [float(t) for t in data["tops"]]
             if not tops:
                 return None
@@ -3295,7 +3513,7 @@ class OfficeDocument(DocumentHandler):
 
     def _render_office_pages(
         self, path, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None, continuous=False, use_cache=True,
+        progress=None, continuous=False,
     ):
         """Try to render `path` - any file this Mac's Quick Look
         generators can preview (Word, Excel, PowerPoint, Keynote,
@@ -3348,22 +3566,17 @@ class OfficeDocument(DocumentHandler):
         limited to always-continuous the way the qlmanage/Chrome
         fallback is.
 
-        continuous=True (-c/--continuous) forces the single-continuous-
-        page behavior even for a document that would otherwise paginate
-        confidently.
+        continuous=True forces the single-continuous-page behavior even
+        for a document that would otherwise paginate confidently - only
+        RtfOfficeDocument.build_pages()'s fallback asks for it. (-c/
+        --continuous is unrelated: it's the viewer's own continuous page
+        view - see Viewer.continuous - which stacks the real, paginated
+        pages instead.)
 
-        The *entire* pipeline above (soffice attempt included) is
-        wrapped in one persistent-cache check (see
-        _render_result_cached()) keyed on `path` plus render_scale/
-        continuous (see _cached_render_dir()) - a hit skips all of it,
-        qlmanage/soffice/Chrome alike, not just the final render.
-        `use_cache=False` (only passed by RtfOfficeDocument.build_pages()'s
-        own qlmanage/Chrome fallback, against a throwaway converted
-        .docx path) skips this method's own cache check entirely, since
-        that caller already wraps its whole self - including this - in
-        one cache check of its own, keyed on the original .rtf; caching
-        here too would just be an extra, never-reused entry keyed on a
-        temp path nothing will ask for again."""
+        Not cached itself: build_pages() wraps it (and RTF's own
+        fallback around it) in one persistent-cache check, keyed on the
+        original file - RTF's call here is against a throwaway converted
+        .docx that nothing would ever ask for again."""
         if progress is None:
             progress = _ProgressLine(enabled=False)
         name = os.path.basename(path)
@@ -3380,7 +3593,7 @@ class OfficeDocument(DocumentHandler):
                 if chrome is None:
                     return None
                 if debug:
-                    print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
+                    _debug_log(f"{name}: using browser: {chrome}")
 
                 progress.update(f"{name}: reading Quick Look preview...")
                 with _DebugTimer(debug, f"{name}: qlmanage preview"):
@@ -3452,93 +3665,12 @@ class OfficeDocument(DocumentHandler):
                 if page_paths is None:
                     return None
                 if debug:
-                    print(
-                        f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
-                        file=sys.stderr, end="\r\n",
-                    )
+                    _debug_log(f"{name}: total: {time.monotonic() - t_start:.2f}s")
                 return page_paths
             finally:
                 progress.clear()
 
-        if not use_cache:
-            return render()
-
-        key_suffix = f":scale={render_scale}" + (":continuous" if continuous else "")
-        result, from_cache = _render_result_cached(path, render, key_suffix=key_suffix)
-        if debug and result is not None and from_cache:
-            print(
-                f"pdfless: [debug] {name}: reusing cached render, skipped qlmanage/soffice/Chrome",
-                file=sys.stderr, end="\r\n",
-            )
-        return result
-
-    def ensure_pages(self, tmpdir, **kwargs):
-        """Render once and reuse afterward - a no-op on every call after
-        the first (see Viewer._ensure_office_pages(), which only needs
-        this once per file no matter how many times it's revisited)."""
-        if self.pages is None:
-            self.build_pages(tmpdir, **kwargs)
-        return self.pages
-
-    def extract_text(self, page):
-        if self._pdf_delegate is not None:
-            # A real PDF page (soffice or Chrome's --print-to-pdf) -
-            # use its own per-page text (pdftotext -layout), so page
-            # breaks - lost once extract_office_text()'s textutil
-            # flattens the whole document into one blob - come through
-            # correctly (see also text_mode_is_paginated()).
-            return self._pdf_delegate.extract_text(page)
-        # textutil (see extract_office_text()) has no notion of pages -
-        # the whole document, or None for a format it can't handle at
-        # all (a spreadsheet or slide deck).
-        return extract_office_text(self.path)
-
-    def supports_text_mode(self):
-        return True
-
-    def supports_search(self):
-        # Real per-page/bbox search (build_search_index()/
-        # find_search_matches() below) only works against a real PDF -
-        # a screenshot-based OfficeVariant (always true for Excel/
-        # Keynote/Pages/Numbers; for Word/RTF/PowerPoint, only when
-        # neither soffice nor Chrome's --print-to-pdf could be used)
-        # has no such index to search.
-        return self._pdf_delegate is not None
-
-    def text_mode_is_paginated(self):
-        return self._pdf_delegate is not None
-
-    def build_search_index(self):
-        if self._pdf_delegate is not None:
-            return self._pdf_delegate.build_search_index()
-        return None
-
-    def find_search_matches(self, index, query):
-        if self._pdf_delegate is not None:
-            return self._pdf_delegate.find_search_matches(index, query)
-        return []
-
-    def _source_for_page(self, cache, page):
-        # One pre-rendered PNG per page (see OfficeDocument._render_office_pages()) -
-        # unlike ImageDocument, there's no single fixed path, so this
-        # reads self.pages (kept in sync by build_pages()/
-        # ensure_pages()) rather than a path fixed at construction time.
-        # Only reached when self._pdf_delegate is None - get_page_image()
-        # (below) forwards to it directly otherwise, without ever
-        # calling this (self.pages holds a same-length placeholder list
-        # in that case, not real per-page paths - see
-        # _render_and_remember()).
-        return self.pages[page - 1]
-
-    def get_page_image(self, cache, page, target_px, fit):
-        # A FlowingText document rendered to a real PDF instead of PNGs
-        # (see _render_and_remember()) - re-rasterize it the same way a
-        # real PdfDocument would, at whatever DPI the current zoom
-        # needs, instead of resizing one fixed-resolution screenshot
-        # (the DocumentHandler default this falls back to otherwise).
-        if self._pdf_delegate is not None:
-            return self._pdf_delegate.get_page_image(cache, page, target_px, fit)
-        return super().get_page_image(cache, page, target_px, fit)
+        return render()
 
 
 class RtfOfficeDocument(OfficeDocument):
@@ -3606,69 +3738,37 @@ class RtfOfficeDocument(OfficeDocument):
             return None
         return cls(path)
 
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None, continuous=False,
-    ):
-        """The whole render (soffice-against-the-original-.rtf attempt,
-        or the textutil-to-docx-then-qlmanage/Chrome fallback) is
-        wrapped in one persistent-cache check keyed on self.path (the
-        original .rtf), the same way OfficeDocument._render_office_pages()
-        wraps its own pipeline - see there. The nested
-        _render_office_pages() call below passes use_cache=False since
-        it would otherwise be keyed on docx_path, a throwaway temp file
-        different every render, making its own cache entry never worth
-        reading back."""
-        if progress is None:
-            progress = _ProgressLine(enabled=False)
-        name = os.path.basename(self.path)
-
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        """soffice against the original .rtf, or else the textutil-to-
+        docx-then-qlmanage/Chrome fallback - cached by build_pages() on
+        self.path (the original .rtf), never the throwaway .docx."""
         def render():
             # Unlike the textutil-converted-docx path below, soffice reads
             # the original .rtf natively, so its page breaks correspond to
             # the real document - no need to force continuous=True just to
             # dodge untrustworthy converted-page-height metadata (see the
             # comment below).
-            soffice_pages = self._soffice_pages_if_eligible(self.path, tmpdir, debug, progress, continuous)
+            soffice_pages = self._soffice_pages_if_eligible(self.path, tmpdir, debug, progress, False)
             if soffice_pages is not None:
                 return soffice_pages
 
             docx_path = self._rtf_to_docx(self.path, tmpdir)
             if docx_path is None:
                 return None
-            # Always continuous, regardless of the caller's -c/--continuous
-            # setting - a converted RTF's page-height pagination (the plist
+            # Always continuous - a converted RTF's page-height pagination (the plist
             # Width/Height textutil's own docx conversion reports) doesn't
             # correspond to anything in the original RTF, so it's not worth
             # trusting as a page boundary the way a native Word document's
             # is.
             return self._render_office_pages(
                 docx_path, tmpdir, debug=debug, render_scale=render_scale,
-                progress=progress, continuous=True, use_cache=False,
+                progress=progress, continuous=True,
             )
 
-        key_suffix = f":scale={render_scale}" + (":continuous" if continuous else "")
-        result, from_cache = _render_result_cached(self.path, render, key_suffix=key_suffix)
-        if debug and result is not None and from_cache:
-            print(
-                f"pdfless: [debug] {name}: reusing cached render, skipped qlmanage/soffice/Chrome",
-                file=sys.stderr, end="\r\n",
-            )
-        return self._remember_pages(result)
-
-    def extract_text(self, page):
-        if self._pdf_delegate is not None:
-            # soffice rendered the original .rtf natively to a real
-            # PDF (see build_pages()) - use its own per-page text, the
-            # same as OfficeDocument.extract_text() does for Word.
-            return self._pdf_delegate.extract_text(page)
-        # textutil already handles RTF directly for plain-text
-        # extraction (see extract_office_text()) - no need to go via
-        # the .docx conversion just for this.
-        return extract_office_text(self.path)
+        return render
 
 
-class SofficeOnlyDocument(OfficeDocument):
+class SofficeOnlyDocument(RenderedDocument):
     """Formats macOS Quick Look has no generator for at all - an ODF
     document, a Visio drawing, or a WMF vector metafile (confirmed by
     hand: qlmanage crashes outright on a real .odt, and produces no
@@ -3684,11 +3784,6 @@ class SofficeOnlyDocument(OfficeDocument):
     OfficeDocument._probe_preview()) - both because it's known not to
     work for any of these extensions, and because it would risk
     reproducing the .odt crash above just to classify a file.
-
-    -c/--continuous has no effect here: soffice always paginates for
-    real, and - unlike OfficeDocument._render_office_pages()'s
-    qlmanage-based variants - there's no screenshot-based single-page
-    rendering to fall back to instead.
 
     .ods (Calc) carries the same print-area/page-setup pagination
     caveat as Excel (see _SOFFICE_EXTENSIONS's docstring - confirmed
@@ -3722,29 +3817,16 @@ class SofficeOnlyDocument(OfficeDocument):
             return None
         return cls(path)
 
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None, continuous=False,
-    ):
-        if progress is None:
-            progress = _ProgressLine(enabled=False)
-        name = os.path.basename(self.path)
+    _CACHE_HIT_NOTE = "reusing cached PDF, skipped LibreOffice"
 
-        def render():
-            return self._try_soffice_pages(self.path, tmpdir, debug, progress)
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        return lambda: self._try_soffice_pages(self.path, tmpdir, debug, progress)
 
-        result, from_cache = _render_result_cached(self.path, render)
-        if debug and result is not None and from_cache:
-            print(
-                f"pdfless: [debug] {name}: reusing cached PDF, skipped LibreOffice",
-                file=sys.stderr, end="\r\n",
-            )
-        if result is None:
-            return None
-        return self._remember_pages(result)
+    def _cache_key_suffix(self, render_scale):
+        return ""  # a real PDF, re-rasterized at any scale on demand
 
 
-class SvgDocument(OfficeDocument):
+class SvgDocument(RenderedDocument):
     """A standalone SVG file, rendered to a real PDF via headless
     Chrome directly - no Quick Look or LibreOffice involved at all.
     Quick Look's own preview for an SVG is just a Preview.url redirect
@@ -3776,24 +3858,21 @@ class SvgDocument(OfficeDocument):
             return None
         return cls(path)
 
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None, continuous=False,
-    ):
-        if progress is None:
-            progress = _ProgressLine(enabled=False)
+    _CACHE_HIT_NOTE = "reusing cached PDF, skipped rendering"
+
+    def _cache_key_suffix(self, render_scale):
+        return ""  # a real PDF, re-rasterized at any scale on demand
+
+    def _renderer(self, tmpdir, debug, render_scale, progress):
         name = os.path.basename(self.path)
         chrome = find_chrome()
         if chrome is None:
             return None
         if debug:
-            print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
+            _debug_log(f"{name}: using browser: {chrome}")
         tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
         wrapper_path = os.path.join(tmpdir, f"svg-wrap-{tag}.html")
 
-        # continuous has no effect here (a single SVG is always one
-        # page either way), so - unlike FlowingText._build_pdf_pages() -
-        # this needs no key_suffix to keep the two apart in the cache.
         def render():
             # There's no plist (unlike a Quick Look preview) to read a
             # width from up front, and an SVG's own intrinsic size varies
@@ -3811,24 +3890,9 @@ class SvgDocument(OfficeDocument):
             label = f"{name}: rendering to PDF"
             with _DebugTimer(debug, label), progress.spin(label + "..."):
                 ok = _capture_html_pdf(chrome, wrapper_path, width, height, out_pdf)
-            if not ok:
-                return None
-            npages = _pdf_page_count_safe(out_pdf)
-            if not npages:
-                os.unlink(out_pdf)
-                return None
-            return ("pdf", out_pdf, npages)
+            return _pdf_render_result(out_pdf, ok)
 
-        result, from_cache = _render_result_cached(self.path, render)
-        if debug and result is not None:
-            print(
-                f"pdfless: [debug] {name}: "
-                + ("reusing cached PDF, skipped rendering" if from_cache else "cached the converted PDF"),
-                file=sys.stderr, end="\r\n",
-            )
-        if result is None:
-            return None
-        return self._remember_pages(result)
+        return render
 
     @staticmethod
     def _write_svg_wrapper(wrapper_path, svg_path, width, height):
@@ -3850,7 +3914,7 @@ class SvgDocument(OfficeDocument):
             f.write(html)
 
 
-class MarkdownDocument(OfficeDocument):
+class MarkdownDocument(_RawTextView, RenderedDocument):
     """A Markdown file, rendered to a real PDF via the `markdown` +
     `weasyprint` Python libraries (see _render_markdown_pdf() below) - no
     Quick Look, Chrome, or LibreOffice involved at all, and
@@ -3870,11 +3934,7 @@ class MarkdownDocument(OfficeDocument):
     image mode. text_mode_is_paginated() is False because that source
     is one continuous blob in text mode; image-mode / search still
     uses the PDF delegate's own per-page bbox index (see
-    Viewer._search_uses_text_lines()).
-
-    -c/--continuous has no effect here, the same as SofficeOnlyDocument
-    and for the same reason: WeasyPrint's real pagination can't be
-    collapsed back into a single page."""
+    Viewer._search_uses_text_lines())."""
 
     _MARKDOWN_EXTENSIONS = (".md", ".markdown")
 
@@ -4025,36 +4085,23 @@ img { max-width: 100%; height: auto; }
             return None
         return cls(path)
 
-    def build_pages(
-        self, tmpdir, debug=False, render_scale=OFFICE_RENDER_SCALE,
-        progress=None, continuous=False,
-    ):
-        if progress is None:
-            progress = _ProgressLine(enabled=False)
-        name = os.path.basename(self.path)
-        tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
-        out_pdf = os.path.join(tmpdir, f"markdown-capture-{tag}.pdf")
-        label = f"{name}: rendering to PDF"
-        with _DebugTimer(debug, label), progress.spin(label + "..."):
-            ok = self._render_markdown_pdf(out_pdf)
-        npages = _pdf_page_count_safe(out_pdf) if ok else None
-        if not npages:
-            if os.path.exists(out_pdf):
-                os.unlink(out_pdf)
-            return None
-        return self._remember_pages(("pdf", out_pdf, npages))
+    def _cache_key_suffix(self, render_scale):
+        # No persistent cache: WeasyPrint renders a Markdown file in
+        # well under a second (see the class docstring), fast enough
+        # that caching it isn't worth the disk space.
+        return None
 
-    def extract_text(self, page):
-        return read_plain_text_lines(self.path)
+    def _renderer(self, tmpdir, debug, render_scale, progress):
+        def render():
+            name = os.path.basename(self.path)
+            tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+            out_pdf = os.path.join(tmpdir, f"markdown-capture-{tag}.pdf")
+            label = f"{name}: rendering to PDF"
+            with _DebugTimer(debug, label), progress.spin(label + "..."):
+                ok = self._render_markdown_pdf(out_pdf)
+            return _pdf_render_result(out_pdf, ok)
 
-    def text_mode_is_paginated(self):
-        return False
-
-    def default_text_border(self, border_default):
-        return False
-
-    def default_text_wrap(self, wrap_default):
-        return wrap_default
+        return render
 
     def search_resets_on_text_mode_toggle(self):
         return True
@@ -4525,10 +4572,8 @@ class PageCache:
     bookkeeping - LRU eviction, the "loaded once natively" table - is
     shared machinery rather than any one kind's own concern."""
 
-    def __init__(self, doc_path, tmpdir, handler, size=CACHE_SIZE):
-        self.doc_path = doc_path
+    def __init__(self, tmpdir, handler, size=CACHE_SIZE):
         self.tmpdir = tmpdir
-        self.kind = handler.kind  # "pdf", "image", or "office"
         self.size = size
         self._cache = OrderedDict()  # (page, dpi_or_px_rounded) -> PIL.Image
         self._native_images = {}  # page -> PIL.Image, loaded once each - see
@@ -4584,14 +4629,67 @@ class EncodeCache:
             self._cache.popitem(last=False)
 
 
+@dataclasses.dataclass(frozen=True)
+class ViewerOptions:
+    """How the viewer starts up, as the command line asked for it - built
+    once by main() (from_args()) and handed through run_viewer() to the
+    Viewer as one value, rather than as a dozen-odd keyword arguments
+    repeated at every step. Frozen: the ones that can change at runtime
+    (scrollbar, continuous, follow, ...) are copied onto the Viewer's own
+    attributes, and those are what change - this stays what was asked for
+    at startup (which some toggles, e.g. copy mode's restore, rely on)."""
+
+    fit: "str | None" = "width"  # -h/--fit-height: "height", else "width"
+    border: bool = True  # --no-border
+    wrap: bool = True  # -S/--chop-long-lines, inverted
+    eol_mark: bool = True  # --no-eol-mark
+    line_numbers: bool = False  # -N/--line-numbers
+    scrollbar: bool = True  # --no-scrollbar
+    wheel_scroll_step: int = 2  # --wheel-scroll-step
+    incremental_scroll: bool = True  # --no-incremental-scroll
+    debug: bool = False  # -d/--debug
+    office_render_scale: float = OFFICE_RENDER_SCALE  # -s/--rendering-scale
+    continuous: bool = False  # -c/--continuous
+    follow: bool = False  # -f/--follow
+    quit_if_one_screen: bool = False  # -F/--quit-if-one-screen
+    keep: bool = False  # -k/--keep (run_viewer() only)
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace, nfiles: int) -> "ViewerOptions":
+        """The options main()'s parsed command line asks for, `nfiles`
+        being how many files it's about to show."""
+        return cls(
+            fit="height" if args.fit_height else "width",
+            border=args.border,
+            wrap=not args.chop_long_lines,
+            eol_mark=args.eol_mark,
+            line_numbers=args.line_numbers,
+            scrollbar=args.scrollbar,
+            wheel_scroll_step=args.wheel_scroll_step,
+            incremental_scroll=args.incremental_scroll,
+            debug=args.debug,
+            office_render_scale=args.rendering_scale,
+            continuous=args.continuous,
+            follow=args.follow,
+            # Only meaningful for a single file - dumping the first of
+            # several and quitting would silently drop the rest.
+            quit_if_one_screen=args.quit_if_one_screen and nfiles == 1,
+            keep=args.keep,
+        )
+
+
 class Viewer:
-    def __init__(
-        self, files, file_index, page, tmpdir, fd, fit="width",
-        border=True, wrap=True, eol_mark=True, line_numbers=False,
-        scrollbar=True, wheel_scroll_step=2, incremental_scroll=True,
-        debug=False, office_render_scale=OFFICE_RENDER_SCALE,
-        office_continuous=False, follow=False, quit_if_one_screen=False,
-    ):
+    def __init__(self, files, file_index, page, tmpdir, fd, fit="width",
+                 options=None, **option_kwargs):
+        """`options` (a ViewerOptions) says how to start up; for
+        convenience - the tests build Viewers this way throughout - the
+        individual options can be given as keyword arguments instead
+        (`fit` positionally, as ever), which make up the ViewerOptions."""
+        if options is None:
+            options = ViewerOptions(fit=fit, **option_kwargs)
+        elif option_kwargs:
+            raise TypeError("pass either options= or individual option keywords, not both")
+        self.options = options
         self.files = files  # [DocumentHandler | path str, ...] - one per
         # CLI argument. main() only actually sniffs the one file it's
         # about to display first (a DocumentHandler there already,
@@ -4607,11 +4705,13 @@ class Viewer:
         # entry above is actually visited - None means that one turned
         # out not to be a usable file at all.
         self.tmpdir = tmpdir
-        self.follow = follow  # -f/--follow, or toggled at runtime with F -
-        # purely a display flag for status_segments(); the actual mtime-
-        # polling/reload logic lives in run_viewer()'s own loop, which
-        # keeps this in sync when the F key toggles it
-        self.quit_if_one_screen = quit_if_one_screen  # -F/--quit-if-one-
+        self.follow = options.follow  # -f/--follow, or toggled at runtime with F
+        # (see toggle_follow()) - poll_follow() reloads the file whenever
+        # its mtime changes while this is on
+        self._follow_path = None  # the file poll_follow() is watching...
+        self._follow_mtime = None  # ...its mtime when last looked at...
+        self._follow_checked = 0.0  # ...and when that was (monotonic)
+        self.quit_if_one_screen = options.quit_if_one_screen  # -F/--quit-if-one-
         # screen - set before _set_current_file() below so _ViewerProgress
         # can already see it: whether this first file ends up dumped-and-
         # quit or interactive isn't known until after that render
@@ -4631,16 +4731,21 @@ class Viewer:
         # exactly fill the terminal would make that \r\n force a one-line
         # scroll, pushing the dump's own top row out of view the instant
         # it's written
-        self.debug = debug  # -d/--debug: print office-preview stage timing
-        self.office_render_scale = office_render_scale  # --rendering-scale
-        self.office_continuous = office_continuous  # -c/--continuous
+        self.debug = options.debug  # -d/--debug: print office-preview stage timing
+        self.office_render_scale = options.office_render_scale  # --rendering-scale
+        self.continuous = options.continuous  # -c/--continuous, or toggled at
+        # runtime with c: stack consecutive pages one after another
+        # (image mode), or the whole document's text with a separator
+        # row between pages (a paginated text mode), instead of showing
+        # one page at a time - see _normalize_continuous() and
+        # _text_continuous()
         self.fd = fd
-        self.fit = fit
-        self.eol_mark = eol_mark  # --no-eol-mark: mark a real end-of-line
+        self.fit = options.fit
+        self.eol_mark = options.eol_mark  # --no-eol-mark: mark a real end-of-line
         # (NEWLINE_MARKER) in text mode - independent of text_wrap/-S, on
         # by default either way (see _draw_text_wrapped()/_unwrapped())
-        self.wheel_scroll_step = wheel_scroll_step
-        self.incremental_scroll = incremental_scroll  # --no-incremental-
+        self.wheel_scroll_step = options.wheel_scroll_step
+        self.incremental_scroll = options.incremental_scroll  # --no-incremental-
         # scroll: force every redraw through _draw()'s full-viewport
         # path, skipping the _scroll_shift_rows()/_draw_shifted()
         # shortcut - an escape hatch for a terminal where that shortcut
@@ -4656,7 +4761,9 @@ class Viewer:
         # but the status line alone doesn't touch any of that.
         self.rows, self.cols, _, _ = get_term_cells(fd)
         self.page = page
-        self._set_current_file()  # sets path/name/kind/npages/cache
+        self._set_current_file()  # sets path/name/npages/cache
+        if self.follow:
+            self._start_following()
         # For an office-kind first file, self.npages was just determined
         # above (by _ensure_office_pages(), lazily) rather than known
         # ahead of time the way main() clamps a PDF/image/text file's
@@ -4674,6 +4781,27 @@ class Viewer:
         # self.rows/self.cols are already set, above - see the comment there
         self.crop_width = 0
         self.x_offset = 0
+        # -c/--continuous image mode's current arrangement of pages on
+        # screen, rebuilt by _normalize_continuous() before every draw:
+        # [(page, top_px, img), ...], top_px being where that page's top
+        # edge sits relative to the top of the viewport (negative for
+        # the first one once it's scrolled partway out of view). Unused
+        # (left empty) outside continuous mode.
+        self._layout = []
+        self._view_height = 0  # how much of the viewport the layout fills
+        self._view_width = 0  # the widest page in it - the pan range
+        # -c/--continuous text mode (see _text_continuous()): every
+        # page's text, fetched once per file via extract_text_pages() and
+        # kept so toggling in and out of text mode doesn't re-run
+        # pdftotext each time - None until first needed.
+        self._text_pages = None
+        # Where each page's block starts in self.text_lines while the
+        # continuous text view is showing - for page 2 onward, that's
+        # the separator row just above its first line - or None when it
+        # isn't (one page's text at a time, or a non-paginated handler).
+        self._text_page_starts = None
+        self._text_separator_lines = frozenset()
+        self._text_max_page_lines = 0  # the -N gutter's width, per page
         self.help_active = False
         self.help_scroll = 0
         self._search_index = None  # lazily built, via PdfDocument.build_search_index()
@@ -4694,14 +4822,10 @@ class Viewer:
         self.text_x_offset_min = 0
         self.text_x_offset_max = 0
         self.text_max_line_width = 0
-        self.border_default = border  # --no-border, as given on the command line
         self.text_border = self._default_text_border()  # border around the
         # page's edges, in text mode; can be swept up along with the text
         # if you select-and-copy it, so it's toggled off with --no-border
         # (or on/off any time with the B key) - see _default_text_border()
-        self.wrap_default = wrap  # -S/--chop-long-lines, as given on the
-        # command line (inverted - this is "should it wrap", not "should
-        # it chop")
         self.text_wrap = self._default_text_wrap()  # soft-wrap long lines
         # instead of panning across them (h/l/H/L) - see
         # _default_text_wrap(); no border while wrapped (see
@@ -4709,7 +4833,7 @@ class Viewer:
         self._display_rows = None  # lazily built by _ensure_display_rows(),
         # only while text_wrap is on - [(line_idx, start, end), ...], one
         # entry per on-screen row
-        self.line_numbers = line_numbers  # -N/--line-numbers: right-
+        self.line_numbers = options.line_numbers  # -N/--line-numbers: right-
         # aligned gutter at the start of each row - see
         # _line_number_gutter_width(); no per-kind default (unlike
         # border/wrap/eol_mark) since there's no kind numbering wouldn't
@@ -4720,7 +4844,7 @@ class Viewer:
         # and the button hasn't come back up yet - see handle_drag()
         self._scrollbar_drag_row = None  # its latest position, not acted
         # on until flush_scrollbar_drag()
-        self.scrollbar = scrollbar  # --no-scrollbar: a column on the
+        self.scrollbar = options.scrollbar  # --no-scrollbar: a column on the
         # terminal's right edge showing scroll position - in both image
         # mode (_draw()) and text mode (_draw_text_wrapped()/
         # _draw_text_unwrapped()); "r" toggles it either way (see
@@ -4740,6 +4864,17 @@ class Viewer:
         self._last_x_offset = None
         self._last_zoom_key = None
         self._last_scroll = None
+        self._last_fit_key = None
+
+    def _invalidate_screen(self) -> None:
+        """Forget what's on screen, so the next image-mode draw starts
+        from a full clear (no incremental shift - see
+        _scroll_shift_rows()) and doesn't try to erase a search marker
+        that something else has already painted over - for anything that
+        overwrites the screen with something else (help, text mode, a
+        file switch, a mode toggle)."""
+        self._last_viewport_set = False
+        self._last_marker_bounds = None
 
     def request_resize(self):
         self.resized = True
@@ -4788,7 +4923,7 @@ class Viewer:
         return True
 
     def _set_current_file(self):
-        """Point path/name/kind/npages/doc_handler/cache at
+        """Point path/name/npages/doc_handler/cache at
         self.files[self.file_index] - just the file's identity, not the
         page/zoom/search/etc. state, which __init__ sets up once and
         go_to_file() resets explicitly on every later switch. Assumes
@@ -4799,22 +4934,26 @@ class Viewer:
         self.path = handler.path
         self.name = os.path.basename(handler.path)
         self.doc_handler = handler
-        self.kind = handler.kind  # "pdf", "image", "text", or "office"
-        self.npages = handler.page_count()  # None for an OfficeDocument
+        self.npages = handler.page_count()  # None for a RenderedDocument
         # until _ensure_office_pages() below actually renders it
-        self._ensure_office_pages()  # a no-op unless doc_handler is an
-        # OfficeDocument, and sets self.npages for real in that case
-        # (memoized on the handler itself - see OfficeDocument.pages -
+        self._ensure_office_pages()  # a no-op unless doc_handler is a
+        # RenderedDocument, and sets self.npages for real in that case
+        # (memoized on the handler itself - see RenderedDocument.pages -
         # so a revisit to an already-rendered file is still cheap)
-        self.cache = PageCache(handler.path, self.tmpdir, handler)
+        self.cache = PageCache(self.tmpdir, handler)
+        self._text_pages = None  # the previous file's text
+        self._text_page_starts = None
+        self._text_separator_lines = frozenset()
+        self._layout = []
 
     def _ensure_office_pages(self):
         """With multiple files on the command line, an office-kind one
-        (Word/Excel/PowerPoint/etc. via Quick Look) is only actually
+        (a RenderedDocument - Word/Excel/PowerPoint/etc. via Quick Look,
+        ODF via soffice, SVG, Markdown) is only actually
         rendered the moment it's about to be displayed - not upfront for
         every such file regardless of whether it's ever looked at - so
         this is where that render happens, the first time doc_handler is
-        an OfficeDocument. A no-op every time after that (doc_handler.
+        a RenderedDocument. A no-op every time after that (doc_handler.
         ensure_pages() remembers its own result on the handler itself,
         the same as a file that's always been rendered up front would
         be) other than resetting self.npages, which is cheap.
@@ -4829,7 +4968,7 @@ class Viewer:
         without leaving anything for a subsequent dump to clean up - see
         Viewer.dump_and_quit() and run_viewer()'s own quit_if_one_screen
         handling, which resets this flag once the outcome is known."""
-        if not isinstance(self.doc_handler, OfficeDocument):
+        if not isinstance(self.doc_handler, RenderedDocument):
             return
         progress = (
             _ProgressLine(not self.debug) if self.quit_if_one_screen
@@ -4838,7 +4977,6 @@ class Viewer:
         pages = self.doc_handler.ensure_pages(
             self.tmpdir, debug=self.debug,
             render_scale=self.office_render_scale, progress=progress,
-            continuous=self.office_continuous,
         )
         if not pages:
             pages = self.doc_handler._render_error_placeholder(
@@ -4904,8 +5042,7 @@ class Viewer:
         self.page = 1
         self.scroll = 0
         self.x_offset = 0
-        self._last_viewport_set = False
-        self._last_marker_bounds = None
+        self._invalidate_screen()
         if self.text_mode:
             self._load_text_page()
         else:
@@ -4930,20 +5067,24 @@ class Viewer:
         self.avail_height_px = cell_h * max(1, rows - 1 - self._dump_margin_rows)
         self.cache.clear()
         self.encode_cache.clear()
-        self._last_viewport_set = False
+        self._invalidate_screen()
         self._last_char_h = 0
-        self._last_marker_bounds = None
         self._display_rows = None  # stale - self.cols may have changed,
         # which is what wrapping is measured against
 
-    def _load_page(self):
-        self.encode_cache.clear()
+    def _page_image(self, page: int) -> Image.Image:
+        """`page`'s raster at the current fit mode and zoom - the one
+        _load_page() shows, and, under -c/--continuous, each of the
+        other pages stacked around it (see _build_continuous_layout())."""
         if self.fit == "height":
             target_height = max(1, round(self.avail_height_px * self.zoom))
-            self.img = self.cache.get(self.page, target_height, fit="height")
-        else:
-            target_width = max(1, round(self.base_width_px * self.zoom))
-            self.img = self.cache.get(self.page, target_width, fit="width")
+            return self.cache.get(page, target_height, fit="height")
+        target_width = max(1, round(self.base_width_px * self.zoom))
+        return self.cache.get(page, target_width, fit="width")
+
+    def _load_page(self):
+        self.encode_cache.clear()
+        self.img = self._page_image(self.page)
         self.crop_width = min(self.img.width, self.base_width_px)
         # Keep whatever horizontal position you panned to (h/l/H/L),
         # only clamping it to the image that just got loaded. Turning a
@@ -4955,7 +5096,165 @@ class Viewer:
         # itself deliberately instead; see set_zoom().
         self.x_offset = max(0, min(self.x_offset, self.img.width - self.crop_width))
         self.scroll_max = max(0, self.img.height - self.avail_height_px)
-        self.scroll = min(self.scroll, self.scroll_max)
+        if self.continuous:
+            # scroll_max still means "this page's bottom edge at the
+            # bottom of the screen" here (J/G), but scrolling itself may
+            # carry on past it into the gap and the next page -
+            # _normalize_continuous() moves on to that page once the
+            # position actually leaves this one.
+            self.scroll = min(self.scroll, self.img.height)
+        else:
+            self.scroll = min(self.scroll, self.scroll_max)
+
+    def _continuous_gap_px(self) -> int:
+        """Height of the gray band between two stacked pages under
+        -c/--continuous - a third of a text row, so it reads as a
+        boundary without costing much vertical space."""
+        return max(2, self.cell_h_px // 3)
+
+    def _set_top_page(self, page: int) -> None:
+        """Make `page` the one at the top of the viewport (self.page/
+        self.img/self.scroll_max) without _load_page()'s other resets -
+        _normalize_continuous()'s own step as scrolling crosses from
+        one page into the next, which mustn't throw away the encode
+        cache (the viewport's content hasn't changed, just which page
+        its position is counted from) or touch self.scroll."""
+        self.page = page
+        self.img = self._page_image(page)
+        self.scroll_max = max(0, self.img.height - self.avail_height_px)
+
+    def _normalize_continuous(self) -> None:
+        """Under -c/--continuous, bring (self.page, self.scroll) back
+        to its one canonical form and rebuild the on-screen layout from
+        it. Anything is free to leave self.scroll anywhere - past the
+        bottom of self.page (scroll_down()), negative (scroll_up()), or
+        so near the end of the document that the screen wouldn't be
+        full - and this sorts it out afterwards, the same way for every
+        caller:
+
+        1. While the position is past this page and its gap, move on to
+           the next page (counting the position from its top instead);
+           while it's negative, move back to the previous one.
+        2. If what's left from here to the end of the document is
+           shorter than the screen, pull the position back by the
+           difference (possibly into earlier pages) - the continuous
+           equivalent of scroll_max, so the last page's bottom edge
+           stops at the bottom of the screen instead of scrolling off.
+        3. Rebuild self._layout for the result.
+
+        Only ever touches pages that end up on screen (or were about to
+        be), so it never has to rasterize the whole document just to
+        know where everything is."""
+        gap = self._continuous_gap_px()
+        avail = self.avail_height_px
+        while self.page < self.npages and self.scroll >= self.img.height + gap:
+            self.scroll -= self.img.height + gap
+            self._set_top_page(self.page + 1)
+        while self.scroll < 0 and self.page > 1:
+            self._set_top_page(self.page - 1)
+            self.scroll += self.img.height + gap
+        self.scroll = max(0, self.scroll)
+
+        # Step 2: how much content there is from the top of the screen
+        # down to the end of the document - only as far as needed to
+        # know whether it fills the screen.
+        remaining = self.img.height - self.scroll
+        page = self.page
+        while remaining < avail and page < self.npages:
+            page += 1
+            remaining += gap + self._page_image(page).height
+        if remaining < avail:
+            self.scroll -= avail - remaining
+            while self.scroll < 0 and self.page > 1:
+                self._set_top_page(self.page - 1)
+                self.scroll += self.img.height + gap
+            self.scroll = max(0, self.scroll)
+        self._build_continuous_layout()
+
+    def _build_continuous_layout(self) -> None:
+        """self._layout (see __init__) for the current, already
+        normalized, position - plus what depends on it: the pan range
+        (self._view_width, the widest page on screen - pages can differ
+        in width under fit-to-height), self.crop_width/x_offset clamped
+        to it, and self._view_height."""
+        gap = self._continuous_gap_px()
+        layout = []
+        top = -self.scroll
+        page = self.page
+        while page <= self.npages and top < self.avail_height_px:
+            img = self.img if page == self.page else self._page_image(page)
+            layout.append((page, top, img))
+            top += img.height + gap
+            page += 1
+        self._layout = layout
+        _, last_top, last_img = layout[-1]
+        self._view_height = max(1, min(self.avail_height_px, last_top + last_img.height))
+        self._view_width = max(img.width for _, _, img in layout)
+        self.crop_width = min(self._view_width, self.base_width_px)
+        self.x_offset = max(0, min(self.x_offset, self._view_width - self.crop_width))
+        # Every page on screen has to stay in the page cache from one
+        # draw to the next, or a zoomed-out view with many small pages
+        # would re-rasterize some of them on every single scroll step.
+        self.cache.size = max(self.cache.size, len(layout) + 2)
+
+    def _content_width(self) -> int:
+        """How wide the pannable content is - the one page's own width,
+        or the widest page on screen under -c/--continuous (see
+        _build_continuous_layout())."""
+        return self._view_width if self.continuous and self._layout else self.img.width
+
+    def _max_x_offset(self) -> int:
+        """The furthest right the pan can go - the content's own width
+        (see _content_width()) past what fits on screen."""
+        return max(0, self._content_width() - self.crop_width)
+
+    def _set_x_offset(self, x_offset: int) -> None:
+        """Pan to `x_offset`, clamped to 0.._max_x_offset()."""
+        self.x_offset = max(0, min(self._max_x_offset(), x_offset))
+
+    def _clamp_image_scroll(self, scroll: int) -> int:
+        """A target scroll position for the current page, clamped to
+        what the view allows: 0..scroll_max normally, or left as-is
+        (apart from the top of the document) under -c/--continuous,
+        where _normalize_continuous() sorts out whatever lands past this
+        page's own end on the next draw."""
+        if self.continuous:
+            return scroll
+        return max(0, min(self.scroll_max, scroll))
+
+    def _view_crop(self, top: int, height: int) -> Image.Image:
+        """The strip of the viewport from `top` to `top + height`
+        (pixels down from its top edge), self.crop_width wide at the
+        current pan - one page's own crop normally, or under
+        -c/--continuous a fresh image with every page in self._layout
+        that overlaps the strip pasted in, over a CONTINUOUS_GAP_COLOR
+        background that shows through between pages (and beside any
+        narrower than the widest one)."""
+        if not self.continuous:
+            return self.img.crop((
+                self.x_offset, self.scroll + top,
+                self.x_offset + self.crop_width, self.scroll + top + height,
+            ))
+        canvas = Image.new("RGB", (self.crop_width, height), CONTINUOUS_GAP_COLOR)
+        for _page, page_top, img in self._layout:
+            y0 = max(top, page_top)
+            y1 = min(top + height, page_top + img.height)
+            x1 = min(img.width, self.x_offset + self.crop_width)
+            if y1 <= y0 or x1 <= self.x_offset:
+                continue  # this page doesn't reach into the strip
+            piece = img.crop((self.x_offset, y0 - page_top, x1, y1 - page_top))
+            canvas.paste(piece, (0, y0 - top))
+        return canvas
+
+    def _visible_page_top(self, page: int) -> "int | None":
+        """Where `page`'s top edge sits relative to the top of the
+        viewport (see _view_crop()), or None if it isn't on screen."""
+        if not self.continuous:
+            return -self.scroll if page == self.page else None
+        for p, top, _img in self._layout:
+            if p == page:
+                return top
+        return None
 
     def set_zoom(self, new_zoom):
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, new_zoom))
@@ -4991,8 +5290,7 @@ class Viewer:
         self.x_offset = 0
 
     def pan(self, dx):
-        max_offset = max(0, self.img.width - self.crop_width)
-        self.x_offset = max(0, min(max_offset, self.x_offset + dx))
+        self._set_x_offset(self.x_offset + dx)
 
     def _relayout(self):
         """Redo the layout after something on screen changed how much
@@ -5032,7 +5330,7 @@ class Viewer:
         whichever unit the current mode scrolls in - the inverse of
         _top_text_line(), so the pair of them carry a reading position
         across anything that changes the layout underneath it."""
-        self.text_scroll = self._row_for_line(line_idx) if self.text_wrap else line_idx
+        self.text_scroll = self._text_row_for_line(line_idx)
         self._clamp_text_scroll()
 
     def _load_content(self):
@@ -5075,10 +5373,9 @@ class Viewer:
             rows = []
             for i, line in enumerate(self.text_lines):
                 if gutter_width:
-                    num = str(i + 1).rjust(gutter_width - 1)
-                    line = LINE_NUMBER_COLOR + num + " " + LINE_NUMBER_RESET + line
+                    line = self._gutter_text(i + 1, gutter_width) + line
                 if self.eol_mark:
-                    line += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
+                    line += EOL_MARK
                 rows.append(line)
             # \r\n, not just \n: the terminal is in raw mode (tty.setraw()
             # - see RawTerminal) for the whole run regardless of which
@@ -5121,26 +5418,48 @@ class Viewer:
 
     def hide_help(self):
         self.help_active = False
-        self._last_viewport_set = False  # help chars overlay the page
-        self._last_marker_bounds = None
+        self._invalidate_screen()  # help chars overlay the page
         self.refresh()
+
+    def handle_help_key(self, key: str) -> None:
+        """A key pressed while the help screen is up: only "q"/F1 (close
+        it) and the scroll keys (for when KEY_TABLE is taller than the
+        box) do anything. Everything else is swallowed so page keys can't
+        leak through underneath it."""
+        if key in ("q", "F1"):
+            self.hide_help()
+        elif key in FORWARD_LINE_KEYS:
+            self.scroll_help(1)
+        elif key in BACKWARD_LINE_KEYS:
+            self.scroll_help(-1)
+        elif key in FORWARD_WINDOW_KEYS:
+            self.scroll_help(max(1, self.rows - 3))
+        elif key in BACKWARD_WINDOW_KEYS:
+            self.scroll_help(-max(1, self.rows - 3))
+
+    def can_enter_text_mode(self) -> bool:
+        """Whether this file has any text-mode content to show at all -
+        enter_text_mode()'s own precondition, and what run_viewer()'s
+        startup fallback on a terminal without inline images checks
+        before switching to text mode for you."""
+        return (
+            self.doc_handler.supports_text_mode()
+            and self.doc_handler.extract_text(self.page) is not None
+        )
 
     def enter_text_mode(self):
         """Switch to text mode - False (no-op) if there's no text to
         show at all, which for an OfficeDocument means textutil
         couldn't extract anything from this particular file (e.g. a
         spreadsheet or slide deck - see extract_office_text())."""
-        if not self.doc_handler.supports_text_mode():
-            return False
-        if self.doc_handler.extract_text(self.page) is None:
+        if not self.can_enter_text_mode():
             return False
         self.text_mode = True
         # Mouse reporting is only useful (and only turned on) for
         # clicking hyperlinks in the page image; leave it off here so
         # the terminal's own click-drag text selection works normally.
         sys.stdout.write(MOUSE_OFF)
-        self._last_viewport_set = False
-        self._last_marker_bounds = None
+        self._invalidate_screen()
         reindex_search = (
             self.search_query and self.doc_handler.search_resets_on_text_mode_toggle()
         )
@@ -5177,8 +5496,7 @@ class Viewer:
             self.toggle_copy_mode()
         self.text_mode = False
         sys.stdout.write(MOUSE_ON)
-        self._last_viewport_set = False
-        self._last_marker_bounds = None
+        self._invalidate_screen()
         # self.page may have moved while browsing in text mode (n/p, g/G,
         # <N>g all update it), but self.img was never touched during that
         # - refresh() only reloads it on a resize - so without this it'd
@@ -5230,7 +5548,120 @@ class Viewer:
             self.refresh()  # so draw the now-decoration-free view here
         return True
 
+    def _text_continuous(self) -> bool:
+        """Whether text mode is showing (or would show) the continuous
+        text view: every page's text in one scrollable run, a separator
+        row between each page and the next, instead of one page at a
+        time - -c/--continuous, for a handler whose text mode is
+        paginated in the first place (a PDF, or an Office document
+        rendered to one). Anything else already shows its whole text as
+        one flowing blob, so -c has nothing to change there."""
+        return self.continuous and self.doc_handler.text_mode_is_paginated()
+
+    def _build_continuous_text(self, pages: "list[list[str]]") -> None:
+        """Stitch `pages` (extract_text_pages()'s per-page line lists)
+        into self.text_lines for the continuous text view, recording
+        where each page's block starts (self._text_page_starts) and
+        which rows are the separators - one heading every page,
+        page 1 included, so each page's own number is shown right above
+        it (see _text_separator_rule()). A separator is
+        stored as an empty line - so wrapping, the pan range, and the
+        search all leave it alone for free - and drawn as a rule by
+        _text_separator_rule() instead. Each page's trailing blank
+        lines are dropped first: pdftotext -layout pads out to the
+        page's own bottom margin, which would otherwise leave a
+        screenful of nothing before every separator."""
+        lines = []
+        starts = []
+        separators = set()
+        max_page_lines = 0
+        for i, page_lines in enumerate(pages):
+            page_lines = list(page_lines)
+            while page_lines and not page_lines[-1].strip():
+                page_lines.pop()
+            starts.append(len(lines))
+            separators.add(len(lines))
+            lines.append("")
+            lines.extend(page_lines)
+            max_page_lines = max(max_page_lines, len(page_lines))
+        self.text_lines = lines
+        self._text_page_starts = starts
+        self._text_separator_lines = frozenset(separators)
+        self._text_max_page_lines = max_page_lines
+
+    def _text_page_of_line(self, line_idx: int) -> int:
+        """The page (1-based) raw line `line_idx` belongs to in the
+        continuous text view - a separator row counting as part of the
+        page it introduces - or just self.page outside it."""
+        if self._text_page_starts is None:
+            return self.page
+        page = bisect.bisect_right(self._text_page_starts, line_idx)
+        return max(1, min(len(self._text_page_starts), page))
+
+    def _text_page_range(self, page: int) -> "tuple[int, int]":
+        """(start, end) raw line indices of `page`'s own text within
+        self.text_lines - the whole of it when only one page's text is
+        loaded, or that page's share of the continuous text view
+        (excluding the separator row above it)."""
+        if self._text_page_starts is None:
+            return 0, len(self.text_lines)
+        page = max(1, min(len(self._text_page_starts), page))
+        start = self._text_page_starts[page - 1] + 1
+        if page < len(self._text_page_starts):
+            end = self._text_page_starts[page]
+        else:
+            end = len(self.text_lines)
+        return start, max(start, end)
+
+    def _text_row_for_line(self, line_idx: int, last: bool = False) -> int:
+        """The scroll position (text_scroll's unit: a raw line index
+        unwrapped, a display row wrapped) of raw line `line_idx` - its
+        first display row, or its last one if `last`."""
+        if not self.text_wrap:
+            return line_idx
+        if not last:
+            return self._row_for_line(line_idx)
+        self._ensure_display_rows()
+        row = self._row_for_line(line_idx)
+        while row + 1 < len(self._display_rows) and self._display_rows[row + 1][0] == line_idx:
+            row += 1
+        return row
+
+    def _text_page_top_row(self, page: int) -> int:
+        """Where to scroll to put `page`'s top at the top of the screen
+        in the continuous text view: its separator row, so the page
+        number it shows is the first thing you see."""
+        if self._text_page_starts is None:
+            return self.text_scroll_min
+        return self._text_row_for_line(self._text_page_starts[page - 1])
+
+    def _sync_text_page(self) -> None:
+        """In the continuous text view, keep self.page following the
+        page at the top of the screen (for the status line, n/p, and
+        which page image mode comes back to) - a no-op otherwise, where
+        self.page only ever changes by loading a different page."""
+        if self._text_page_starts is not None:
+            self.page = self._text_page_of_line(self._top_text_line())
+
     def _load_text_page(self):
+        if self._text_continuous():
+            # extract_text_pages() is one pdftotext run over the whole
+            # document - fetched once per file and kept (see __init__),
+            # since toggling t or c shouldn't have to wait for it again.
+            if self._text_pages is None:
+                self._text_pages = self.doc_handler.extract_text_pages(self.npages)
+            if self._text_pages is not None:
+                self._build_continuous_text(self._text_pages)
+                self._display_rows = None
+                self.text_scroll = 0
+                self.text_x_offset = 0
+                self._clamp_text_scroll()
+                self.text_scroll = self._text_page_top_row(self.page)
+                self.text_x_offset = self.text_x_offset_min
+                self._clamp_text_scroll()
+                return
+        self._text_page_starts = None
+        self._text_separator_lines = frozenset()
         # For a handler whose text isn't paginated (office/text/rtf),
         # extract_text() ignores `page` and returns the whole document
         # every time - simplest to just always ask fresh here rather
@@ -5274,7 +5705,7 @@ class Viewer:
         --no-border, since there's usually no real "page" boundary in
         one worth bordering; otherwise whatever --no-border asked for).
         The B key can still toggle either way, on top of this default."""
-        return self.doc_handler.default_text_border(self.border_default)
+        return self.doc_handler.default_text_border(self.options.border)
 
     def toggle_text_wrap(self):
         """Switches between soft-wrapping long lines and panning across
@@ -5348,7 +5779,67 @@ class Viewer:
         column."""
         if not self.line_numbers or not self.text_lines:
             return 0
+        if self._text_page_starts is not None:
+            # Numbered from 1 on every page (see _text_line_number()), so
+            # only the longest page matters, not the whole document.
+            return len(str(max(1, self._text_max_page_lines))) + 1
         return len(str(len(self.text_lines))) + 1
+
+    def _text_line_number(self, line_idx: int) -> "int | None":
+        """The -N gutter's number for raw line `line_idx`: its position
+        in self.text_lines, or in the continuous text view its position
+        within its own page - the same number it'd have with only that
+        page loaded, so it still matches <N>g (see go_to_text_line()).
+        None for a separator row, which gets no number at all."""
+        if self._text_page_starts is None:
+            return line_idx + 1
+        if line_idx in self._text_separator_lines:
+            return None
+        start, _end = self._text_page_range(self._text_page_of_line(line_idx))
+        return line_idx - start + 1
+
+    def _text_separator_rule(self, line_idx: int, width: int) -> str:
+        """The continuous text view's separator row for raw line
+        `line_idx`, `width` columns of it: a horizontal rule with the
+        number of the page it introduces ("N/M") near its left end
+        (dropped if there's no room for it) - the rule in
+        PAGE_SEPARATOR_COLOR, the number itself in PAGE_NUMBER_COLOR."""
+        width = max(0, width)
+        label = f" {self._text_page_of_line(line_idx)}/{self.npages} "
+        if len(label) + 2 > width:
+            return PAGE_SEPARATOR_COLOR + "─" * width + SGR_RESET
+        return (
+            PAGE_SEPARATOR_COLOR + "──" + SGR_RESET
+            + PAGE_NUMBER_COLOR + label + SGR_RESET
+            + PAGE_SEPARATOR_COLOR + "─" * (width - 2 - len(label)) + SGR_RESET
+        )
+
+    def toggle_continuous(self) -> None:
+        """c: switch -c/--continuous on/off, staying where you were -
+        the same page (and, in text mode, the same line of it) -
+        rather than starting over at the top."""
+        page = self.page
+        if self.text_mode:
+            # Measured against the current layout, before it changes:
+            # how many lines into its page the top of the screen is.
+            start, _end = self._text_page_range(page)
+            line_offset = max(0, self._top_text_line() - start)
+        self.continuous = not self.continuous
+        self._invalidate_screen()
+        if self.text_mode:
+            if self.doc_handler.text_mode_is_paginated():
+                self.page = page
+                self._load_text_page()
+                if line_offset:
+                    start, _end = self._text_page_range(page)
+                    self._scroll_to_text_line(start + line_offset)
+        else:
+            # Re-clamps the scroll position for whichever mode is now
+            # on - to this page's own range when turning it off; turning
+            # it on, _draw()'s _normalize_continuous() takes it from here.
+            self._load_page()
+        self.refresh()
+        self.draw_status("continuous view " + ("on" if self.continuous else "off"))
 
     def toggle_scrollbar(self):
         """Switches the scrollbar on/off - "r" (see run_viewer(), which
@@ -5391,7 +5882,7 @@ class Viewer:
         - that text mode's own single flowing view doesn't split on)."""
         total_extent = avail_rows + (self.text_scroll_max - self.text_scroll_min)
         start = self.text_scroll - self.text_scroll_min
-        if self.doc_handler.text_mode_is_paginated():
+        if self.doc_handler.text_mode_is_paginated() and self._text_page_starts is None:
             page, npages = self.page, self.npages
         else:
             page, npages = 1, 1
@@ -5427,17 +5918,15 @@ class Viewer:
         otherwise; off for a PDF/Office's own derived text view, which
         pans instead, regardless of -S). The -S key sequence can still
         toggle either way, on top of this default."""
-        return self.doc_handler.default_text_wrap(self.wrap_default)
+        return self.doc_handler.default_text_wrap(self.options.wrap)
+
+    def _set_text_scroll(self, row: int) -> None:
+        """Scroll text mode to `row`, clamped to the current
+        text_scroll_min..text_scroll_max (see _clamp_text_scroll(),
+        which works those out)."""
+        self.text_scroll = max(self.text_scroll_min, min(self.text_scroll_max, row))
 
     def _clamp_text_scroll(self):
-        # The border sits at the page's actual edges - one row above the
-        # first line, one below the last; one column left of column 0,
-        # one right of the widest line - which is usually off-screen at
-        # the default scroll/pan position. It only comes into view by
-        # scrolling/panning one step past the content itself, so with the
-        # border on, the scroll/pan range is widened by exactly that much;
-        # with it off, the range is exactly what it was before this
-        # feature existed.
         avail_rows = self._text_avail_rows()
         if self.text_wrap:
             # No border while wrapped (see _draw_text_wrapped()) - the
@@ -5447,9 +5936,7 @@ class Viewer:
             self._ensure_display_rows()
             self.text_scroll_min = 0
             self.text_scroll_max = max(0, len(self._display_rows) - avail_rows)
-            self.text_scroll = max(
-                self.text_scroll_min, min(self.text_scroll, self.text_scroll_max)
-            )
+            self._set_text_scroll(self.text_scroll)
             self.text_x_offset_min = 0
             self.text_x_offset_max = 0
             self.text_x_offset = 0
@@ -5464,14 +5951,18 @@ class Viewer:
         # with it off, the range is exactly what it was before this
         # feature existed.
         if self.text_border:
-            self.text_scroll_min = -1
-            self.text_scroll_max = max(-1, len(self.text_lines) - avail_rows + 1)
+            # The continuous text view has no separate top border row:
+            # page 1's own separator row is drawn as the border's top
+            # edge instead (see _draw_text_unwrapped()), so there's
+            # nothing above row 0 to scroll up to.
+            self.text_scroll_min = -1 if self._text_page_starts is None else 0
+            self.text_scroll_max = max(
+                self.text_scroll_min, len(self.text_lines) - avail_rows + 1
+            )
         else:
             self.text_scroll_min = 0
             self.text_scroll_max = max(0, len(self.text_lines) - avail_rows)
-        self.text_scroll = max(
-            self.text_scroll_min, min(self.text_scroll, self.text_scroll_max)
-        )
+        self._set_text_scroll(self.text_scroll)
 
         # The -N gutter (if on) lives outside this space entirely - see
         # _draw_text_unwrapped() - so the "page" is narrower by that much.
@@ -5508,6 +5999,28 @@ class Viewer:
         match = self.search_matches[self.search_pos]
         return match if match[0] == self.page else None
 
+    def _visible_search_match(self) -> "tuple | None":
+        """What to actually draw a match marker/highlight for: the same
+        as _active_search_page_match(), except that under
+        -c/--continuous the match can be on any page that's on screen
+        too, not just the one at the top - in image mode, any page in
+        self._layout; in the continuous text view, any page at all,
+        since the whole document's text is loaded there and the
+        highlight is simply drawn wherever that line is. Used only for
+        drawing: everything that repositions the view around a match
+        still goes by _active_search_page_match(), since it works from
+        the current page's own coordinates."""
+        if self.search_pos is None:
+            return None
+        match = self.search_matches[self.search_pos]
+        if match[0] == self.page:
+            return match
+        if not self.continuous:
+            return None
+        if self.text_mode:
+            return match if self._text_continuous() else None
+        return match if self._visible_page_top(match[0]) is not None else None
+
     def _active_search_occurrence_index(self):
         """How many other matches with the same page precede
         self.search_matches[self.search_pos] (0-indexed) - i.e. this is
@@ -5521,17 +6034,19 @@ class Viewer:
         if self.search_pos is None:
             return None
         page = self.search_matches[self.search_pos][0]
-        if page != self.page:
-            return None
+        if page != self.page and not self._text_continuous():
+            return None  # (the continuous text view has every page loaded)
         return sum(1 for m in self.search_matches[: self.search_pos] if m[0] == page)
 
     def _match_bbox_px(self, match):
-        """Pixel bounding box (in the current page image) of a
+        """Pixel bounding box (in its own page's image, at the current
+        zoom - self.img when it's on the current page) of a
         (page, xMin, yMin, xMax, yMax) search match, in points."""
-        _, xmin_pt, ymin_pt, xmax_pt, ymax_pt = match
-        page_info = self._search_index[self.page - 1]
-        scale_x = self.img.width / page_info["width_pt"]
-        scale_y = self.img.height / page_info["height_pt"]
+        page, xmin_pt, ymin_pt, xmax_pt, ymax_pt = match
+        img = self.img if page == self.page else self._page_image(page)
+        page_info = self._search_index[page - 1]
+        scale_x = img.width / page_info["width_pt"]
+        scale_y = img.height / page_info["height_pt"]
         return (
             xmin_pt * scale_x,
             ymin_pt * scale_y,
@@ -5539,15 +6054,22 @@ class Viewer:
             ymax_pt * scale_y,
         )
 
-    def _find_all_text_matches(self):
+    def _find_all_text_matches(self, line_range=None):
         """Every occurrence of self.search_query within self.text_lines
-        (the current page's pdftotext -layout text), as a list of
-        (line_idx, start, end), in reading order."""
+        (the current page's pdftotext -layout text, or the whole
+        document's), as a list of (line_idx, start, end), in reading
+        order - only lines line_range[0] up to (not including)
+        line_range[1] of it, if given (one page's share of the
+        continuous text view - see _text_page_range())."""
         if not self.search_query:
             return []
         pattern = compile_search_pattern(self.search_query)
+        start, end = line_range if line_range else (0, len(self.text_lines))
         results = []
-        for i, line in enumerate(self.text_lines):
+        for i in range(start, end):
+            if i in self._text_separator_lines:
+                continue  # drawn as a rule, not text - see _text_separator_rule()
+            line = self.text_lines[i]
             for m in pattern.finditer(line):
                 if m.start() != m.end():
                     results.append((i, m.start(), m.end()))
@@ -5563,7 +6085,7 @@ class Viewer:
             if len(match) == 3:
                 return match
             return self._text_highlight_for_match(match)
-        return self._text_highlight_for_match(self._active_search_page_match())
+        return self._text_highlight_for_match(self._visible_search_match())
 
     def _text_highlight_for_match(self, match):
         """(line_idx, start, end) of `match` within self.text_lines, or
@@ -5571,7 +6093,8 @@ class Viewer:
         possibility, given the two extractions can differ)."""
         if match is None:
             return None
-        all_matches = self._find_all_text_matches()
+        page_start, page_end = self._text_page_range(match[0])
+        all_matches = self._find_all_text_matches((page_start, page_end))
         if not all_matches:
             return None
 
@@ -5582,26 +6105,56 @@ class Viewer:
         # Fall back to a proportional-position guess, for the rare case
         # where the two extractions disagree on how many times the query
         # appears on this page.
-        _, _xmin_pt, ymin_pt, _xmax_pt, _ymax_pt = match
-        page_info = self._search_index[self.page - 1]
-        height_pt = page_info["height_pt"]
-        approx_line = (
-            round((ymin_pt / height_pt) * len(self.text_lines)) if height_pt else 0
-        )
+        approx_line = self._approx_text_line(match)
         return min(all_matches, key=lambda c: abs(c[0] - approx_line))
+
+    def _approx_text_line(self, match: tuple) -> int:
+        """A guess at the raw text_lines index a (page, xMin, yMin, xMax,
+        yMax) bbox match falls on - its vertical position on the page,
+        as the same fraction of that page's own lines - for when the
+        text extraction can't pin it down exactly (see
+        _text_highlight_for_match())."""
+        page, _xmin_pt, ymin_pt, _xmax_pt, _ymax_pt = match
+        height_pt = self._search_index[page - 1]["height_pt"]
+        page_start, page_end = self._text_page_range(page)
+        return page_start + (
+            round((ymin_pt / height_pt) * (page_end - page_start)) if height_pt else 0
+        )
+
+    def _scroll_text_to_row(self, row: int) -> None:
+        """Scroll text mode so `row` lands a quarter of the screen down
+        rather than jammed against the top edge - where a search match
+        is put, so there's context above it."""
+        self._set_text_scroll(row - self._text_avail_rows() // 4)
+
+    def _scroll_text_to_highlight(self, line_idx: int, start: int, end: int) -> None:
+        """Bring characters start..end of raw line `line_idx` into view:
+        pan them to the middle if they're off to either side of an
+        unwrapped view (wrapped text has no pan to speak of), then scroll
+        their row into place (_scroll_text_to_row())."""
+        if not self.text_wrap:
+            avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
+            line = self.text_lines[line_idx]
+            col_start = display_width(line[:start])
+            col_end = display_width(line[:end])
+            if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
+                self.text_x_offset = max(
+                    self.text_x_offset_min,
+                    min(
+                        self.text_x_offset_max,
+                        round((col_start + col_end) / 2 - avail_cols / 2),
+                    ),
+                )
+        self._scroll_text_to_row(self._text_row_for_line(line_idx))
 
     def _scroll_image_to_match(self, match):
         """Scroll/pan the image view so `match` is visible, landing it a
         little below the top-left rather than jammed against the edge."""
         px_left, px_top, px_right, px_bottom = self._match_bbox_px(match)
         margin = self.avail_height_px // 4
-        self.scroll = max(0, min(self.scroll_max, round(px_top) - margin))
-        max_x_offset = max(0, self.img.width - self.crop_width)
+        self.scroll = self._clamp_image_scroll(round(px_top) - margin)
         if px_left < self.x_offset or px_right > self.x_offset + self.crop_width:
-            self.x_offset = max(
-                0,
-                min(max_x_offset, round((px_left + px_right) / 2 - self.crop_width / 2)),
-            )
+            self._set_x_offset(round((px_left + px_right) / 2 - self.crop_width / 2))
 
     def _scroll_text_to_match(self, match):
         """Scroll/pan the text view so `match` is visible, landing it a
@@ -5611,39 +6164,32 @@ class Viewer:
         view (the text-mode equivalent of _scroll_image_to_match()).
         Wrapped text has no pan to speak of - _row_for_line() converts
         the raw line position into a display-row scroll target instead."""
-        avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
         highlight = self._text_highlight_for_match(match)
         if highlight:
-            line_idx, start, end = highlight
-            if self.text_wrap:
-                target_row = self._row_for_line(line_idx)
-            else:
-                line = self.text_lines[line_idx]
-                col_start = display_width(line[:start])
-                col_end = display_width(line[:end])
-                if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
-                    self.text_x_offset = max(
-                        self.text_x_offset_min,
-                        min(
-                            self.text_x_offset_max,
-                            round((col_start + col_end) / 2 - avail_cols / 2),
-                        ),
-                    )
-                target_row = line_idx
+            self._scroll_text_to_highlight(*highlight)
         else:
-            _, _xmin_pt, ymin_pt, _xmax_pt, _ymax_pt = match
-            height_pt = self._search_index[self.page - 1]["height_pt"]
-            line_idx = (
-                round((ymin_pt / height_pt) * len(self.text_lines)) if height_pt else 0
-            )
-            target_row = self._row_for_line(line_idx) if self.text_wrap else line_idx
-        avail_rows = self._text_avail_rows()
-        margin = avail_rows // 4
-        self.text_scroll = max(
-            self.text_scroll_min, min(self.text_scroll_max, target_row - margin)
-        )
+            self._scroll_text_to_row(self._text_row_for_line(self._approx_text_line(match)))
 
     def go_to_page_text(self, page, scroll):
+        """Show `page` in text mode: scroll=0 is its top, None its
+        bottom (continuous scroll-up wants that), and any other number
+        that many lines down into it."""
+        if self._text_page_starts is not None:
+            self._go_to_page_continuous_text(page, scroll)
+            return
+        if not self.doc_handler.text_mode_is_paginated():
+            # One flowing blob (a Markdown file's raw source, an Office
+            # document via textutil, ...) - text mode is a single page
+            # however many the image view has, so there's no other page
+            # to go to: only the top or bottom of this one. self.page is
+            # left alone, still the image-mode page `t` returns to.
+            if scroll is None:
+                self.text_scroll = self.text_scroll_max
+            elif scroll == 0:
+                self.text_scroll = self.text_scroll_min
+            else:
+                self._scroll_to_text_line(scroll)
+            return
         self.page = max(1, min(self.npages, page))
         self._load_text_page()  # already leaves text_scroll at text_scroll_min
         if scroll is None:
@@ -5652,9 +6198,30 @@ class Viewer:
             # 0 means "top of page", which _load_text_page() already set
             # up (text_scroll_min, revealing the border if there is one);
             # anything else is a specific line to land on (e.g. <N>g).
-            self.text_scroll = max(
-                self.text_scroll_min, min(self.text_scroll_max, scroll)
-            )
+            self._set_text_scroll(scroll)
+
+    def _go_to_page_continuous_text(self, page: int, scroll: "int | None") -> None:
+        """go_to_page_text() for the continuous text view - where every
+        page is already loaded, so it's only ever a scroll. The bottom
+        (scroll=None) puts the page's last line at the bottom of the
+        screen, but never so far that the page's own top leaves the top
+        of it - which would make the previous page the current one, and
+        a second J/G walk back another page."""
+        page = max(1, min(self.npages, page))
+        self.page = page
+        start, end = self._text_page_range(page)
+        top_row = self._text_page_top_row(page)
+        if scroll is None:
+            if page == self.npages:
+                target = self.text_scroll_max
+            else:
+                bottom_row = self._text_row_for_line(max(start, end - 1), last=True)
+                target = max(top_row, bottom_row - self._text_avail_rows() + 1)
+        elif scroll == 0:
+            target = top_row
+        else:
+            target = self._text_row_for_line(min(max(start, end - 1), start + scroll))
+        self._set_text_scroll(target)
 
     def go_to_text_line(self, n):
         """Jump to line `n` (1-based) within the current page's text -
@@ -5665,20 +6232,35 @@ class Viewer:
         to guarantee the requested line is the one that ends up on top.
         While wrapped, "line n" still means the same raw line - it just
         lands on whichever display row that line's wrapping starts at."""
-        target_line = max(0, min(len(self.text_lines) - 1, n - 1))
-        row = self._row_for_line(target_line) if self.text_wrap else target_line
+        # Line numbers count from the top of each page in the continuous
+        # text view too (see _draw_text_unwrapped()), so "line n" is
+        # still the current page's own line n there.
+        start, end = self._text_page_range(self.page)
+        target_line = max(start, min(max(start, end - 1), start + n - 1))
+        row = self._text_row_for_line(target_line)
         self.text_scroll = max(self.text_scroll_min, row)
 
     def text_scroll_down(self, n):
+        if self._text_page_starts is not None:
+            # The continuous text view: one scroll range for the whole
+            # document, no page turn at either end of a page.
+            self.text_scroll = min(self.text_scroll_max, self.text_scroll + n)
+            return
         if self.text_scroll < self.text_scroll_max:
             self.text_scroll = min(self.text_scroll_max, self.text_scroll + n)
-        elif self.page < self.npages:
+        elif self.doc_handler.text_mode_is_paginated() and self.page < self.npages:
+            # Only a paginated text mode has a next page to turn to -
+            # anything else already shows the whole document, and
+            # "turning" to image page 2 would just show it all again.
             self.go_to_page_text(self.page + 1, 0)
 
     def text_scroll_up(self, n):
+        if self._text_page_starts is not None:
+            self.text_scroll = max(self.text_scroll_min, self.text_scroll - n)
+            return
         if self.text_scroll > self.text_scroll_min:
             self.text_scroll = max(self.text_scroll_min, self.text_scroll - n)
-        elif self.page > 1:
+        elif self.doc_handler.text_mode_is_paginated() and self.page > 1:
             self.go_to_page_text(self.page - 1, None)
 
     def _row_for_line(self, line_idx):
@@ -5744,7 +6326,53 @@ class Viewer:
                 rows.append((i, start, end))
         self._display_rows = rows
 
+    @staticmethod
+    def _gutter_text(number: "int | None", gutter_width: int) -> str:
+        """The -N gutter cell for a row: `number` right-aligned in gray,
+        or just blanks for a row that gets none (a wrapped continuation,
+        a border row, a page separator, ...)."""
+        if number is None:
+            return " " * gutter_width
+        return LINE_NUMBER_COLOR + str(number).rjust(gutter_width - 1) + " " + SGR_RESET
+
+    @staticmethod
+    def _splice_highlight(rendered: str, start: int, end: int) -> str:
+        """`rendered` with characters start..end (clipped to it) wrapped
+        in TEXT_HIGHLIGHT_COLOR - the search match's highlight. The
+        offsets are relative to `rendered` itself, so either caller
+        shifts them from the raw line first (by where its wrapped
+        segment or pan window starts)."""
+        start, end = max(start, 0), min(end, len(rendered))
+        if start >= len(rendered) or end <= start:
+            return rendered
+        return rendered[:start] + TEXT_HIGHLIGHT_COLOR + rendered[start:end] + SGR_RESET + rendered[end:]
+
+    def _scrollbar_escapes(self, avail_rows: int, start_frac: float, visible_frac: float) -> "list[str]":
+        """The scrollbar column's cells as positioned escape strings -
+        [] while it's off - for either mode's draw."""
+        if not self.scrollbar:
+            return []
+        cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
+        return [f"\x1b[{i + 1};{self.cols}H{cell}" for i, cell in enumerate(cells)]
+
+    def _finish_text_frame(self, rows: "list[str]", avail_rows: int) -> None:
+        """Write one text-mode frame: clear the screen, then `rows` (the
+        positioned row escapes _draw_text_wrapped()/_unwrapped() built),
+        the scrollbar and the status line. Attributes are reset *before*
+        clearing, not after: a still-active SGR state (e.g. a background
+        color left on by draw_search_prompt(), which doesn't reset it
+        since it's mid-edit) is what \x1b[2J fills the newly-blanked
+        cells with - resetting only afterwards colors future writes but
+        leaves every cell the clear itself touched stuck in that stale
+        color."""
+        out = [SGR_RESET, "\x1b[H\x1b[2J", *rows]
+        out += self._scrollbar_escapes(avail_rows, *self._text_scrollbar_fractions(avail_rows))
+        out.append(self.format_status())
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
     def _draw_text(self):
+        self._sync_text_page()
         if self.text_wrap:
             self._draw_text_wrapped()
         else:
@@ -5763,7 +6391,7 @@ class Viewer:
         avail_rows = self._text_avail_rows()
         highlight = self._text_search_highlight()
 
-        out = [STATUS_COLOR_OFF, "\x1b[H\x1b[2J"]
+        out = []
         n_rows = len(self._display_rows)
         gutter_width = self._line_number_gutter_width()
 
@@ -5775,49 +6403,37 @@ class Viewer:
 
             line_idx, start, end = self._display_rows[virtual_row]
             rendered = self.text_lines[line_idx][start:end]
+            number = self._text_line_number(line_idx)
 
             if gutter_width:
                 # Only the line's first display row gets a number - a
                 # wrapped continuation row (start != 0) stays blank.
-                if start == 0:
-                    num = str(line_idx + 1).rjust(gutter_width - 1)
-                    gutter_text = LINE_NUMBER_COLOR + num + " " + LINE_NUMBER_RESET
-                else:
-                    gutter_text = " " * gutter_width
+                gutter_text = self._gutter_text(number if start == 0 else None, gutter_width)
                 out.append(f"\x1b[{screen_row};1H{gutter_text}")
+
+            if line_idx in self._text_separator_lines:
+                # Left blank while copy mode is on, so a select-and-copy
+                # across a page boundary picks up nothing but the text.
+                if self._copy_mode_saved is None:
+                    rule = self._text_separator_rule(line_idx, self._text_avail_cols() - gutter_width)
+                    out.append(f"\x1b[{screen_row};{gutter_width + 1}H{rule}")
+                continue
 
             if highlight and highlight[0] == line_idx:
                 # start/end are character offsets into the raw line;
-                # clip them to this segment, then shift into the
-                # segment's own (rendered-relative) coordinates.
+                # shift them into this segment's own coordinates.
                 _, h_start, h_end = highlight
-                h_start, h_end = max(h_start, start) - start, min(h_end, end) - start
-                if h_start < len(rendered) and h_end > h_start:
-                    rendered = (
-                        rendered[:h_start]
-                        + TEXT_HIGHLIGHT_COLOR
-                        + rendered[h_start:h_end]
-                        + TEXT_HIGHLIGHT_RESET
-                        + rendered[h_end:]
-                    )
+                rendered = self._splice_highlight(rendered, h_start - start, h_end - start)
 
             if self.eol_mark and end == len(self.text_lines[line_idx]):
                 # This segment reaches the actual end of the raw line -
                 # a real newline, not just where this row's wrapping
                 # happened to cut it - see NEWLINE_MARKER.
-                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
+                rendered += EOL_MARK
 
             out.append(f"\x1b[{screen_row};{gutter_width + 1}H{rendered}")
 
-        if self.scrollbar:
-            start_frac, visible_frac = self._text_scrollbar_fractions(avail_rows)
-            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
-            for i, cell in enumerate(cells):
-                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
-
-        out.append(self.format_status())
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        self._finish_text_frame(out, avail_rows)
 
     def _draw_text_unwrapped(self):
         # The border sits at the page's own edges in this same scrollable/
@@ -5836,13 +6452,7 @@ class Viewer:
         gutter_width = self._line_number_gutter_width()
         avail_cols = max(1, self._text_avail_cols() - gutter_width)
         highlight = self._text_search_highlight()
-        # Reset text attributes *before* clearing, not after: a
-        # still-active SGR state (e.g. a background color left on by
-        # draw_search_prompt(), which doesn't reset it since it's
-        # mid-edit) is what \x1b[2J fills the newly-blanked cells with -
-        # resetting only afterwards colors future writes but leaves
-        # every cell the clear itself touched stuck in that stale color.
-        out = [STATUS_COLOR_OFF, "\x1b[H\x1b[2J"]
+        out = []
 
         left_col = -1 - self.text_x_offset
         right_col = self.text_max_line_width - self.text_x_offset
@@ -5854,12 +6464,40 @@ class Viewer:
             screen_row = i + 1
 
             if gutter_width:
-                if 0 <= virtual_row < len(self.text_lines):
-                    num = str(virtual_row + 1).rjust(gutter_width - 1)
-                    gutter_text = LINE_NUMBER_COLOR + num + " " + LINE_NUMBER_RESET
+                # None (blank) for a border row, page separator, or off the page
+                number = (
+                    self._text_line_number(virtual_row)
+                    if 0 <= virtual_row < len(self.text_lines) else None
+                )
+                out.append(f"\x1b[{screen_row};1H{self._gutter_text(number, gutter_width)}")
+
+            if virtual_row in self._text_separator_lines:
+                # The continuous text view's heading row for a page: a
+                # rule spanning the same columns the border's own top/
+                # bottom edges do (joining up with its sides as ├/┤ -
+                # or, for page 1's, as the border's top corners ┌/┐,
+                # since it takes the top edge's place), or the whole
+                # visible width with no border. Left blank in copy mode,
+                # the same as in _draw_text_wrapped().
+                if self._copy_mode_saved is not None:
+                    continue
+                if self.text_border:
+                    line_start = max(0, left_col)
+                    line_end = min(avail_cols - 1, right_col)
                 else:
-                    gutter_text = " " * gutter_width  # border row, or off the page
-                out.append(f"\x1b[{screen_row};1H{gutter_text}")
+                    line_start, line_end = 0, avail_cols - 1
+                if line_end < line_start:
+                    continue  # panned out of view
+                first = virtual_row == 0
+                left_end = ("┌" if first else "├") if left_visible else ""
+                right_end = ("┐" if first else "┤") if right_visible else ""
+                rule = self._text_separator_rule(
+                    virtual_row, line_end - line_start + 1 - len(left_end) - len(right_end)
+                )
+                out.append(
+                    f"\x1b[{screen_row};{line_start + 1 + gutter_width}H{left_end}{rule}{right_end}"
+                )
+                continue
 
             if self.text_border and virtual_row in (-1, len(self.text_lines)):
                 line_start = max(0, left_col)
@@ -5903,23 +6541,14 @@ class Viewer:
                 # rendered's own coordinates before slicing it up to
                 # splice in color codes.
                 _, start, end = highlight
-                start, end = start - base, end - base
-                start, end = max(start, 0), min(end, len(rendered))
-                if start < len(rendered) and end > start:
-                    rendered = (
-                        rendered[:start]
-                        + TEXT_HIGHLIGHT_COLOR
-                        + rendered[start:end]
-                        + TEXT_HIGHLIGHT_RESET
-                        + rendered[end:]
-                    )
+                rendered = self._splice_highlight(rendered, start - base, end - base)
 
             if show_marker:
                 # Right after the real content - i.e. at the actual
                 # newline position - not padded out to the border (see
                 # below), which would misleadingly suggest the line
                 # itself reaches all the way to the page edge.
-                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
+                rendered += EOL_MARK
                 shown_width += 1
 
             if right_visible:
@@ -5938,15 +6567,7 @@ class Viewer:
             start_col = (left_col if left_visible else content_start) + 1 + gutter_width
             out.append(f"\x1b[{screen_row};{start_col}H{''.join(parts)}")
 
-        if self.scrollbar:
-            start_frac, visible_frac = self._text_scrollbar_fractions(avail_rows)
-            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
-            for i, cell in enumerate(cells):
-                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
-
-        out.append(self.format_status())
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        self._finish_text_frame(out, avail_rows)
 
     def _draw_help(self):
         # Overlay the help as a boxed panel centered over the page, instead
@@ -5971,7 +6592,7 @@ class Viewer:
         row0 = max(1, (available_rows - box_h) // 2 + 1)
         col0 = max(1, (self.cols - box_w) // 2 + 1)
 
-        out = [STATUS_COLOR_OFF, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
+        out = [SGR_RESET, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
         for i, line in enumerate(lines):
             out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line.ljust(content_w)} │")
         out.append(f"\x1b[{row0 + box_h - 1};{col0}H└{'─' * (box_w - 2)}┘")
@@ -6025,24 +6646,33 @@ class Viewer:
             return True
         return False
 
+    def _encode_key(self, top: int, width: int, height: int) -> tuple:
+        """EncodeCache key for the viewport strip _view_crop(top, height)
+        would produce - counted from self.page's own top edge, which
+        together with the rest pins down exactly what's in it (under
+        -c/--continuous too, since _normalize_continuous() always leaves
+        (page, scroll) in one canonical form)."""
+        return (
+            self.page, self.scroll + top, self.x_offset, width, height,
+            round(self.zoom * 100), self.fit, self.continuous,
+        )
+
     def _draw(self):
-        crop_bottom = min(self.scroll + self.avail_height_px, self.img.height)
-        crop_h = crop_bottom - self.scroll
+        if self.continuous:
+            self._normalize_continuous()
+            crop_h = self._view_height
+        else:
+            crop_h = min(self.scroll + self.avail_height_px, self.img.height) - self.scroll
 
         shift = self._scroll_shift_rows(self.crop_width, crop_h)
         if shift is not None:
-            self._draw_shifted(shift, crop_bottom)
+            self._draw_shifted(shift, crop_h)
             return
 
-        crop = self.img.crop(
-            (self.x_offset, self.scroll, self.x_offset + self.crop_width, crop_bottom)
-        )
+        crop = self._view_crop(0, crop_h)
         crop_w, crop_h = crop.width, crop.height
 
-        encode_key = (
-            self.page, self.scroll, self.x_offset, crop_w, crop_h,
-            round(self.zoom * 100),
-        )
+        encode_key = self._encode_key(0, crop_w, crop_h)
         data = self.encode_cache.get(encode_key)
         if data is None:
             data = self._encode_crop(crop)
@@ -6061,9 +6691,11 @@ class Viewer:
         self._last_viewport_set = True
         self._remember_drawn_position()
 
-        match = self._active_search_page_match()
+        match = self._visible_search_match()
         new_bounds = (
-            self._match_marker_bounds(*self._match_bbox_px(match))
+            self._match_marker_bounds(
+                *self._match_bbox_px(match), page_top=self._visible_page_top(match[0])
+            )
             if match else None
         )
 
@@ -6072,7 +6704,7 @@ class Viewer:
         # draw_search_prompt(), which doesn't reset it since it's
         # mid-edit) is what a \x1b[2J/ECH fills the newly-blanked cells
         # with - see _draw_text()'s longer version of this comment.
-        out = [STATUS_COLOR_OFF, self._format_viewport_clear(crop_w, crop_h, full_clear)]
+        out = [SGR_RESET, self._format_viewport_clear(crop_w, crop_h, full_clear)]
         # Erase the previous marker before the new image lands; otherwise
         # box-drawing chars linger on iTerm2 inline-image cells (especially
         # when search is cleared or n/p jumps to another match).
@@ -6101,6 +6733,26 @@ class Viewer:
         self._last_x_offset = self.x_offset
         self._last_zoom_key = round(self.zoom * 100)
         self._last_scroll = self.scroll
+        self._last_fit_key = (self.fit, self.continuous)
+
+    def _scroll_delta_px(self) -> "int | None":
+        """How far down (in pixels; negative for up) the viewport moved
+        since the last draw, or None if that can't be told from here.
+        Same page: just the scroll difference. Under -c/--continuous,
+        also across a boundary into the page right after or before the
+        last one (its height plus the gap is the distance between their
+        origins) - anything further is at least a whole page's worth of
+        movement, and never worth shifting for anyway."""
+        if self._last_page == self.page:
+            return self.scroll - self._last_scroll
+        if not self.continuous:
+            return None
+        gap = self._continuous_gap_px()
+        if self._last_page == self.page - 1:
+            return self._page_image(self._last_page).height + gap - self._last_scroll + self.scroll
+        if self._last_page == self.page + 1:
+            return -(self.img.height + gap - self.scroll + self._last_scroll)
+        return None
 
     def _scroll_shift_rows(self, crop_w, crop_h):
         """Whole character-rows the viewport shifted since the last
@@ -6142,14 +6794,14 @@ class Viewer:
                 or not iterm2_like()
                 or crop_w != self._last_viewport_w
                 or crop_h != self._last_viewport_h
-                or self._last_page != self.page
                 or self._last_x_offset != self.x_offset
                 or self._last_zoom_key != round(self.zoom * 100)
+                or self._last_fit_key != (self.fit, self.continuous)
                 or self._last_marker_bounds is not None
-                or self._active_search_page_match() is not None):
+                or self._visible_search_match() is not None):
             return None
-        delta = self.scroll - self._last_scroll
-        if delta == 0 or delta % self.cell_h_px != 0:
+        delta = self._scroll_delta_px()
+        if delta is None or delta == 0 or delta % self.cell_h_px != 0:
             return None
         shift = delta // self.cell_h_px
         avail_rows = max(1, self.rows - 1)
@@ -6157,34 +6809,29 @@ class Viewer:
             return None  # no overlap left - a full redraw is just as cheap
         return shift
 
-    def _draw_shifted(self, shift, crop_bottom):
+    def _draw_shifted(self, shift, crop_h):
         """The incremental path _draw() takes for a plain vertical
         scroll (see _scroll_shift_rows()): shift whatever's already
         displayed with the terminal's own scroll region instead of
         redrawing it, and transmit only the strip of pixels that just
-        became visible."""
+        became visible. `crop_h` is the height of the whole viewport
+        image, the same as _draw() would otherwise have sent."""
         avail_rows = max(1, self.rows - 1)
         strip_rows = abs(shift)
         strip_h = strip_rows * self.cell_h_px
         if shift > 0:
             # Scrolled forward: content moves UP, revealing new rows at
             # the BOTTOM.
-            strip_top = crop_bottom - strip_h
+            strip_top = crop_h - strip_h
             screen_row = avail_rows - strip_rows + 1
         else:
             # Scrolled backward: content moves DOWN, revealing new rows
             # at the TOP.
-            strip_top = self.scroll
+            strip_top = 0
             screen_row = 1
-        strip = self.img.crop((
-            self.x_offset, strip_top,
-            self.x_offset + self.crop_width, strip_top + strip_h,
-        ))
+        strip = self._view_crop(strip_top, strip_h)
 
-        encode_key = (
-            self.page, strip_top, self.x_offset, strip.width, strip.height,
-            round(self.zoom * 100),
-        )
+        encode_key = self._encode_key(strip_top, strip.width, strip.height)
         data = self.encode_cache.get(encode_key)
         if data is None:
             data = self._encode_crop(strip)
@@ -6200,7 +6847,7 @@ class Viewer:
         self._remember_drawn_position()
 
         out = [
-            STATUS_COLOR_OFF,
+            SGR_RESET,
             f"\x1b[1;{avail_rows}r",
             f"\x1b[{shift}S" if shift > 0 else f"\x1b[{strip_rows}T",
             "\x1b[r",  # back to a full-screen scroll region right away -
@@ -6228,12 +6875,10 @@ class Viewer:
         # this page's own (self.scroll, avail_height_px, img.height)
         # fraction into a whole-document position - see
         # _scrollbar_fractions() - rather than just this page's own.
-        avail_rows = max(1, self.rows - 1)
         start_frac, visible_frac = self._scrollbar_fractions(
             self.scroll, self.avail_height_px, self.img.height, self.page, self.npages
         )
-        cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
-        return [f"\x1b[{i + 1};{self.cols}H{cell}" for i, cell in enumerate(cells)]
+        return self._scrollbar_escapes(max(1, self.rows - 1), start_frac, visible_frac)
 
     def status_segments(self):
         """The default status line, as (text, color) fields in order."""
@@ -6244,12 +6889,22 @@ class Viewer:
                 else int(100 * self.text_scroll / self.text_scroll_max)
             )
             mode_field = " text "
+        elif self.continuous:
+            # No per-page scroll range to take a percentage of - how far
+            # the bottom of the screen is through the whole document
+            # instead, in the same page units the scrollbar uses (see
+            # _scrollbar_fractions()), so the last screenful reads 100%.
+            start_frac, visible_frac = self._scrollbar_fractions(
+                self.scroll, self.avail_height_px, self.img.height, self.page, self.npages
+            )
+            pct = min(100, int(100 * (start_frac + visible_frac)))
         else:
             pct = (
                 100
                 if self.scroll_max == 0
                 else int(100 * self.scroll / self.scroll_max)
             )
+        if not self.text_mode:
             # self.zoom alone isn't comparable across m/M (fit height/
             # width): it's always "1.0" right after switching fit mode
             # (see set_fit()), which would show "100%" for either one
@@ -6264,6 +6919,17 @@ class Viewer:
             # which fit mode or zoom level produced it.
             zoom_pct = round(100 * self.img.width / max(1, self.base_width_px))
             mode_field = f" zoom {zoom_pct}% "
+        if self.continuous and (not self.text_mode or self._text_continuous()):
+            # -c/--continuous (or toggled with c) - only where it
+            # actually changes anything: not in the text mode of a
+            # handler whose text is one flowing blob either way.
+            mode_field += "cont "
+        page, npages = self.page, self.npages
+        if self.text_mode and not self.doc_handler.text_mode_is_paginated():
+            # The whole document is one page of text here, whatever the
+            # image view's own page count is (a Markdown file rendered
+            # to 15 PDF pages is still just its one raw source).
+            page, npages = 1, 1
         segments = [(f" {self.name} ", STATUS_COLOR_FILENAME)]
         if len(self.files) > 1:
             segments.append((
@@ -6271,7 +6937,7 @@ class Viewer:
                 STATUS_COLOR_FILE_INDEX,
             ))
         segments += [
-            (f" page {self.page:>{len(str(self.npages))}}/{self.npages} ", STATUS_COLOR_PAGE),
+            (f" page {page:>{len(str(npages))}}/{npages} ", STATUS_COLOR_PAGE),
             (f" {pct:>3}% ", STATUS_COLOR_LOC),
             (mode_field, STATUS_COLOR_ZOOM),
         ]
@@ -6286,7 +6952,7 @@ class Viewer:
             status = pad_to_width(truncate_to_width(f" {text} ", self.cols), self.cols)
             return (
                 f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K"
-                f"{status}{STATUS_COLOR_OFF}"
+                f"{status}{SGR_RESET}"
             )
 
         # Truncate/pad by terminal column width, not Python string length:
@@ -6306,9 +6972,9 @@ class Viewer:
             out.append(f"{color}{chunk}")
             width_used += display_width(chunk)
         if width_used < self.cols:
-            out.append(f"{STATUS_COLOR_OFF}{' ' * (self.cols - width_used)}")
+            out.append(f"{SGR_RESET}{' ' * (self.cols - width_used)}")
 
-        return f"\x1b[{self.rows};1H\x1b[2K{''.join(out)}{STATUS_COLOR_OFF}"
+        return f"\x1b[{self.rows};1H\x1b[2K{''.join(out)}{SGR_RESET}"
 
     def draw_status(self, text=None):
         # \x1b[?25l re-hides the real terminal cursor draw_search_prompt()
@@ -6357,16 +7023,20 @@ class Viewer:
         sys.stdout.flush()
 
     def go_page(self, page, scroll):
+        """Show `page` in image mode: `scroll` is how far down into it
+        to start, or None for its bottom (scroll_max - valid only once
+        _load_page() has loaded it, which is why the caller can't just
+        pass self.scroll_max itself), the same as go_to_page_text()."""
         self.page = max(1, min(self.npages, page))
         self._load_page()
-        self.scroll = scroll
+        self.scroll = self.scroll_max if scroll is None else scroll
 
     def _pdf_source(self):
         """The PdfDocument to defer to for anything that only makes
         sense against a real PDF (page_size_pt(), build_link_index()) -
-        either self.doc_handler itself, or the PdfDocument an
-        OfficeDocument rendered to under the hood (see
-        OfficeDocument.get_page_image()'s _pdf_delegate - a plain
+        either self.doc_handler itself, or the PdfDocument a
+        RenderedDocument rendered to under the hood (see
+        RenderedDocument.get_page_image()'s _pdf_delegate - a plain
         <a href> in the original Word/RTF document survives
         Chrome's --print-to-pdf as a real PDF link annotation, so this
         lets it be treated exactly like a real PDF's hyperlinks
@@ -6406,7 +7076,20 @@ class Viewer:
             self._jump_to_scrollbar_row(row)
             return
         self._ensure_link_index()
-        page_info = self._link_index[self.page - 1]
+        # Which page the click landed on, and how far down it the top
+        # of the viewport is - always the current page normally; under
+        # -c/--continuous, whichever page in the layout covers the
+        # clicked row (none, if it's in a gap between pages).
+        page, img, origin = self.page, self.img, self.scroll
+        if self.continuous:
+            click_y = (row - 1) * self.cell_h_px
+            for p, top, p_img in self._layout:
+                if top <= click_y < top + p_img.height:
+                    page, img, origin = p, p_img, -top
+                    break
+            else:
+                return
+        page_info = self._link_index[page - 1]
         if not page_info["links"] or not page_info["width_pt"] or not page_info["height_pt"]:
             return
 
@@ -6419,11 +7102,11 @@ class Viewer:
         # digits by whatever generated the PDF, so its rect can be
         # thinner than one terminal row is tall - a single sampled point
         # would frequently land just outside it and miss the click.
-        scale_x = page_info["width_pt"] / self.img.width
-        scale_y = page_info["height_pt"] / self.img.height
+        scale_x = page_info["width_pt"] / img.width
+        scale_y = page_info["height_pt"] / img.height
         cell_xmin = (self.x_offset + (col - 1) * self.cell_w_px) * scale_x
         cell_xmax = cell_xmin + self.cell_w_px * scale_x
-        cell_ymin = (self.scroll + (row - 1) * self.cell_h_px) * scale_y
+        cell_ymin = (origin + (row - 1) * self.cell_h_px) * scale_y
         cell_ymax = cell_ymin + self.cell_h_px * scale_y
 
         best = None
@@ -6488,7 +7171,7 @@ class Viewer:
             # that only scrolls within it doesn't reload and rescale
             # the very same image for nothing.
             self.go_page(page, 0)
-        self.scroll = max(0, min(self.scroll_max, round(within_frac * self.img.height)))
+        self.scroll = self._clamp_image_scroll(round(within_frac * self.img.height))
         self.refresh()
 
     def handle_wheel(self, direction):
@@ -6548,9 +7231,8 @@ class Viewer:
     def _restore_position(self, page, scroll, x_offset):
         self.page = max(1, min(self.npages, page))
         self._load_page()  # loads the image and recomputes scroll_max
-        self.scroll = max(0, min(self.scroll_max, scroll))
-        max_x_offset = max(0, self.img.width - self.crop_width)
-        self.x_offset = max(0, min(max_x_offset, x_offset))
+        self.scroll = self._clamp_image_scroll(scroll)
+        self._set_x_offset(x_offset)
 
     def go_to_link_target(self, page, top_pt):
         """Jump to `page`, scrolled so the link's target y-position
@@ -6570,7 +7252,7 @@ class Viewer:
         scale_y = self.img.height / height_pt
         px_top = (height_pt - top_pt) * scale_y  # bottom-up -> top-down
         margin = self.avail_height_px // 4
-        self.scroll = max(0, min(self.scroll_max, round(px_top) - margin))
+        self.scroll = self._clamp_image_scroll(round(px_top) - margin)
 
     def reload(self):
         """Re-read the PDF from disk (e.g. -f/--follow noticed it changed
@@ -6580,9 +7262,10 @@ class Viewer:
         any in-progress search is cleared too, since its match list may
         no longer correspond to anything in the new file."""
         if self.is_pdf:
+            self.doc_handler.forget_page_sizes()
             self.npages = self.doc_handler.page_count()
             self.page = max(1, min(self.npages, self.page))
-        elif isinstance(self.doc_handler, OfficeDocument):
+        elif isinstance(self.doc_handler, RenderedDocument):
             # Unlike a PDF, an office-preview's pages are pre-rendered
             # PNGs on disk (see OfficeDocument._render_office_pages()) rather than
             # generated on demand - those need regenerating too, not
@@ -6591,17 +7274,18 @@ class Viewer:
             pages = self.doc_handler.build_pages(
                 self.tmpdir,
                 debug=self.debug, render_scale=self.office_render_scale,
-                progress=_ViewerProgress(self), continuous=self.office_continuous,
+                progress=_ViewerProgress(self),
             )
             if pages:
                 # build_pages() already updated self.doc_handler.pages
-                # (see OfficeDocument._render_and_remember()) - just
+                # (see OfficeDocument._remember_pages()) - just
                 # self.cache.clear() below is needed to drop any now-stale
                 # resized/cached images.
                 self.npages = len(pages)
                 self.page = max(1, min(self.npages, self.page))
         self.cache.clear()
         self._search_index = None
+        self._text_pages = None  # stale too - re-extracted on demand
         self.clear_search()
         if self.text_mode:
             self._load_text_page()
@@ -6720,31 +7404,7 @@ class Viewer:
         self.search_pos = idx
 
         if self._search_uses_text_lines():
-            line_idx, start, end = self.search_matches[idx]
-            if self.text_wrap:
-                # No pan to speak of while wrapped - _row_for_line()
-                # converts the raw line position into a display-row
-                # scroll target instead (same as _scroll_text_to_match()).
-                target_row = self._row_for_line(line_idx)
-            else:
-                avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
-                line = self.text_lines[line_idx]
-                col_start = display_width(line[:start])
-                col_end = display_width(line[:end])
-                if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
-                    self.text_x_offset = max(
-                        self.text_x_offset_min,
-                        min(
-                            self.text_x_offset_max,
-                            round((col_start + col_end) / 2 - avail_cols / 2),
-                        ),
-                    )
-                target_row = line_idx
-            avail_rows = self._text_avail_rows()
-            margin = avail_rows // 4
-            self.text_scroll = max(
-                self.text_scroll_min, min(self.text_scroll_max, target_row - margin)
-            )
+            self._scroll_text_to_highlight(*self.search_matches[idx])
             self.refresh()
             self.draw_status(
                 f'"{self.search_query}" match {idx + 1}/{len(self.search_matches)}'
@@ -6771,17 +7431,24 @@ class Viewer:
         self.refresh()
         self.draw_status(
             f'"{self.search_query}" match {idx + 1}/{len(self.search_matches)} '
-            f"(page {self.page})"
+            # The match's own page, not self.page: under -c/--continuous
+            # the view can settle with an earlier page at the top.
+            f"(page {page})"
         )
 
-    def _match_marker_bounds(self, px_left, px_top, px_right, px_bottom):
-        """Screen-cell bounds for a search-match box, or None if off-screen."""
+    def _match_marker_bounds(self, px_left, px_top, px_right, px_bottom, page_top=None):
+        """Screen-cell bounds for a search-match box, or None if off-screen.
+        The px_* coordinates are within the match's own page image;
+        `page_top` is where that page's top edge sits in the viewport
+        (see _visible_page_top()) - by default the current page's."""
         available_rows = max(1, self.rows - 1)  # bottom row is the status bar
+        if page_top is None:
+            page_top = -self.scroll
 
         col0 = (px_left - self.x_offset) // self.cell_w_px
         col1 = -(-(px_right - self.x_offset) // self.cell_w_px) - 1  # ceil - 1
-        row0 = (px_top - self.scroll) // self.cell_h_px
-        row1 = -(-(px_bottom - self.scroll) // self.cell_h_px) - 1
+        row0 = (px_top + page_top) // self.cell_h_px
+        row1 = -(-(px_bottom + page_top) // self.cell_h_px) - 1
 
         col0, col1 = col0 - 1, col1 + 1  # border sits one cell outside the text
         row0, row1 = row0 - 1, row1 + 1
@@ -6795,7 +7462,7 @@ class Viewer:
     def _format_marker_erase(self, row0, col0, row1, col1):
         """Wipe a previously drawn search-match box without clearing the screen."""
         width = col1 - col0 + 1
-        out = [SEARCH_MARKER_RESET]
+        out = [SGR_RESET]
         for row in range(row0, row1 + 1):
             out.append(f"\x1b[{row + 1};{col0 + 1}H\x1b[{width}X")
         return "".join(out)
@@ -6809,7 +7476,7 @@ class Viewer:
             out.append(f"\x1b[{row + 1};{col1 + 1}H┃")
         if row1 > row0:
             out.append(f"\x1b[{row1 + 1};{col0 + 1}H┗{'━' * (width - 2)}┛")
-        out.append(SEARCH_MARKER_RESET)
+        out.append(SGR_RESET)
         return "".join(out)
 
     def _half_page_step(self):
@@ -6824,17 +7491,27 @@ class Viewer:
         return self.cell_h_px * half_rows
 
     def scroll_down(self, step):
+        if self.continuous:
+            # No page turn to speak of - just move, and let
+            # _normalize_continuous() carry the position over into the
+            # next page (or stop it at the end of the document).
+            self.scroll += step
+            self._normalize_continuous()
+            return
         if self.scroll < self.scroll_max:
             self.scroll = min(self.scroll_max, self.scroll + step)
         elif self.page < self.npages:
             self.go_page(self.page + 1, 0)
 
     def scroll_up(self, step):
+        if self.continuous:
+            self.scroll -= step
+            self._normalize_continuous()
+            return
         if self.scroll > 0:
             self.scroll = max(0, self.scroll - step)
         elif self.page > 1:
             self.go_page(self.page - 1, None)
-            self.scroll = self.scroll_max
 
     def handle_key_text(self, key):
         """Key handling while in text mode: page/line navigation plus
@@ -6888,9 +7565,15 @@ class Viewer:
         elif key in ("L", "SHIFT-RIGHT"):
             self.text_x_offset = self.text_x_offset_max
         elif key in ("K", "U", "SHIFT-UP", "g"):
-            self.text_scroll = self.text_scroll_min
+            if self._text_page_starts is not None:
+                self.go_to_page_text(self.page, 0)  # the current page, not the document
+            else:
+                self.text_scroll = self.text_scroll_min
         elif key in ("J", "D", "SHIFT-DOWN", "G"):
-            self.text_scroll = self.text_scroll_max
+            if self._text_page_starts is not None:
+                self.go_to_page_text(self.page, None)
+            else:
+                self.text_scroll = self.text_scroll_max
         elif key == "n":
             # A handler whose text isn't paginated (office/text/rtf -
             # see _load_text_page()) shows the whole document at once,
@@ -6903,6 +7586,210 @@ class Viewer:
         elif key == "q":
             return False
         return True
+
+    def _start_following(self) -> None:
+        """(Re)start follow mode's mtime tracking from the current file
+        and time - whenever follow is turned on (-f, F, O/v) or switches
+        to watching a different file (:n/:p). Otherwise a change that
+        happened while follow was off, or to some other file, would
+        trigger an immediate reload."""
+        self._follow_path = self.path
+        try:
+            self._follow_mtime = os.path.getmtime(self.path)
+        except OSError:
+            self._follow_mtime = None
+        self._follow_checked = time.monotonic()
+
+    def poll_follow(self) -> None:
+        """Follow mode's periodic check, called on every pass of
+        run_viewer()'s loop: every FOLLOW_INTERVAL seconds, reload the
+        file if its mtime changed since the last look."""
+        if not self.follow:
+            return
+        if self.path != self._follow_path:
+            self._start_following()  # :n/:p switched files
+            return
+        if time.monotonic() - self._follow_checked < FOLLOW_INTERVAL:
+            return
+        self._follow_checked = time.monotonic()
+        try:
+            mtime = os.path.getmtime(self._follow_path)
+        except OSError:
+            return  # e.g. mid save-as-replace; try again next tick
+        if mtime == self._follow_mtime:
+            return
+        self._follow_mtime = mtime
+        try:
+            self.reload()
+        except Exception:
+            # The file may have been mid-write when we noticed the mtime
+            # change (e.g. pdftoppm/pdfinfo saw a truncated file); keep
+            # showing the last good render and pick up the change on a
+            # later, now-complete write.
+            pass
+
+    def toggle_follow(self) -> None:
+        """F: -f/--follow switched on/off at runtime."""
+        self.follow = not self.follow
+        if self.follow:
+            self._start_following()
+        self.refresh()
+
+    def open_in_default_app(self) -> None:
+        """O/v: hand the current file off to macOS's own default app for
+        it (Preview/Word/Excel/...), and switch follow mode on (if it
+        wasn't already) so an edit made there comes back automatically.
+        self.path is always the original file, never a temporary
+        rendered PDF, so this opens the same thing pdfless was pointed
+        at in the first place, even for a soffice/Chrome-rendered format."""
+        if not _open_in_default_app(self.path):
+            self.draw_status(
+                "opening the file in its own app needs macOS"
+                if sys.platform != "darwin" else f"couldn't open {self.path}"
+            )
+            return
+        if not self.follow:
+            self.follow = True
+            self._start_following()
+        self.refresh()
+
+    def text_toggle_refusal(self) -> "str | None":
+        """Why t/T can't switch modes right now, as a status message - or
+        None if they can try (enter_text_mode() may still find there's
+        no text after all)."""
+        if self.doc_handler.starts_in_text_mode():
+            # Always-on text mode already - toggling would try to switch
+            # to an image view this kind doesn't have.
+            return "this is already a plain text file"
+        if self.text_mode and not iterm2_like():
+            # Already in text mode - possibly run_viewer()'s startup
+            # fallback put it there - and image mode wouldn't show
+            # anything on this terminal anyway, so refuse to cross back
+            # rather than switching to a blank screen.
+            return "image mode needs iTerm2/WezTerm - not supported on this terminal"
+        if not self.doc_handler.supports_text_mode():
+            return "text mode isn't available for this file type"
+        return None
+
+    def handle_global_key(self, key: str) -> bool:
+        """The keys that mean the same in image and text mode and need
+        nothing from run_viewer()'s own loop state - True if `key` was
+        one of them (and has been handled, redraw included)."""
+        if key in ("\x0c", "FOCUS_IN"):
+            # ^L: repaint the screen (e.g. after other output garbled it)
+            # without otherwise changing anything. FOCUS_IN is the same
+            # fix, triggered automatically - see FOCUS_ON's comment for
+            # why a focus change (under tmux, especially) can otherwise
+            # leave this pane blank, and for why only this direction,
+            # not FOCUS_OUT, is safe to redraw on.
+            self.refresh()
+        elif key == "FOCUS_OUT":
+            pass
+        elif key == "r":
+            self.toggle_scrollbar()
+            self.refresh()
+        elif key == "c":
+            self.toggle_continuous()
+        elif key == "F":
+            self.toggle_follow()
+        elif key in ("O", "v"):
+            self.open_in_default_app()
+        elif key == "F1":
+            # less(1) puts its help on "h"/"H", which pdfless can't - both
+            # are panning keys here (less has nothing to pan). "?" isn't
+            # free either, being less's backward search, so help lives on
+            # F1, with ":h" as a second way in for terminals that send
+            # something unexpected for F1.
+            self.show_help()
+        elif key in ("t", "T"):
+            # T is t and C combined into one press/undo - see
+            # toggle_clean_text_mode().
+            refusal = self.text_toggle_refusal()
+            toggle = self.toggle_text_mode if key == "t" else self.toggle_clean_text_mode
+            if refusal is None and not toggle():
+                refusal = "no text could be extracted from this file"
+            if refusal is not None:
+                self.draw_status(refusal)
+        else:
+            return False
+        return True
+
+    def handle_count_key(self, key: str, count: "int | None") -> bool:
+        """The keys a typed-in number (`count`, or None) can come before,
+        other than g/G - True if `key` was one of them (and has been
+        handled)."""
+        if key in ("<", ">", "HOME", "END"):
+            # "<"/">" (HOME/END are aliases): jump to the first/last page
+            # of the whole document - "<number><" or "<number>>" jumps
+            # straight to that page instead, in either mode.
+            go = self.go_to_page_text if self.text_mode else self.go_page
+            if count is not None:
+                go(count, 0)
+            elif key in ("<", "HOME"):
+                go(1, 0)
+            else:
+                go(self.npages, None)
+            self.refresh()
+        elif key in ("{", "}"):
+            # One-keystroke equivalents of ":p"/":n" - mirroring "["/"]"
+            # (PDF link-history back/forward), the shifted key just above
+            # each on a US keyboard.
+            if key == "{":
+                self.previous_file()
+            else:
+                self.next_file()
+        elif key == "x":
+            # "x" jumps to the first file in the list; "<number>x" jumps
+            # straight to that file (1-based, matching "<number><"'s page
+            # numbering) - meaningful only with more than one file, but
+            # harmless otherwise (go_to_file() just reports there's
+            # nowhere to go).
+            self.go_to_file(count - 1 if count is not None else 0, "no such file")
+        elif key == "X":
+            self.go_to_file(len(self.files) - 1, "no such file")
+        else:
+            return False
+        return True
+
+    def handle_mouse(self, kind: str, col: int, row: int) -> None:
+        """One decoded mouse event (see decode_sgr_mouse()): the wheel
+        scrolls the help box while it's up, and otherwise clicks/drags/
+        the wheel/the back and forward buttons act on the page."""
+        if self.help_active:
+            if kind == "MOUSE_WHEEL_UP":
+                self.scroll_help(-1)
+            elif kind == "MOUSE_WHEEL_DOWN":
+                self.scroll_help(1)
+        elif kind == "MOUSE_CLICK":
+            self.handle_click(col, row)
+        elif kind == "MOUSE_DRAG":
+            if self.handle_drag(row):
+                # A drag arrives as a burst of motion events, and acting
+                # on one costs a page rasterize - so let the burst drain
+                # first and only act on where the pointer actually ended up.
+                ready, _, _ = select.select([self.fd], [], [], 0)
+                if not ready:
+                    self.flush_scrollbar_drag()
+        elif kind == "MOUSE_RELEASE":
+            self.end_scrollbar_drag()
+        elif kind == "MOUSE_WHEEL_UP":
+            self.handle_wheel(-1)
+        elif kind == "MOUSE_WHEEL_DOWN":
+            self.handle_wheel(1)
+        elif kind == "MOUSE_BACK":
+            self.go_back()
+        elif kind == "MOUSE_FORWARD":
+            self.go_forward()
+
+    def _view_state(self) -> tuple:
+        """Everything handle_key()/handle_key_text() can change that
+        affects what's on screen - run_viewer() compares it before and
+        after a key to decide whether a redraw is needed."""
+        return (
+            self.page, self.scroll, self.zoom, self.x_offset, self.fit,
+            self.text_mode, self.text_scroll, self.text_x_offset, self.text_border,
+            self.text_wrap, self.eol_mark, self.line_numbers, self.scrollbar,
+        )
 
     def handle_key(self, key):
         if self.text_mode:
@@ -6936,7 +7823,7 @@ class Viewer:
         elif key in ("H", "SHIFT-LEFT"):
             self.x_offset = 0
         elif key in ("L", "SHIFT-RIGHT"):
-            self.x_offset = max(0, self.img.width - self.crop_width)
+            self.x_offset = self._max_x_offset()
         elif key in ("K", "U", "SHIFT-UP", "g"):
             self.scroll = 0
         elif key in ("J", "D", "SHIFT-DOWN", "G"):
@@ -6956,12 +7843,173 @@ class Viewer:
         return True
 
 
+def read_key(fd: int) -> "str | tuple | None":
+    """Read one keypress from `fd`: a plain character, a named key
+    (decode_csi_key()/read_ss3_key() - "UP", "F1", ...; "ESC-v" for
+    Meta-v, "backward one window"), or ("MOUSE", kind, col, row) for an
+    SGR mouse event (see decode_sgr_mouse()). "" for an escape sequence
+    nothing here recognizes, None once the input is gone for good."""
+    key = read_utf8_char(fd)
+    if key != "\x1b":
+        return key
+    # Possibly ESC-v, an SS3 sequence (F1), or a CSI one (arrow/Home/
+    # End/PageUp/PageDown, plain or Shift-ed; F1 on some terminals; a
+    # mouse event) - or just a lone Esc, if nothing follows it quickly.
+    r, _, _ = select.select([fd], [], [], 0.1)
+    if not r:
+        return key
+    nxt = os.read(fd, 1)
+    if nxt == b"v":
+        return "ESC-v"
+    if nxt == b"O":
+        return read_ss3_key(fd) or ""
+    if nxt == b"[":
+        seq = read_csi_sequence(fd)
+        mouse = decode_sgr_mouse(seq) if seq else None
+        if mouse:
+            return ("MOUSE", *mouse)
+        return decode_csi_key(seq) or ""
+    return key
+
+
+class _LineEditor:
+    """The search prompt's one line of input after "/" or "?": typed
+    characters go in at the cursor, with readline's own bindings for
+    moving and deleting - ^B/^F/LEFT/RIGHT move the cursor, ^A/^E/HOME/
+    END jump it to the start/end, backspace and ^D/DEL delete before/
+    under it, and ^U/^K kill from it to the start/end (DEL is the one
+    exception to readline, added for the plain Delete key on keyboards
+    without an easy ^D). Enter submits, Esc/^C cancel, and so does
+    backspace on an already-empty line. Every other key is swallowed, so
+    nothing leaks through as a page command while the prompt is up."""
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.cursor = 0  # index into text the next edit applies at
+
+    def handle(self, key: str) -> "str | None":
+        """Apply `key`: returns "submit", "cancel", "changed" (redraw the
+        prompt), or None if it did nothing."""
+        text, cursor = self.text, self.cursor
+        if key in ("\r", "\n"):
+            return "submit"
+        if key in ("\x1b", "\x03"):
+            return "cancel"
+        if key in ("\x7f", "\x08"):
+            if cursor > 0:
+                text, cursor = text[:cursor - 1] + text[cursor:], cursor - 1
+            elif not text:
+                return "cancel"
+        elif key in ("\x02", "LEFT"):  # ^B
+            cursor = max(0, cursor - 1)
+        elif key in ("\x06", "RIGHT"):  # ^F
+            cursor = min(len(text), cursor + 1)
+        elif key in ("\x01", "HOME"):  # ^A: jump to the start
+            cursor = 0
+        elif key in ("\x05", "END"):  # ^E: jump to the end
+            cursor = len(text)
+        elif key in ("\x04", "DEL"):  # ^D / Delete: delete under the cursor
+            text = text[:cursor] + text[cursor + 1:]
+        elif key == "\x15":  # ^U: kill from the cursor to the start
+            text, cursor = text[cursor:], 0
+        elif key == "\x0b":  # ^K: kill from the cursor to the end
+            text = text[:cursor]
+        elif len(key) == 1 and key.isprintable():
+            text, cursor = text[:cursor] + key + text[cursor:], cursor + 1
+        if (text, cursor) == (self.text, self.cursor):
+            return None
+        self.text, self.cursor = text, cursor
+        return "changed"
+
+
+def _toggle_and_refresh(toggle):
+    """A _PREFIX_BINDINGS action: call Viewer method `toggle`, then redraw."""
+    def action(viewer):
+        toggle(viewer)
+        viewer.refresh()
+    return action
+
+
+# The keys that can follow a one-key prefix, each mapped to what it does
+# (an action returning False means quit). Any other key cancels quietly.
+# ":" is less(1)'s :n/:p (next/previous file - also on "}"/"{") and :q,
+# plus pdfless's own :h for the help screen (F1 is the primary way in).
+# "-" (text mode only - it's zoom-out in image mode) is less(1)'s own
+# runtime "-<option-letter>" toggle syntax, kept only for
+# -S/--chop-long-lines and -N/--line-numbers compatibility; "s"/"#"
+# alone are the primary keys for those.
+_PREFIX_BINDINGS = {
+    ":": {
+        "n": Viewer.next_file,
+        "p": Viewer.previous_file,
+        "h": Viewer.show_help,
+        "q": lambda viewer: False,
+    },
+    "-": {
+        "S": _toggle_and_refresh(Viewer.toggle_text_wrap),
+        "s": _toggle_and_refresh(Viewer.toggle_text_wrap),
+        "N": _toggle_and_refresh(Viewer.toggle_line_numbers),
+        "n": _toggle_and_refresh(Viewer.toggle_line_numbers),
+    },
+}
+
+
+def _enter_screen_seq(alt_screen: bool, mouse: bool) -> str:
+    """What to write to take over the terminal for the viewer: the
+    alternate screen (unless `alt_screen` is False - --keep's resume
+    after ^Z), a hidden cursor, alternate scroll and focus reporting, and
+    mouse reporting if `mouse` (image mode only - see MOUSE_ON)."""
+    return (
+        ("\x1b[?1049h" if alt_screen else "") + "\x1b[?25l"
+        + ALT_SCROLL_ON + FOCUS_ON + (MOUSE_ON if mouse else "")
+    )
+
+
+def _leave_screen_seq(alt_screen: bool) -> str:
+    """_enter_screen_seq() undone: every reporting mode off, the cursor
+    back, and the alternate screen left (unless `alt_screen` is False -
+    --keep, which leaves the last page on screen)."""
+    return (
+        MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h"
+        + ("\x1b[?1049l" if alt_screen else "")
+    )
+
+
+def _suspend(fd: int, old_termios, keep: bool, viewer: Viewer) -> None:
+    """^Z: suspend, like a normal shell job-control app would - raw mode
+    disables the tty's own ^Z-to-SIGTSTP translation (see RawTerminal),
+    so this does it by hand: give the terminal back and cooked-mode the
+    tty before actually stopping, then reverse all of that once `fg`
+    resumes us. --keep leaves the alternate screen buffer alone, so the
+    page stays on screen while suspended (the same trick main() uses to
+    leave it up after quitting); otherwise the shell prompt lands on the
+    real scrollback."""
+    sys.stdout.write(_leave_screen_seq(alt_screen=not keep))
+    sys.stdout.flush()
+    termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
+    # SIGSTOP rather than SIGTSTP: the cleanup above already does
+    # everything SIGTSTP's catchability would be for, so there's no
+    # downside to using the one stop signal that's guaranteed to actually
+    # stop the process - it can't be caught, blocked, or ignored, unlike
+    # SIGTSTP (which, at least on some setups, can silently fail to stop
+    # it on the first try). Sent to the whole process group (pid 0), not
+    # just our own pid: when launched via `uv run --script` (its
+    # shebang), this process is a *child* of uv, which is what the shell
+    # actually sees as the foreground job - stopping only ourselves would
+    # leave uv running and still attached to the tty, so the shell would
+    # never notice anything stopped.
+    os.kill(0, signal.SIGSTOP)
+    # ... stopped here until `fg` sends SIGCONT ...
+    tty.setraw(fd)
+    sys.stdout.write(_enter_screen_seq(alt_screen=not keep, mouse=not viewer.text_mode))
+    sys.stdout.flush()
+    viewer.request_resize()  # the terminal may have been resized while
+    # stopped, and its contents are gone either way
+
+
 def run_viewer(
-    files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
-    border=True, wrap=True, eol_mark=True, line_numbers=False, scrollbar=True,
-    follow=False, wheel_scroll_step=2, keep=False, incremental_scroll=True,
-    debug=False, office_render_scale=OFFICE_RENDER_SCALE,
-    office_continuous=False, quit_if_one_screen=False, viewer_out=None,
+    files, start_file_index, start_page, tmpdir, fd, old_termios,
+    options=ViewerOptions(), viewer_out=None,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
     caller can inspect its final geometry (e.g. to tidy up the screen).
@@ -6974,15 +8022,8 @@ def run_viewer(
     interactive loop below (a page render, a keypress handler, ...)
     would leave the terminal in whatever raw/alternate-screen/mouse-
     reporting state it was in when the exception hit - see main()."""
-    viewer = Viewer(
-        files, start_file_index, start_page, tmpdir, fd, fit=fit,
-        border=border, wrap=wrap, eol_mark=eol_mark, line_numbers=line_numbers,
-        scrollbar=scrollbar, wheel_scroll_step=wheel_scroll_step,
-        incremental_scroll=incremental_scroll,
-        debug=debug,
-        office_render_scale=office_render_scale, office_continuous=office_continuous,
-        follow=follow, quit_if_one_screen=quit_if_one_screen,
-    )
+    viewer = Viewer(files, start_file_index, start_page, tmpdir, fd, options=options)
+    keep = options.keep
     if viewer_out is not None:
         viewer_out.append(viewer)
 
@@ -6995,10 +8036,7 @@ def run_viewer(
         # text mode where this file has one; run_viewer()'s own "t"/"T"
         # handling below keeps you there afterwards (see there).
         name = os.path.basename(viewer.path)
-        has_text = (
-            viewer.doc_handler.supports_text_mode()
-            and viewer.doc_handler.extract_text(viewer.page) is not None
-        )
+        has_text = viewer.can_enter_text_mode()
         if has_text:
             warning = f"{name}: this terminal doesn't support inline images (needs iTerm2/WezTerm) - showing text mode instead"
         else:
@@ -7016,7 +8054,7 @@ def run_viewer(
             # only, no content) until something else happened to reload it.
             viewer._load_text_page()
 
-    if quit_if_one_screen:
+    if options.quit_if_one_screen:
         # -F/--quit-if-one-screen: real less(1)'s own -F. Only affects
         # whether/how this first file starts up - never entering the
         # alternate screen at all here is what leaves the dump in the
@@ -7060,8 +8098,7 @@ def run_viewer(
         # first file's dump-or-interactive question was still open.
         viewer.quit_if_one_screen = False
 
-    initial_mouse = MOUSE_OFF if viewer.text_mode else MOUSE_ON
-    sys.stdout.write("\x1b[?1049h\x1b[?25l" + initial_mouse + ALT_SCROLL_ON + FOCUS_ON)
+    sys.stdout.write(_enter_screen_seq(alt_screen=True, mouse=not viewer.text_mode))
     sys.stdout.flush()
     viewer.entered_alt_screen = True
 
@@ -7070,66 +8107,20 @@ def run_viewer(
 
     signal.signal(signal.SIGWINCH, on_winch)
 
+    # The run loop's own input state - at most one of these is active at
+    # a time: a number being typed in (a count for the next key - see
+    # Viewer.handle_count_key()), a one-key prefix awaiting its second
+    # key (see _PREFIX_BINDINGS), or a search query being typed.
     num_buf = ""
-    search_buf = None  # None: not typing; otherwise the query in progress
-    search_cursor = 0  # index into search_buf the next inserted/deleted
-    # character applies at - only meaningful while search_buf is not None
-    search_backward = False  # whether that query was opened with "?" (not "/")
+    pending_prefix = None  # ":" or "-", or None
+    search_editor = None  # a _LineEditor while the "/"/"?" prompt is up
+    search_backward = False  # whether that prompt was opened with "?"
     last_search_query = None  # remembered across searches, for a bare "/"/"?"
-    colon_pending = False  # True right after ":", awaiting n/p/h
-    dash_pending = False  # True right after "-" in text mode, awaiting "S"
-
-    last_follow_path = viewer.path
-    try:
-        last_mtime = os.path.getmtime(last_follow_path) if follow else None
-    except OSError:
-        last_mtime = None
-    last_follow_check = time.monotonic()
-
-    def start_following():
-        """(Re)start follow's mtime tracking from the current file/time -
-        shared by "F" turning follow on and "O"/"v" doing the same as a
-        side effect of handing the file to an external app. Otherwise a
-        change that happened while follow was off (a stale last_mtime)
-        would trigger an immediate reload the moment it's turned on."""
-        nonlocal last_follow_path, last_mtime, last_follow_check
-        last_follow_path = viewer.path
-        try:
-            last_mtime = os.path.getmtime(last_follow_path)
-        except OSError:
-            last_mtime = None
-        last_follow_check = time.monotonic()
 
     viewer.refresh()
     while True:
         r, _, _ = select.select([fd], [], [], 0.3)
-
-        if follow and viewer.path != last_follow_path:
-            # :n/:p switched to a different file - start tracking that
-            # one instead, rather than comparing its mtime against
-            # whatever the previous file's was.
-            last_follow_path = viewer.path
-            try:
-                last_mtime = os.path.getmtime(last_follow_path)
-            except OSError:
-                last_mtime = None
-            last_follow_check = time.monotonic()
-        elif follow and time.monotonic() - last_follow_check >= FOLLOW_INTERVAL:
-            last_follow_check = time.monotonic()
-            try:
-                mtime = os.path.getmtime(last_follow_path)
-            except OSError:
-                mtime = None  # e.g. mid save-as-replace; try again next tick
-            if mtime is not None and mtime != last_mtime:
-                last_mtime = mtime
-                try:
-                    viewer.reload()
-                except Exception:
-                    # The file may have been mid-write when we noticed the
-                    # mtime change (e.g. pdftoppm/pdfinfo saw a truncated
-                    # file); keep showing the last good render and pick
-                    # up the change on a later, now-complete write.
-                    pass
+        viewer.poll_follow()
 
         if viewer.resized:
             viewer.refresh()
@@ -7137,360 +8128,85 @@ def run_viewer(
         if not r:
             # Nothing waiting - a good moment to act on a scrollbar drag
             # whose motion events stopped without a release arriving
-            # (see the MOUSE_DRAG handling below); a no-op otherwise.
+            # (see Viewer.handle_mouse()); a no-op otherwise.
             viewer.flush_scrollbar_drag()
             continue
-        key = read_utf8_char(fd)
+        key = read_key(fd)
         if key is None:
             break
-        if key == "\x1b":
-            # Possibly ESC-v (Meta-v, "backward one window"), an SS3
-            # sequence (F1), or a CSI one (arrow/Home/End/PageUp/
-            # PageDown, plain or Shift-ed; F1 on some terminals).
-            r2, _, _ = select.select([fd], [], [], 0.1)
-            if r2:
-                nxt = os.read(fd, 1)
-                if nxt == b"v":
-                    key = "ESC-v"
-                elif nxt == b"O":
-                    key = read_ss3_key(fd) or ""
-                elif nxt == b"[":
-                    seq = read_csi_sequence(fd)
-                    mouse = decode_sgr_mouse(seq) if seq else None
-                    if mouse:
-                        kind, mcol, mrow = mouse
-                        if search_buf is None:
-                            if viewer.help_active:
-                                if kind == "MOUSE_WHEEL_UP":
-                                    viewer.scroll_help(-1)
-                                elif kind == "MOUSE_WHEEL_DOWN":
-                                    viewer.scroll_help(1)
-                            elif kind == "MOUSE_CLICK":
-                                viewer.handle_click(mcol, mrow)
-                            elif kind == "MOUSE_DRAG":
-                                if viewer.handle_drag(mrow):
-                                    # A drag arrives as a burst of motion
-                                    # events, and acting on one costs a
-                                    # page rasterize - so let the burst
-                                    # drain first and only act on where
-                                    # the pointer actually ended up.
-                                    ready, _, _ = select.select([fd], [], [], 0)
-                                    if not ready:
-                                        viewer.flush_scrollbar_drag()
-                            elif kind == "MOUSE_RELEASE":
-                                viewer.end_scrollbar_drag()
-                            elif kind == "MOUSE_WHEEL_UP":
-                                viewer.handle_wheel(-1)
-                            elif kind == "MOUSE_WHEEL_DOWN":
-                                viewer.handle_wheel(1)
-                            elif kind == "MOUSE_BACK":
-                                viewer.go_back()
-                            elif kind == "MOUSE_FORWARD":
-                                viewer.go_forward()
-                        continue
-                    key = decode_csi_key(seq) or ""
-
-        if key == "\x1a":
-            # ^Z: suspend, like a normal shell job-control app would -
-            # raw mode disables the tty's own ^Z-to-SIGTSTP translation
-            # (see RawTerminal), so this does it by hand: leave the
-            # mouse modes and cooked-mode the tty before actually
-            # stopping, then reverse all of that once `fg` resumes us.
-            # Takes priority over everything else (even typing a search
-            # query), same as a real terminal's ^Z would.
-            #
-            # --keep leaves the alternate screen buffer alone (no
-            # \x1b[?1049l) so the page stays on screen while suspended,
-            # the same trick main() uses to leave it up after quitting;
-            # otherwise leave the alternate screen like normal, so the
-            # shell prompt lands on the real scrollback instead.
-            leave_screen = "" if keep else "\x1b[?1049l"
-            sys.stdout.write(MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h" + leave_screen)
-            sys.stdout.flush()
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
-            # SIGSTOP rather than SIGTSTP: the cleanup above already does
-            # everything SIGTSTP's catchability would be for, so there's
-            # no downside to using the one stop signal that's guaranteed
-            # to actually stop the process - it can't be caught, blocked,
-            # or ignored, unlike SIGTSTP (which, at least on some
-            # setups, can silently fail to stop it on the first try).
-            # Sent to the whole process group (pid 0), not just our own
-            # pid: when launched via `uv run --script` (its shebang),
-            # this process is a *child* of uv, which is what the shell
-            # actually sees as the foreground job - stopping only
-            # ourselves would leave uv running and still attached to the
-            # tty, so the shell would never notice anything stopped.
-            os.kill(0, signal.SIGSTOP)
-            # ... stopped here until `fg` sends SIGCONT ...
-            tty.setraw(fd)
-            enter_screen = "" if keep else "\x1b[?1049h"
-            sys.stdout.write(
-                enter_screen + "\x1b[?25l" + ALT_SCROLL_ON + FOCUS_ON
-                + ("" if viewer.text_mode else MOUSE_ON)
-            )
-            sys.stdout.flush()
-            viewer.request_resize()  # the terminal may have been resized
-            # while stopped, and its contents are gone either way
+        if isinstance(key, tuple):  # ("MOUSE", kind, col, row)
+            if search_editor is None:
+                viewer.handle_mouse(*key[1:])
             continue
 
-        if search_buf is not None:
-            # Typing a search pattern after "/" or "?": collect
-            # characters until Enter confirms it, Esc/^C cancels,
-            # backspace edits it (or also cancels, if the pattern is
-            # already empty), ^B/^F/LEFT/RIGHT move search_cursor within
-            # it, ^A/^E/HOME/END jump it to the start/end, ^D/DEL delete
-            # the character under search_cursor, and ^U/^K kill from
-            # search_cursor to the start/end - readline's own bindings
-            # for these (DEL is the one exception, added for the plain
-            # Delete key on keyboards without an easy ^D). Every other
-            # key is swallowed so it can't leak through as a page
-            # command while the prompt is up.
-            if key in ("\r", "\n"):
-                query = search_buf or last_search_query
-                search_buf = None
+        # The order of the checks from here on is what decides which
+        # meaning a key gets: ^Z beats everything (even typing a search
+        # query), a prompt or pending prefix swallows the next key
+        # whatever it is, and the help screen swallows every other key
+        # but its own.
+        if key == "\x1a":
+            _suspend(fd, old_termios, keep, viewer)
+            continue
+
+        if search_editor is not None:
+            outcome = search_editor.handle(key)
+            if outcome == "submit":
+                query = search_editor.text or last_search_query
+                search_editor = None
                 if query:
                     last_search_query = query
                     viewer.start_search(query, backward=search_backward)
                 else:
                     viewer.draw_status()
-            elif key in ("\x1b", "\x03"):
-                search_buf = None
+            elif outcome == "cancel":
+                search_editor = None
                 viewer.draw_status()
-            elif key in ("\x7f", "\x08"):
-                if search_cursor > 0:
-                    search_buf = search_buf[:search_cursor - 1] + search_buf[search_cursor:]
-                    search_cursor -= 1
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-                elif not search_buf:
-                    search_buf = None
-                    viewer.draw_status()
-            elif key in ("\x02", "LEFT"):  # ^B
-                if search_cursor > 0:
-                    search_cursor -= 1
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key in ("\x06", "RIGHT"):  # ^F
-                if search_cursor < len(search_buf):
-                    search_cursor += 1
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key in ("\x01", "HOME"):  # ^A: jump to the start
-                if search_cursor > 0:
-                    search_cursor = 0
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key in ("\x05", "END"):  # ^E: jump to the end
-                if search_cursor < len(search_buf):
-                    search_cursor = len(search_buf)
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key in ("\x04", "DEL"):  # ^D / Delete: delete the character under search_cursor
-                if search_cursor < len(search_buf):
-                    search_buf = search_buf[:search_cursor] + search_buf[search_cursor + 1:]
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key == "\x15":  # ^U: kill from search_cursor to the start
-                if search_cursor > 0:
-                    search_buf = search_buf[search_cursor:]
-                    search_cursor = 0
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif key == "\x0b":  # ^K: kill from search_cursor to the end
-                if search_cursor < len(search_buf):
-                    search_buf = search_buf[:search_cursor]
-                    viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
-            elif len(key) == 1 and key.isprintable():
-                search_buf = search_buf[:search_cursor] + key + search_buf[search_cursor:]
-                search_cursor += 1
-                viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
+            elif outcome == "changed":
+                viewer.draw_search_prompt(
+                    search_editor.text, search_editor.cursor, backward=search_backward,
+                )
             continue
 
-        if colon_pending:
-            # ":" was just pressed - less(1)'s :n/:p, next/previous file
-            # (only meaningful with more than one file on the command
-            # line; harmless otherwise, since go_to_file() just reports
-            # there's nowhere to go - also bound to "{"/"}", a one-
-            # keystroke equivalent, see below), :q to quit, plus
-            # pdfless's own ":h" for the help screen. Any other key
-            # cancels quietly.
-            colon_pending = False
-            if key == "n":
-                viewer.next_file()
-            elif key == "p":
-                viewer.previous_file()
-            elif key == "h":
-                viewer.show_help()  # the spelt-out way in; F1 is primary
-            elif key == "q":
-                break  # less(1)'s ":q" - same as the plain "q" quit key
-            else:
+        if pending_prefix is not None:
+            action = _PREFIX_BINDINGS[pending_prefix].get(key)
+            pending_prefix = None
+            if action is None:
                 viewer.draw_status()
-            continue
-
-        if dash_pending:
-            # "-" was just pressed in text mode - less(1)'s own runtime
-            # "-<option-letter>" toggle syntax, kept only for
-            # -S/--chop-long-lines and -N/--line-numbers compatibility
-            # with less(1); "s"/"#" alone (see handle_key_text()) are the
-            # primary ways to toggle wrap/line-numbers. eol-mark and the
-            # border have no dash-toggle of their own - just "E"/"B".
-            # Any other key cancels quietly.
-            dash_pending = False
-            if key in ("S", "s"):
-                viewer.toggle_text_wrap()
-                viewer.refresh()
-            elif key in ("N", "n"):
-                viewer.toggle_line_numbers()
-                viewer.refresh()
-            else:
-                viewer.draw_status()
+            elif action(viewer) is False:
+                break
             continue
 
         if key == "\x03":
             break
 
         if viewer.help_active:
-            # While the help screen is up, only "q"/F1 and the scroll
-            # keys (for when KEY_TABLE is taller than the box) do
-            # anything. Everything else is swallowed so page keys can't
-            # leak through underneath it.
-            if key in ("q", "F1"):
-                viewer.hide_help()
-            elif key in FORWARD_LINE_KEYS:
-                viewer.scroll_help(1)
-            elif key in BACKWARD_LINE_KEYS:
-                viewer.scroll_help(-1)
-            elif key in FORWARD_WINDOW_KEYS:
-                viewer.scroll_help(max(1, viewer.rows - 3))
-            elif key in BACKWARD_WINDOW_KEYS:
-                viewer.scroll_help(-max(1, viewer.rows - 3))
+            viewer.handle_help_key(key)
             continue
 
-        if key == "\x0c":  # ^L: repaint the screen (e.g. after other
-            # output has garbled it), without otherwise changing anything
-            viewer.refresh()
+        if viewer.handle_global_key(key):
             continue
 
-        if key == "FOCUS_IN":
-            # Same fix as ^L, triggered automatically: see FOCUS_ON's
-            # comment for why a focus change (under tmux, especially)
-            # can otherwise leave this pane blank - and for why only
-            # this direction, not FOCUS_OUT, is safe to redraw on.
-            viewer.refresh()
-            continue
-        if key == "FOCUS_OUT":
-            continue
-
-        if key == "r":
-            # Applies in both image and text mode (see
-            # Viewer.toggle_scrollbar()), so handled here at the top
-            # level rather than inside handle_key()/handle_key_text().
-            viewer.toggle_scrollbar()
-            viewer.refresh()
-            continue
-
-        if key == "F":
-            # Same -f/--follow behavior as the command-line flag, toggled
-            # at runtime; applies in both image and text mode, so handled
-            # here rather than inside handle_key()/handle_key_text().
-            follow = not follow
-            viewer.follow = follow
-            if follow:
-                start_following()
-            viewer.refresh()
-            continue
-
-        if key in ("O", "v"):
-            # Hand the current file off to macOS's own default app for
-            # it (Preview/Word/Excel/...), and switch follow mode on (if
-            # it wasn't already) so an edit made there comes back
-            # automatically - the same reload path -f/--follow and "F"
-            # already use. viewer.path is always the original file (see
-            # DocumentHandler.__init__/Viewer.path), never a temporary
-            # rendered PDF, so this opens the same thing the user
-            # pointed pdfless at in the first place, even for a
-            # soffice/Chrome-rendered format.
-            if not _open_in_default_app(viewer.path):
-                viewer.draw_status(
-                    "opening the file in its own app needs macOS"
-                    if sys.platform != "darwin" else f"couldn't open {viewer.path}"
-                )
-                continue
-            if not follow:
-                follow = True
-                viewer.follow = True
-                start_following()
-            viewer.refresh()
-            continue
-
-        if key == "F1":
-            # less(1) puts its help on "h"/"H", which pdfless can't -
-            # both are panning keys here (less has nothing to pan). "?"
-            # isn't free either, being less's backward search, so help
-            # lives on F1, with ":h" as a second way in for terminals
-            # that send something unexpected for F1.
-            viewer.show_help()
-            continue
-
-        if key == ":":
-            colon_pending = True
-            viewer.draw_status(":")
-            continue
-
-        if key == "-" and viewer.text_mode:
+        if key == ":" or (key == "-" and viewer.text_mode):
             # In image mode, "-" already means zoom out (see
-            # Viewer.handle_key()) - only text mode gets the
-            # less(1)-style "-S" toggle.
-            dash_pending = True
-            viewer.draw_status("-")
-            continue
-
-        if key == "t":
-            if viewer.doc_handler.starts_in_text_mode():
-                # Always-on text mode already - toggling would try to
-                # switch to an image view this kind doesn't have.
-                viewer.draw_status("this is already a plain text file")
-            elif viewer.text_mode and not iterm2_like():
-                # Already in text mode - possibly the run_viewer() startup
-                # fallback above put it there - and image mode wouldn't
-                # show anything on this terminal anyway (see there), so
-                # refuse to cross back rather than switching to a blank
-                # screen.
-                viewer.draw_status("image mode needs iTerm2/WezTerm - not supported on this terminal")
-            elif viewer.doc_handler.supports_text_mode():
-                if not viewer.toggle_text_mode():
-                    viewer.draw_status("no text could be extracted from this file")
-            else:
-                viewer.draw_status("text mode isn't available for this file type")
-            continue
-
-        if key == "T":
-            # t and C combined into one press/undo - see
-            # Viewer.toggle_clean_text_mode(). Same eligibility checks
-            # as "t" above; there's no separate image view to enter for
-            # a kind that's always in text mode, so this is a no-op
-            # there too.
-            if viewer.doc_handler.starts_in_text_mode():
-                viewer.draw_status("this is already a plain text file")
-            elif viewer.text_mode and not iterm2_like():
-                viewer.draw_status("image mode needs iTerm2/WezTerm - not supported on this terminal")
-            elif viewer.doc_handler.supports_text_mode():
-                if not viewer.toggle_clean_text_mode():
-                    viewer.draw_status("no text could be extracted from this file")
-            else:
-                viewer.draw_status("text mode isn't available for this file type")
+            # Viewer.handle_key()) - only text mode gets the less(1)-style
+            # "-S"/"-N" toggles.
+            pending_prefix = key
+            viewer.draw_status(key)
             continue
 
         if key in ("/", "?"):
             # less(1)'s pair: "/" searches forward from here, "?"
-            # backward. Either way the whole document is searched and
-            # N/P then walk every match - the direction only decides
-            # which match this search lands on first (see
-            # Viewer._match_index_from()).
-            #
-            # Search always works in text mode (there's always a flat
-            # list of lines to search, self.text_lines) regardless of
-            # what the underlying file kind otherwise supports in image
-            # mode (doc_handler.supports_search() - currently PDF only,
-            # via its own page/bbox index).
+            # backward. Either way the whole document is searched and N/P
+            # then walk every match - the direction only decides which
+            # match this search lands on first (see
+            # Viewer._match_index_from()). Search always works in text
+            # mode (there's always a flat list of lines to search)
+            # regardless of what the file kind supports in image mode
+            # (doc_handler.supports_search() - a real PDF's bbox index).
             if viewer.text_mode or viewer.doc_handler.supports_search():
-                search_buf = ""
-                search_cursor = 0
+                search_editor = _LineEditor()
                 search_backward = key == "?"
-                viewer.draw_search_prompt(search_buf, search_cursor, backward=search_backward)
+                viewer.draw_search_prompt("", 0, backward=search_backward)
             else:
                 viewer.draw_status("search isn't available for this file type")
             continue
@@ -7502,109 +8218,48 @@ def run_viewer(
             if key in ("p", "P"):
                 viewer.repeat_search(forward=False)
                 continue
+            if key in ("q", "\x1b"):
+                # With a search active, "q"/Esc dismiss it (removing the
+                # match box/highlight and its status line) rather than
+                # quitting pdfless outright - quit still works normally on
+                # a second press, once there's no longer a search to clear.
+                viewer.clear_search()
+                viewer.refresh()
+                continue
 
-        if key in ("q", "\x1b") and viewer.search_query is not None:
-            # With a search active, "q"/Esc dismiss it (removing the
-            # match box/highlight and its status line) rather than
-            # quitting pdfless outright - quit still works normally on
-            # a second press, once there's no longer a search to clear.
-            viewer.clear_search()
-            viewer.refresh()
-            continue
-
-        # A lone "0" (no pending page number) resets the zoom/pan instead
-        # of starting a number entry.
+        # A lone "0" (no pending number) resets the zoom/pan instead of
+        # starting a number entry.
         if key.isdigit() and not (key == "0" and not num_buf):
             num_buf += key
             viewer.draw_status(f"number: {num_buf}")
             continue
 
-        if key in ("g", "G") and num_buf:
-            # "<number>g"/"<number>G": in text mode, jump straight to
-            # that line of the current page's text (a new capability -
-            # there's no page-image equivalent of "line", so the count
-            # is simply ignored there and this falls through to plain
-            # g/G below: jump to the top/bottom of the current page).
+        count = int(num_buf) if num_buf else None
+        if key in ("g", "G") and count is not None:
+            # "<number>g"/"<number>G": in text mode, jump straight to that
+            # line of the current page's text. There's no page-image
+            # equivalent of "line", so in image mode the count is simply
+            # dropped and this falls through to plain g/G below (the top/
+            # bottom of the current page).
+            num_buf = ""
             if viewer.text_mode:
-                viewer.go_to_text_line(int(num_buf))
-                num_buf = ""
+                viewer.go_to_text_line(count)
                 viewer.refresh()
                 continue
+        elif viewer.handle_count_key(key, count):
             num_buf = ""
-
-        if key in ("<", ">", "HOME", "END"):
-            # "<"/">" (HOME/END are aliases): jump to the first/last
-            # page of the whole document - "<number><" or "<number>>"
-            # jumps straight to that page instead, in either mode.
-            first = key in ("<", "HOME")
-            if num_buf:
-                target = int(num_buf)
-                num_buf = ""
-                if viewer.text_mode:
-                    viewer.go_to_page_text(target, 0)
-                else:
-                    viewer.go_page(target, 0)
-            elif viewer.text_mode:
-                if first:
-                    viewer.go_to_page_text(1, 0)
-                else:
-                    viewer.go_to_page_text(viewer.npages, None)
-            else:
-                if first:
-                    viewer.go_page(1, 0)
-                else:
-                    viewer.go_page(viewer.npages, None)
-                    viewer.scroll = viewer.scroll_max
-            viewer.refresh()
-            continue
-
-        if key in ("{", "}"):
-            # One-keystroke equivalents of ":p"/":n" - mirroring "["/"]"
-            # (PDF link-history back/forward), the shifted key just above
-            # each on a US keyboard.
-            if key == "{":
-                viewer.previous_file()
-            else:
-                viewer.next_file()
-            continue
-
-        if key == "x":
-            # "x" jumps to the first file in the list; "<number>x" jumps
-            # straight to that file (1-based, matching "<number><"'s
-            # page numbering) - meaningful only with more than one file,
-            # but harmless otherwise (go_to_file() just reports there's
-            # nowhere to go).
-            target = int(num_buf) - 1 if num_buf else 0
-            num_buf = ""
-            viewer.go_to_file(target, "no such file")
-            continue
-
-        if key == "X":
-            # "X" jumps to the last file in the list, mirroring "x" for
-            # the first.
-            num_buf = ""
-            viewer.go_to_file(len(viewer.files) - 1, "no such file")
             continue
 
         if num_buf:
-            # Any other key cancels a pending page number.
+            # Any other key cancels a pending number.
             num_buf = ""
             viewer.draw_status()
 
         border_before = viewer.text_border
-        before = (
-            viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
-            viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers, viewer.scrollbar,
-        )
+        before = viewer._view_state()
         if not viewer.handle_key(key):
             break
-        after = (
-            viewer.page, viewer.scroll, viewer.zoom, viewer.x_offset, viewer.fit,
-            viewer.text_mode, viewer.text_scroll, viewer.text_x_offset, viewer.text_border,
-            viewer.text_wrap, viewer.eol_mark, viewer.line_numbers, viewer.scrollbar,
-        )
-        if after != before:
+        if viewer._view_state() != before:
             viewer.refresh()
             if viewer.text_border != border_before and viewer.text_wrap:
                 # "B" toggled text_border, but _draw_text_wrapped() never
@@ -7662,8 +8317,12 @@ def main():
     parser.add_argument(
         "-c", "--continuous",
         action="store_true",
-        help="for a Quick Look preview file (macOS only), force continuous "
-             "scrolling instead of paginating",
+        help="continuous view: scroll through consecutive pages one "
+             "after another, so the bottom of one page and the top of "
+             "the next can be on screen together, instead of one page "
+             "at a time (a PDF's text mode likewise shows the whole "
+             "document, with a separator row between pages); toggle "
+             "any time with c",
     )
     parser.add_argument(
         "-k", "--keep",
@@ -7895,20 +8554,9 @@ def main():
             keep = args.keep
             viewer_out = []
             try:
-                fit = "height" if args.fit_height else "width"
                 viewer = run_viewer(
                     files, start_file_index, start_page, tmpdir, fd, rt.old,
-                    fit=fit, border=args.border, wrap=not args.chop_long_lines,
-                    eol_mark=args.eol_mark, line_numbers=args.line_numbers,
-                    scrollbar=args.scrollbar, follow=args.follow,
-                    wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
-                    incremental_scroll=args.incremental_scroll,
-                    debug=args.debug,
-                    office_render_scale=args.rendering_scale,
-                    office_continuous=args.continuous,
-                    # Only meaningful for a single file - dumping the first
-                    # of several and quitting would silently drop the rest.
-                    quit_if_one_screen=args.quit_if_one_screen and len(files) == 1,
+                    options=ViewerOptions.from_args(args, len(files)),
                     viewer_out=viewer_out,
                 )
             except BaseException:
@@ -7932,13 +8580,11 @@ def main():
                         # status line and bring the cursor back so the
                         # shell prompt lands cleanly below the image.
                         sys.stdout.write(
-                            MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF
-                            + f"\x1b[{viewer.rows};1H\x1b[2K\x1b[?25h"
+                            _leave_screen_seq(alt_screen=False)
+                            + f"\x1b[{viewer.rows};1H\x1b[2K"
                         )
                     else:
-                        sys.stdout.write(
-                            MOUSE_OFF + ALT_SCROLL_OFF + FOCUS_OFF + "\x1b[?25h\x1b[?1049l"
-                        )
+                        sys.stdout.write(_leave_screen_seq(alt_screen=True))
                     sys.stdout.flush()
                 # else: the alternate screen was never entered (-F/--quit-
                 # if-one-screen's dump-and-quit path) - nothing to restore.

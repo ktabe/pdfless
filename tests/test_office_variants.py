@@ -84,25 +84,12 @@ def test_docx_twopage_paginates_via_print_to_pdf(sample_twopage_docx, tmp_path):
 
 
 @requires_office_support
-def test_docx_continuous_flag_forces_a_single_page(sample_twopage_docx, tmp_path):
-    """-c/--continuous still collapses it back to one page - the same
-    "no real page boundaries of its own" reasoning FlowingText already
-    had, just no longer the default (see
-    test_docx_twopage_paginates_via_print_to_pdf)."""
-    handler = classify(sample_twopage_docx, tmp_path)
-    assert isinstance(handler, pdfless.OfficeDocument)
-    pages = handler.build_pages(str(tmp_path), continuous=True)
-    assert len(pages) == 1
-
-
-@requires_office_support
 @requires_soffice
 def test_rtf_uses_soffice_when_available_and_paginates_really(sample_twopage_rtf, tmp_path):
     """Unlike the textutil-converted-docx fallback (see
     RtfOfficeDocument.build_pages()'s "Always continuous" branch),
     soffice reads the original .rtf natively, so its real \\page break
-    is trusted and produces 2 real pages even with -c/--continuous NOT
-    passed."""
+    is trusted and produces 2 real pages."""
     handler = classify(sample_twopage_rtf, tmp_path)
     assert isinstance(handler, pdfless.RtfOfficeDocument)
     pages = handler.build_pages(str(tmp_path))
@@ -183,7 +170,7 @@ def test_docx_renders_via_a_pdf_delegate_for_crisp_zoom(sample_twopage_docx, tmp
     handler.build_pages(str(tmp_path))
     assert handler._pdf_delegate is not None
 
-    cache = pdfless.PageCache(handler.path, str(tmp_path), handler)
+    cache = pdfless.PageCache(str(tmp_path), handler)
     small = handler.get_page_image(cache, 1, 300, "width")
     big = handler.get_page_image(cache, 1, 1200, "width")
     assert small.width == 300
@@ -517,7 +504,7 @@ def test_svg_renders_via_chrome_directly(sample_svg, tmp_path):
     assert len(pages) == 1
     assert handler._pdf_delegate is not None
 
-    cache = pdfless.PageCache(handler.path, str(tmp_path), handler)
+    cache = pdfless.PageCache(str(tmp_path), handler)
     small = handler.get_page_image(cache, 1, 300, "width")
     big = handler.get_page_image(cache, 1, 900, "width")
     assert small.width == 300
@@ -534,3 +521,16 @@ def test_svg_falls_back_to_plain_text_without_chrome(sample_svg, tmp_path, monke
     handler = classify(sample_svg, tmp_path)
     assert isinstance(handler, pdfless.TextDocument)
     assert not isinstance(handler, pdfless.SvgDocument)
+
+
+def test_find_chrome_never_picks_vivaldi_from_path(monkeypatch):
+    """Vivaldi's headless mode doesn't work, so it's excluded from
+    CHROME_CANDIDATES - and must not sneak back in via the PATH fallback
+    either, on a machine where it's the only Chromium-family browser."""
+    monkeypatch.setattr(pdfless, "CHROME_CANDIDATES", ())
+    monkeypatch.setattr(pdfless, "_default_browser_bundle_id", lambda: None)
+    monkeypatch.setattr(
+        pdfless.shutil, "which",
+        lambda name: "/usr/bin/" + name if name.startswith("vivaldi") else None,
+    )
+    assert pdfless.find_chrome() is None
