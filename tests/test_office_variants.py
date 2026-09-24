@@ -84,25 +84,12 @@ def test_docx_twopage_paginates_via_print_to_pdf(sample_twopage_docx, tmp_path):
 
 
 @requires_office_support
-def test_docx_continuous_flag_forces_a_single_page(sample_twopage_docx, tmp_path):
-    """-c/--continuous still collapses it back to one page - the same
-    "no real page boundaries of its own" reasoning FlowingText already
-    had, just no longer the default (see
-    test_docx_twopage_paginates_via_print_to_pdf)."""
-    handler = classify(sample_twopage_docx, tmp_path)
-    assert isinstance(handler, pdfless.OfficeDocument)
-    pages = handler.build_pages(str(tmp_path), continuous=True)
-    assert len(pages) == 1
-
-
-@requires_office_support
 @requires_soffice
 def test_rtf_uses_soffice_when_available_and_paginates_really(sample_twopage_rtf, tmp_path):
     """Unlike the textutil-converted-docx fallback (see
     RtfOfficeDocument.build_pages()'s "Always continuous" branch),
     soffice reads the original .rtf natively, so its real \\page break
-    is trusted and produces 2 real pages even with -c/--continuous NOT
-    passed."""
+    is trusted and produces 2 real pages."""
     handler = classify(sample_twopage_rtf, tmp_path)
     assert isinstance(handler, pdfless.RtfOfficeDocument)
     pages = handler.build_pages(str(tmp_path))

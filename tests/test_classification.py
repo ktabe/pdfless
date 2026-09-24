@@ -63,15 +63,14 @@ def test_rtf_office_document_always_renders_continuous(sample_rtf, tmp_path):
     """A converted RTF's page-height pagination doesn't correspond to
     anything in the original RTF (it's just whatever page size
     textutil's docx conversion happened to declare), so
-    RtfOfficeDocument.build_pages() always forces continuous=True,
-    ignoring whatever the caller (-c/--continuous) asked for."""
+    RtfOfficeDocument.build_pages() always renders it with
+    continuous=True internally."""
     handler = classify(sample_rtf, tmp_path)
     assert isinstance(handler, pdfless.RtfOfficeDocument)
 
-    for continuous_arg in (False, True):
-        pages = handler.build_pages(str(tmp_path), continuous=continuous_arg)
-        assert pages is not None
-        assert len(pages) == 1
+    pages = handler.build_pages(str(tmp_path))
+    assert pages is not None
+    assert len(pages) == 1
 
 
 def test_rtf_falls_back_to_plain_text_without_textutil(sample_rtf, tmp_path, monkeypatch):

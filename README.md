@@ -133,7 +133,7 @@ press `C` again to restore the previous display settings.
 | `--no-scrollbar` | Hide the scrollbar. |
 | `--wheel-scroll-step N` | Scroll N lines per mouse-wheel step in image mode (default: 2). |
 | `-s`, `--rendering-scale N` | Set the rendering scale for image-based Quick Look previews (default: 1). Higher values improve sharpness at the cost of rendering time. |
-| `-c`, `--continuous` | Use a continuous view for Quick Look previews. |
+| `-c`, `--continuous` | Scroll through pages continuously, so the bottom of one page and the top of the next can be on screen together. In text mode, a paginated document (PDF, or a format rendered to PDF) is shown as one run of text with a separator line between pages. Toggle at any time with `c`. |
 | `--no-incremental-scroll` | Redraw the full page image on every scroll. |
 | `-d`, `--debug` | Print debugging information to standard error. |
 | `--no-cache` | Render afresh without reading or writing the persistent cache. |
@@ -208,6 +208,7 @@ edit the input. These bindings apply only while the search prompt is active.
 | `E` | Toggle end-of-line markers in text mode (shown by default). |
 | `#`, `-N` | Toggle line numbers in text mode (hidden by default). |
 | `C` | Toggle a clean text display for copying, restoring previous settings on the second press. |
+| `c` | Toggle the continuous view (`-c`/`--continuous`) in both image and text mode, keeping the current position. |
 | `r` | Toggle the scrollbar (shown by default). |
 | `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-f`/`--follow` is specified. |
 | Click a PDF link | Open a URL in the system browser or follow an internal link. |
@@ -266,10 +267,10 @@ Preview quality and pagination depend on the format and available renderer.
 | Word | `.doc`, `.docx`, `.docm` | LibreOffice preferred; otherwise Quick Look + Chrome. Supports text mode and search. Pagination may differ with the fallback renderer. |
 | Excel | `.xls`, `.xlsx`, `.xlsm` | Quick Look + Chrome. One page per sheet; no text mode or search. |
 | PowerPoint | `.ppt`, `.pptx`, `.pptm` | LibreOffice preferred; otherwise Quick Look + Chrome. One page per slide. Text mode and search require LibreOffice. |
-| RTF | `.rtf` | LibreOffice preserves page breaks; the Quick Look + Chrome fallback uses a continuous view. Supports text mode and search, with a plain-text fallback if rendering is unavailable. |
-| Pages | `.pages` | Quick Look + Chrome. Continuous view; no text mode or search. |
+| RTF | `.rtf` | LibreOffice preserves page breaks; the Quick Look + Chrome fallback shows one continuous page. Supports text mode and search, with a plain-text fallback if rendering is unavailable. |
+| Pages | `.pages` | Quick Look + Chrome. Shown as one continuous page; no text mode or search. |
 | Numbers | `.numbers` | Quick Look + Chrome. Only the first sheet is shown; no text mode or search. |
-| Keynote | `.key` | Quick Look + Chrome. Usually continuous; some previews support per-slide paging. No text mode or search. |
+| Keynote | `.key` | Quick Look + Chrome. Usually shown as one continuous page; some previews support per-slide paging. No text mode or search. |
 | OpenDocument | `.odt`, `.odp`, `.odg`, `.ods` | LibreOffice required. Supports text mode and search. Spreadsheet pagination follows the print layout. |
 | Visio | `.vsd`, `.vsdx` | LibreOffice required. One page per Visio page. `.vsdx` support has not been manually verified. |
 | WMF | `.wmf` | LibreOffice required. Single-page view. |
@@ -280,9 +281,8 @@ Formats rendered to PDF support text extraction and search where the resulting
 PDF contains text. Image-based Quick Look previews do not. In Markdown preview
 mode, `/` searches the rendered PDF; press `t` first to search the raw source.
 
-Use `-s` to increase the resolution of image-based Quick Look previews and
-`-c` to request continuous scrolling for Quick Look documents. These options
-do not change the pagination or resolution of LibreOffice-only formats or Markdown.
+Use `-s` to increase the resolution of image-based Quick Look previews. This
+option does not change the resolution of LibreOffice-only formats or Markdown.
 Excel uses Quick Look's sheet-based view rather than LibreOffice's print layout.
 
 A password-protected Word, PowerPoint, or Visio file (`.docx`/`.pptx`/`.vsdx`
