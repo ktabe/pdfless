@@ -277,7 +277,7 @@ Preview quality and pagination depend on the format and available renderer.
 | PowerPoint | `.ppt`, `.pptx`, `.pptm` | LibreOffice preferred; otherwise Quick Look + Chrome. One page per slide. Text mode and search require LibreOffice. |
 | RTF | `.rtf` | LibreOffice preserves page breaks; the Quick Look + Chrome fallback shows one continuous page. Supports text mode and search, with a plain-text fallback if rendering is unavailable. |
 | Pages | `.pages` | Quick Look + Chrome. Shown as one continuous page; no text mode or search. |
-| Numbers | `.numbers` | Quick Look + Chrome. Only the first sheet is shown; no text mode or search. |
+| Numbers | `.numbers` | Quick Look + Chrome. One page per sheet; no text mode or search. |
 | Keynote | `.key` | Quick Look + Chrome. Usually shown as one continuous page; some previews support per-slide paging. No text mode or search. |
 | OpenDocument | `.odt`, `.odp`, `.odg`, `.ods` | LibreOffice required. Supports text mode and search. Spreadsheet pagination follows the print layout. |
 | Visio | `.vsd`, `.vsdx` | LibreOffice required. One page per Visio page. `.vsdx` support has not been manually verified. |

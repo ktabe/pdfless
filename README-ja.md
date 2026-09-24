@@ -265,7 +265,7 @@ Quick LookプレビューまたはSVGの描画を利用する場合は，Chrome�
 | PowerPoint | `.ppt`, `.pptx`, `.pptm` | LibreOfficeを優先し，なければQuick Look + Chromeを使用します．1スライドを1ページとして表示します．テキストモードと検索にはLibreOfficeが必要です． |
 | RTF | `.rtf` | LibreOfficeでは改ページを維持し，代替のQuick Look + Chromeでは1枚の長いページとして表示します．テキストモードと検索に対応し，描画できない場合はプレーンテキストとして表示します． |
 | Pages | `.pages` | Quick Look + Chromeが必要です．1枚の長いページとして表示します．テキストモードと検索には対応しません． |
-| Numbers | `.numbers` | Quick Look + Chromeが必要です．最初のシートのみ表示します．テキストモードと検索には対応しません． |
+| Numbers | `.numbers` | Quick Look + Chromeが必要です．シートごとに1ページとして表示します．テキストモードと検索には対応しません． |
 | Keynote | `.key` | Quick Look + Chromeが必要です．通常は1枚の長いページとして表示しますが，一部のプレビューではスライド単位のページ表示に対応します．テキストモードと検索には対応しません． |
 | OpenDocument | `.odt`, `.odp`, `.odg`, `.ods` | LibreOfficeが必要です．テキストモードと検索に対応します．表計算文書のページ分割は印刷レイアウトに従います． |
 | Visio | `.vsd`, `.vsdx` | LibreOfficeが必要です．Visioの各ページを1ページとして表示します．`.vsdx`の対応は手動では未検証です． |
