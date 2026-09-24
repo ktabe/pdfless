@@ -445,6 +445,18 @@ def _default_browser_bundle_id():
     return None
 
 
+def _debug_log(msg: str) -> None:
+    """Print one -d/--debug line to stderr ("pdfless: [debug] <msg>") -
+    the caller decides whether debug is on. end="\r\n", not the default
+    "\n": this runs while the terminal's in raw mode (office rendering
+    only ever happens from inside the interactive viewer - even a
+    first/only file is rendered lazily, from Viewer.__init__), where a
+    bare "\n" doesn't return the cursor to column 1 (that's OPOST's
+    job, and raw mode turns it off) - every line after the first would
+    print staggered one column further right than the last otherwise."""
+    print(f"pdfless: [debug] {msg}", file=sys.stderr, end="\r\n")
+
+
 class _DebugTimer:
     """Prints how long one stage of OfficeDocument._render_office_pages() took, when
     -d/--debug is on - e.g. "pdfless: [debug] slides.pptx: rendering:
@@ -462,18 +474,7 @@ class _DebugTimer:
 
     def __exit__(self, *exc):
         if self.debug:
-            # end="\r\n", not the default "\n": this prints while the
-            # terminal's in raw mode (OfficeDocument._render_office_pages() only ever
-            # runs from inside the interactive viewer now - even a
-            # first/only file is rendered lazily, from Viewer.__init__),
-            # where a bare "\n" doesn't return the cursor to column 1
-            # (that's OPOST's job, and raw mode turns it off) - every
-            # line after the first would print staggered one column
-            # further right than the last otherwise.
-            print(
-                f"pdfless: [debug] {self.label}: {time.monotonic() - self.t0:.2f}s",
-                file=sys.stderr, end="\r\n",
-            )
+            _debug_log(f"{self.label}: {time.monotonic() - self.t0:.2f}s")
 
 
 class _ProgressLine:
@@ -678,18 +679,32 @@ _HEIGHT_ATTR_RE = re.compile(r'\bheight="([\d.]+)"', re.IGNORECASE)
 OFFICE_EMBEDDED_IMG_MAX_PX = 6000
 
 
+# pdfinfo's own output lines for the page count and a page's size -
+# shared by PdfDocument and the failure-tolerant helpers below. The size
+# line reads "Page size:" for a plain run and "Page    N size:" once
+# -f/-l ask for specific pages, hence the optional page number.
+_PDFINFO_PAGES_RE = re.compile(r"^Pages:\s+(\d+)", re.MULTILINE)
+_PDFINFO_SIZE_RE = re.compile(r"^Page\s*(?:\d+\s+)?size:\s+([\d.]+) x ([\d.]+)", re.MULTILINE)
+
+
+def _pdfinfo_safe(pdf_path: str) -> "str | None":
+    """pdfinfo's output for `pdf_path`, or None if it couldn't be run
+    (timed out, or not there at all) - for the helpers below, which
+    only ever read PDFs pdfless itself (or Quick Look) just produced."""
+    try:
+        return run_subprocess(
+            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
 def _pdf_page_size_pt_safe(pdf_path):
     """Like PdfDocument.page_size_pt(), but tolerant of failure (returns None
     rather than die()ing the whole program) - for sizing a picture
     embedded in a Quick Look preview, where a bad reading just means
     falling back to a default DPI rather than aborting entirely."""
-    try:
-        out = run_subprocess(
-            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
-        ).stdout
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    m = re.search(r"^Page\s*(?:\d+\s+)?size:\s+([\d.]+) x ([\d.]+)", out, re.MULTILINE)
+    m = _PDFINFO_SIZE_RE.search(_pdfinfo_safe(pdf_path) or "")
     return (float(m.group(1)), float(m.group(2))) if m else None
 
 
@@ -699,14 +714,21 @@ def _pdf_page_count_safe(pdf_path):
     back how many pages Chrome's --print-to-pdf produced (see
     FlowingText.build_pages()), where a bad reading just means falling
     back to the screenshot-based path rather than aborting entirely."""
-    try:
-        out = run_subprocess(
-            ["pdfinfo", pdf_path], capture_output=True, text=True, timeout=10,
-        ).stdout
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
+    m = _PDFINFO_PAGES_RE.search(_pdfinfo_safe(pdf_path) or "")
     return int(m.group(1)) if m else None
+
+
+def _pdf_render_result(out_pdf: str, ok: bool = True) -> "tuple | None":
+    """The ("pdf", out_pdf, npages) result a PDF-producing renderer
+    (soffice, Chrome's --print-to-pdf, WeasyPrint) hands back, once it's
+    written `out_pdf` - or None, deleting whatever it left behind, if it
+    reported failure (`ok` False) or the file has no readable pages."""
+    npages = _pdf_page_count_safe(out_pdf) if ok else None
+    if not npages:
+        if os.path.exists(out_pdf):
+            os.unlink(out_pdf)
+        return None
+    return ("pdf", out_pdf, npages)
 
 
 OFFICE_CACHE_MAX_ENTRIES = 50  # persistent rendered-pages cache (see
@@ -965,7 +987,7 @@ def _convert_via_soffice(soffice, path, tmpdir, timeout=60, debug=False):
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         if debug:
-            print(f"pdfless: [debug] {name}: soffice failed to run: {e}", file=sys.stderr, end="\r\n")
+            _debug_log(f"{name}: soffice failed to run: {e}")
         return None
     base = os.path.splitext(os.path.basename(path))[0]
     out_pdf = os.path.join(tmpdir, f"{base}.pdf")
@@ -978,10 +1000,9 @@ def _convert_via_soffice(soffice, path, tmpdir, timeout=60, debug=False):
         # sign is stderr/stdout text and no output file, so both are
         # worth showing here rather than just silently returning None.
         detail = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()
-        print(
-            f"pdfless: [debug] {name}: soffice produced no output"
-            + (f" - {detail.splitlines()[0]}" if detail else ""),
-            file=sys.stderr, end="\r\n",
+        _debug_log(
+            f"{name}: soffice produced no output"
+            + (f" - {detail.splitlines()[0]}" if detail else "")
         )
     return None
 
@@ -1875,12 +1896,7 @@ class FlowingText(OfficeVariant):
         label = f"{self.name}: rendering to PDF"
         with _DebugTimer(debug, label), progress.spin(label + "..."):
             ok = _capture_html_pdf(self.chrome, self.html_path, self.width, page_height, out_pdf)
-        npages = _pdf_page_count_safe(out_pdf) if ok else None
-        if not npages:
-            if os.path.exists(out_pdf):
-                os.unlink(out_pdf)
-            return None
-        return ("pdf", out_pdf, npages)
+        return _pdf_render_result(out_pdf, ok)
 
     def _build_pages_via_screenshot(self, tmpdir, debug, render_scale, progress, continuous):
         if render_scale == OFFICE_RENDER_SCALE:
@@ -2263,12 +2279,24 @@ class PdfDocument(DocumentHandler):
         return ["-upw", password] if password else []
 
     @staticmethod
+    def _poppler_stdout(tool: str, path: str, password: "str | None", *options: str,
+                        to_stdout: bool = False) -> str:
+        """Run poppler's `tool` (pdfinfo/pdftotext) on `path` and return
+        what it printed: `options` go before the path, the -upw password
+        (see _password_args()) first of all, and `to_stdout` adds the "-"
+        output-file argument pdftotext needs to print instead of writing
+        a .txt file. Raises CalledProcessError on failure, with stderr
+        captured - sniff()/_ensure_unlocked() read it to tell a wrong
+        password apart from a broken file."""
+        args = [tool, *PdfDocument._password_args(password), *options, path]
+        if to_stdout:
+            args.append("-")
+        return run_subprocess(args, capture_output=True, text=True, check=True).stdout
+
+    @staticmethod
     def _pdf_page_count(path, password=None):
-        out = run_subprocess(
-            ["pdfinfo", *PdfDocument._password_args(password), path],
-            capture_output=True, text=True, check=True,
-        ).stdout
-        m = re.search(r"^Pages:\s+(\d+)", out, re.MULTILINE)
+        out = PdfDocument._poppler_stdout("pdfinfo", path, password)
+        m = _PDFINFO_PAGES_RE.search(out)
         if not m:
             die("could not determine page count")
         return int(m.group(1))
@@ -2349,13 +2377,10 @@ class PdfDocument(DocumentHandler):
 
     def _read_page_size_pt(self, page: int) -> "tuple[float, float]":
         """page_size_pt()'s actual pdfinfo run, for one page."""
-        out = run_subprocess(
-            ["pdfinfo", *self._password_args(self.password), "-f", str(page), "-l", str(page), self.path],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        m = re.search(r"^Page\s*(?:\d+\s+)?size:\s+([\d.]+) x ([\d.]+)", out, re.MULTILINE)
+        out = self._poppler_stdout(
+            "pdfinfo", self.path, self.password, "-f", str(page), "-l", str(page),
+        )
+        m = _PDFINFO_SIZE_RE.search(out)
         if not m:
             die(f"could not determine page size for page {page}")
         return float(m.group(1)), float(m.group(2))
@@ -2364,12 +2389,10 @@ class PdfDocument(DocumentHandler):
         """Plain-text rendering of one page, via poppler's pdftotext
         -layout (which tries to preserve the page's visual line/column
         layout, unlike the flat word-run text used for search)."""
-        out = run_subprocess(
-            ["pdftotext", *self._password_args(self.password), "-f", str(page), "-l", str(page), "-layout", self.path, "-"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+        out = self._poppler_stdout(
+            "pdftotext", self.path, self.password,
+            "-f", str(page), "-l", str(page), "-layout", to_stdout=True,
+        )
         return out.splitlines()
 
     def extract_text_pages(self, npages: int) -> "list[list[str]]":
@@ -2380,12 +2403,9 @@ class PdfDocument(DocumentHandler):
         exactly as extract_text() does for that page on its own - the
         two must agree line for line, since search highlighting maps a
         match's page-relative line position between them."""
-        out = run_subprocess(
-            ["pdftotext", *self._password_args(self.password), "-layout", self.path, "-"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+        out = self._poppler_stdout(
+            "pdftotext", self.path, self.password, "-layout", to_stdout=True,
+        )
         pieces = out.split("\f")
         pages = [piece + "\f" for piece in pieces[:-1]]
         if pieces[-1]:
@@ -2402,12 +2422,9 @@ class PdfDocument(DocumentHandler):
         {"width_pt": float, "height_pt": float, "text": str,
         "words": [(start, end, xMin, yMin, xMax, yMax), ...]} (all in points)
         where (start, end) are offsets into "text" for that word."""
-        out = run_subprocess(
-            ["pdftotext", *self._password_args(self.password), "-bbox", self.path, "-"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+        out = self._poppler_stdout(
+            "pdftotext", self.path, self.password, "-bbox", to_stdout=True,
+        )
 
         pages = []
         for width, height, body in self._BBOX_PAGE_RE.findall(out):
@@ -3057,10 +3074,7 @@ class OfficeDocument(DocumentHandler):
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             if debug:
-                print(
-                    f"pdfless: [debug] {name}: qlmanage failed to run: {e}",
-                    file=sys.stderr, end="\r\n",
-                )
+                _debug_log(f"{name}: qlmanage failed to run: {e}")
             return None
         bundle = os.path.join(outdir, f"{os.path.basename(path)}.qlpreview")
         html_path = os.path.join(bundle, "Preview.html")
@@ -3077,10 +3091,7 @@ class OfficeDocument(DocumentHandler):
                 )
                 stderr_lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
                 detail = f" - {stderr_lines[0]}" if stderr_lines else ""
-                print(
-                    f"pdfless: [debug] {name}: qlmanage {how}{detail}",
-                    file=sys.stderr, end="\r\n",
-                )
+                _debug_log(f"{name}: qlmanage {how}{detail}")
             return None
 
         width = height = page_element_xpath = None
@@ -3253,17 +3264,13 @@ class OfficeDocument(DocumentHandler):
         if soffice is None:
             return None
         if debug:
-            print(f"pdfless: [debug] {name}: using soffice: {soffice}", file=sys.stderr, end="\r\n")
+            _debug_log(f"{name}: using soffice: {soffice}")
         label = f"{name}: converting via LibreOffice"
         with _DebugTimer(debug, label), progress.spin(label + "..."):
             out_pdf = _convert_via_soffice(soffice, path, tmpdir, debug=debug)
         if out_pdf is None:
             return None
-        npages = _pdf_page_count_safe(out_pdf)
-        if not npages:
-            os.unlink(out_pdf)
-            return None
-        return ("pdf", out_pdf, npages)
+        return _pdf_render_result(out_pdf)
 
     def _measure_slide_offsets(self, chrome, html_path, page_element_xpath, width):
         """For a document whose Quick Look preview has distinct page/slide
@@ -3463,7 +3470,7 @@ class OfficeDocument(DocumentHandler):
                 if chrome is None:
                     return None
                 if debug:
-                    print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
+                    _debug_log(f"{name}: using browser: {chrome}")
 
                 progress.update(f"{name}: reading Quick Look preview...")
                 with _DebugTimer(debug, f"{name}: qlmanage preview"):
@@ -3535,10 +3542,7 @@ class OfficeDocument(DocumentHandler):
                 if page_paths is None:
                     return None
                 if debug:
-                    print(
-                        f"pdfless: [debug] {name}: total: {time.monotonic() - t_start:.2f}s",
-                        file=sys.stderr, end="\r\n",
-                    )
+                    _debug_log(f"{name}: total: {time.monotonic() - t_start:.2f}s")
                 return page_paths
             finally:
                 progress.clear()
@@ -3549,10 +3553,7 @@ class OfficeDocument(DocumentHandler):
         key_suffix = f":scale={render_scale}" + (":continuous" if continuous else "")
         result, from_cache = _render_result_cached(path, render, key_suffix=key_suffix)
         if debug and result is not None and from_cache:
-            print(
-                f"pdfless: [debug] {name}: reusing cached render, skipped qlmanage/soffice/Chrome",
-                file=sys.stderr, end="\r\n",
-            )
+            _debug_log(f"{name}: reusing cached render, skipped qlmanage/soffice/Chrome")
         return result
 
     def ensure_pages(self, tmpdir, **kwargs):
@@ -3738,10 +3739,7 @@ class RtfOfficeDocument(OfficeDocument):
         key_suffix = f":scale={render_scale}"
         result, from_cache = _render_result_cached(self.path, render, key_suffix=key_suffix)
         if debug and result is not None and from_cache:
-            print(
-                f"pdfless: [debug] {name}: reusing cached render, skipped qlmanage/soffice/Chrome",
-                file=sys.stderr, end="\r\n",
-            )
+            _debug_log(f"{name}: reusing cached render, skipped qlmanage/soffice/Chrome")
         return self._remember_pages(result)
 
 
@@ -3807,10 +3805,7 @@ class SofficeOnlyDocument(OfficeDocument):
 
         result, from_cache = _render_result_cached(self.path, render)
         if debug and result is not None and from_cache:
-            print(
-                f"pdfless: [debug] {name}: reusing cached PDF, skipped LibreOffice",
-                file=sys.stderr, end="\r\n",
-            )
+            _debug_log(f"{name}: reusing cached PDF, skipped LibreOffice")
         if result is None:
             return None
         return self._remember_pages(result)
@@ -3859,7 +3854,7 @@ class SvgDocument(OfficeDocument):
         if chrome is None:
             return None
         if debug:
-            print(f"pdfless: [debug] {name}: using browser: {chrome}", file=sys.stderr, end="\r\n")
+            _debug_log(f"{name}: using browser: {chrome}")
         tag = hashlib.md5(self.path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
         wrapper_path = os.path.join(tmpdir, f"svg-wrap-{tag}.html")
 
@@ -3880,20 +3875,13 @@ class SvgDocument(OfficeDocument):
             label = f"{name}: rendering to PDF"
             with _DebugTimer(debug, label), progress.spin(label + "..."):
                 ok = _capture_html_pdf(chrome, wrapper_path, width, height, out_pdf)
-            if not ok:
-                return None
-            npages = _pdf_page_count_safe(out_pdf)
-            if not npages:
-                os.unlink(out_pdf)
-                return None
-            return ("pdf", out_pdf, npages)
+            return _pdf_render_result(out_pdf, ok)
 
         result, from_cache = _render_result_cached(self.path, render)
         if debug and result is not None:
-            print(
-                f"pdfless: [debug] {name}: "
-                + ("reusing cached PDF, skipped rendering" if from_cache else "cached the converted PDF"),
-                file=sys.stderr, end="\r\n",
+            _debug_log(
+                f"{name}: "
+                + ("reusing cached PDF, skipped rendering" if from_cache else "cached the converted PDF")
             )
         if result is None:
             return None
@@ -4102,12 +4090,7 @@ img { max-width: 100%; height: auto; }
         label = f"{name}: rendering to PDF"
         with _DebugTimer(debug, label), progress.spin(label + "..."):
             ok = self._render_markdown_pdf(out_pdf)
-        npages = _pdf_page_count_safe(out_pdf) if ok else None
-        if not npages:
-            if os.path.exists(out_pdf):
-                os.unlink(out_pdf)
-            return None
-        return self._remember_pages(("pdf", out_pdf, npages))
+        return self._remember_pages(_pdf_render_result(out_pdf, ok))
 
     def extract_text(self, page):
         return read_plain_text_lines(self.path)
