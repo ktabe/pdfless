@@ -216,7 +216,7 @@ def test_text_mode_shows_every_page_with_separators(sample_pdf, monkeypatch):
         assert start - 1 in viewer._text_separator_lines
         assert viewer._text_page_of_line(start - 1) == page
     rule = viewer._text_separator_rule(viewer._text_page_starts[1], 30)
-    assert pdfless.PAGE_NUMBER_COLOR + f" 2/{viewer.npages} " + pdfless.PAGE_NUMBER_RESET in rule
+    assert pdfless.PAGE_NUMBER_COLOR + f" 2/{viewer.npages} " + pdfless.SGR_RESET in rule
     assert pdfless.PAGE_NUMBER_COLOR + f" 1/{viewer.npages} " in viewer._text_separator_rule(0, 30)
     # Page 1's heading stands in for the border's top edge: nothing to
     # scroll up to above it.

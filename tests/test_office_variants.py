@@ -170,7 +170,7 @@ def test_docx_renders_via_a_pdf_delegate_for_crisp_zoom(sample_twopage_docx, tmp
     handler.build_pages(str(tmp_path))
     assert handler._pdf_delegate is not None
 
-    cache = pdfless.PageCache(handler.path, str(tmp_path), handler)
+    cache = pdfless.PageCache(str(tmp_path), handler)
     small = handler.get_page_image(cache, 1, 300, "width")
     big = handler.get_page_image(cache, 1, 1200, "width")
     assert small.width == 300
@@ -504,7 +504,7 @@ def test_svg_renders_via_chrome_directly(sample_svg, tmp_path):
     assert len(pages) == 1
     assert handler._pdf_delegate is not None
 
-    cache = pdfless.PageCache(handler.path, str(tmp_path), handler)
+    cache = pdfless.PageCache(str(tmp_path), handler)
     small = handler.get_page_image(cache, 1, 300, "width")
     big = handler.get_page_image(cache, 1, 900, "width")
     assert small.width == 300

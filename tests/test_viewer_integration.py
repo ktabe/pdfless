@@ -169,7 +169,7 @@ def test_quit_if_one_screen_dump_respects_line_numbers_and_eol_mark(pty_session,
     exited, out = _drain_until_exit(session)
     assert exited
     assert b"\x1b[?1049h" not in out
-    # LINE_NUMBER_COLOR "1 " LINE_NUMBER_RESET "line one" - gutter and
+    # LINE_NUMBER_COLOR "1 " SGR_RESET "line one" - gutter and
     # content are separated by ANSI codes, not adjacent plain text.
     assert "\x1b[90m1 \x1b[0mline one".encode() in out
     assert "\x1b[90m3 \x1b[0mline three".encode() in out

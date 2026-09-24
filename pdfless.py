@@ -66,7 +66,9 @@ Image.MAX_IMAGE_PIXELS = None
 __version__ = "1.1.0"
 
 STATUS_COLOR_ON = "\x1b[44;97m"  # white on blue - used for one-off messages
-STATUS_COLOR_OFF = "\x1b[0m"
+# Resets every SGR attribute (color, reverse video, ...) at once - how
+# every colored piece of output here ends, whatever set the color.
+SGR_RESET = "\x1b[0m"
 
 # The default status line is split into differently-colored fields so
 # filename/page/loc%/zoom% each stand out, with the trailing key-hints
@@ -83,25 +85,21 @@ STATUS_COLOR_HELP = "\x1b[100;37m"  # light grey on dark grey
 # Text-mode search match: no image to draw a box marker over there, so
 # the matched substring itself is highlighted with a background color.
 TEXT_HIGHLIGHT_COLOR = "\x1b[43;30m"  # black on yellow
-TEXT_HIGHLIGHT_RESET = "\x1b[0m"
 
 # PDF (image) mode search match: same yellow, as a foreground color for
 # the box-drawing border characters (there's no text to paint a
 # background behind, just the underlying page image).
 SEARCH_MARKER_COLOR = "\x1b[93m"  # bright yellow
-SEARCH_MARKER_RESET = "\x1b[0m"
 
 # Wrap mode (_draw_text_wrapped()): marks a real newline (the last
 # display row of a raw line) with U+21B5 (↵), distinct from a row that's
 # just a soft-wrap continuation of the same line.
 NEWLINE_MARKER = "↵"
 NEWLINE_MARKER_COLOR = "\x1b[34m"  # blue
-NEWLINE_MARKER_RESET = "\x1b[0m"
 
 # -N/--line-numbers: a right-aligned gutter at the start of each text-mode
 # row (see Viewer._line_number_gutter_width()).
 LINE_NUMBER_COLOR = "\x1b[90m"  # gray
-LINE_NUMBER_RESET = "\x1b[0m"
 
 # -c/--continuous: what fills the space between two stacked pages in
 # the page image (and beside a page narrower than the widest one on
@@ -112,11 +110,9 @@ LINE_NUMBER_RESET = "\x1b[0m"
 # Viewer._text_separator_rule()).
 CONTINUOUS_GAP_COLOR = (128, 128, 128)
 PAGE_SEPARATOR_COLOR = "\x1b[90m"  # gray
-PAGE_SEPARATOR_RESET = "\x1b[0m"
 # The "N/M" page number within that separator row - green, the same hue
 # as the status line's own page field, so it reads as the same thing.
 PAGE_NUMBER_COLOR = "\x1b[1;32m"  # bold green
-PAGE_NUMBER_RESET = "\x1b[0m"
 
 # The scrollbar's two kinds of cell, ready to write (see
 # Viewer._scrollbar_column()). The thumb is a reverse-video space
@@ -605,7 +601,7 @@ class _ViewerProgress:
         # self.cols afterward wouldn't touch any spill onto the row above.
         if self.enabled:
             sys.stdout.write(
-                f"\x1b[{self.viewer.rows};1H\x1b[2K{STATUS_COLOR_OFF}\x1b[?25l"
+                f"\x1b[{self.viewer.rows};1H\x1b[2K{SGR_RESET}\x1b[?25l"
             )
             sys.stdout.flush()
 
@@ -2959,17 +2955,11 @@ class RtfDocument(TextDocument):
     def sniff(cls, path, tmpdir, debug=False):
         if not cls.is_rtf_file(path):
             return None
-        if not is_probably_text(path):
-            # Vanishingly unlikely for genuine RTF (it's pure ASCII by
-            # spec) - but keep the same NUL-byte safety net
-            # TextDocument itself applies, rather than trusting the RTF
-            # signature alone.
-            return None
-        try:
-            read_plain_text_lines(path)  # just to validate it decodes
-        except Exception as e:
-            raise UnusableFile(f"not valid UTF-8 text ({e})") from e
-        return cls(path)
+        # The rest is TextDocument's own check - vanishingly unlikely to
+        # fail for genuine RTF (it's pure ASCII by spec), but kept as the
+        # same NUL-byte/decoding safety net rather than trusting the RTF
+        # signature alone.
+        return super().sniff(path, tmpdir, debug)
 
     def extract_text(self, page):
         return extract_office_text(self.path) or super().extract_text(page)
@@ -3753,17 +3743,6 @@ class RtfOfficeDocument(OfficeDocument):
                 file=sys.stderr, end="\r\n",
             )
         return self._remember_pages(result)
-
-    def extract_text(self, page):
-        if self._pdf_delegate is not None:
-            # soffice rendered the original .rtf natively to a real
-            # PDF (see build_pages()) - use its own per-page text, the
-            # same as OfficeDocument.extract_text() does for Word.
-            return self._pdf_delegate.extract_text(page)
-        # textutil already handles RTF directly for plain-text
-        # extraction (see extract_office_text()) - no need to go via
-        # the .docx conversion just for this.
-        return extract_office_text(self.path)
 
 
 class SofficeOnlyDocument(OfficeDocument):
@@ -4611,10 +4590,8 @@ class PageCache:
     bookkeeping - LRU eviction, the "loaded once natively" table - is
     shared machinery rather than any one kind's own concern."""
 
-    def __init__(self, doc_path, tmpdir, handler, size=CACHE_SIZE):
-        self.doc_path = doc_path
+    def __init__(self, tmpdir, handler, size=CACHE_SIZE):
         self.tmpdir = tmpdir
-        self.kind = handler.kind  # "pdf", "image", or "office"
         self.size = size
         self._cache = OrderedDict()  # (page, dpi_or_px_rounded) -> PIL.Image
         self._native_images = {}  # page -> PIL.Image, loaded once each - see
@@ -4747,7 +4724,7 @@ class Viewer:
         # but the status line alone doesn't touch any of that.
         self.rows, self.cols, _, _ = get_term_cells(fd)
         self.page = page
-        self._set_current_file()  # sets path/name/kind/npages/cache
+        self._set_current_file()  # sets path/name/npages/cache
         # For an office-kind first file, self.npages was just determined
         # above (by _ensure_office_pages(), lazily) rather than known
         # ahead of time the way main() clamps a PDF/image/text file's
@@ -4854,6 +4831,16 @@ class Viewer:
         self._last_scroll = None
         self._last_fit_key = None
 
+    def _invalidate_screen(self) -> None:
+        """Forget what's on screen, so the next image-mode draw starts
+        from a full clear (no incremental shift - see
+        _scroll_shift_rows()) and doesn't try to erase a search marker
+        that something else has already painted over - for anything that
+        overwrites the screen with something else (help, text mode, a
+        file switch, a mode toggle)."""
+        self._last_viewport_set = False
+        self._last_marker_bounds = None
+
     def request_resize(self):
         self.resized = True
         # The help box's size/position and the underlying page raster are
@@ -4901,7 +4888,7 @@ class Viewer:
         return True
 
     def _set_current_file(self):
-        """Point path/name/kind/npages/doc_handler/cache at
+        """Point path/name/npages/doc_handler/cache at
         self.files[self.file_index] - just the file's identity, not the
         page/zoom/search/etc. state, which __init__ sets up once and
         go_to_file() resets explicitly on every later switch. Assumes
@@ -4912,14 +4899,13 @@ class Viewer:
         self.path = handler.path
         self.name = os.path.basename(handler.path)
         self.doc_handler = handler
-        self.kind = handler.kind  # "pdf", "image", "text", or "office"
         self.npages = handler.page_count()  # None for an OfficeDocument
         # until _ensure_office_pages() below actually renders it
         self._ensure_office_pages()  # a no-op unless doc_handler is an
         # OfficeDocument, and sets self.npages for real in that case
         # (memoized on the handler itself - see OfficeDocument.pages -
         # so a revisit to an already-rendered file is still cheap)
-        self.cache = PageCache(handler.path, self.tmpdir, handler)
+        self.cache = PageCache(self.tmpdir, handler)
         self._text_pages = None  # the previous file's text
         self._text_page_starts = None
         self._text_separator_lines = frozenset()
@@ -5020,8 +5006,7 @@ class Viewer:
         self.page = 1
         self.scroll = 0
         self.x_offset = 0
-        self._last_viewport_set = False
-        self._last_marker_bounds = None
+        self._invalidate_screen()
         if self.text_mode:
             self._load_text_page()
         else:
@@ -5046,9 +5031,8 @@ class Viewer:
         self.avail_height_px = cell_h * max(1, rows - 1 - self._dump_margin_rows)
         self.cache.clear()
         self.encode_cache.clear()
-        self._last_viewport_set = False
+        self._invalidate_screen()
         self._last_char_h = 0
-        self._last_marker_bounds = None
         self._display_rows = None  # stale - self.cols may have changed,
         # which is what wrapping is measured against
 
@@ -5183,6 +5167,15 @@ class Viewer:
         _build_continuous_layout())."""
         return self._view_width if self.continuous and self._layout else self.img.width
 
+    def _max_x_offset(self) -> int:
+        """The furthest right the pan can go - the content's own width
+        (see _content_width()) past what fits on screen."""
+        return max(0, self._content_width() - self.crop_width)
+
+    def _set_x_offset(self, x_offset: int) -> None:
+        """Pan to `x_offset`, clamped to 0.._max_x_offset()."""
+        self.x_offset = max(0, min(self._max_x_offset(), x_offset))
+
     def _clamp_image_scroll(self, scroll: int) -> int:
         """A target scroll position for the current page, clamped to
         what the view allows: 0..scroll_max normally, or left as-is
@@ -5261,8 +5254,7 @@ class Viewer:
         self.x_offset = 0
 
     def pan(self, dx):
-        max_offset = max(0, self._content_width() - self.crop_width)
-        self.x_offset = max(0, min(max_offset, self.x_offset + dx))
+        self._set_x_offset(self.x_offset + dx)
 
     def _relayout(self):
         """Redo the layout after something on screen changed how much
@@ -5302,7 +5294,7 @@ class Viewer:
         whichever unit the current mode scrolls in - the inverse of
         _top_text_line(), so the pair of them carry a reading position
         across anything that changes the layout underneath it."""
-        self.text_scroll = self._row_for_line(line_idx) if self.text_wrap else line_idx
+        self.text_scroll = self._text_row_for_line(line_idx)
         self._clamp_text_scroll()
 
     def _load_content(self):
@@ -5346,9 +5338,9 @@ class Viewer:
             for i, line in enumerate(self.text_lines):
                 if gutter_width:
                     num = str(i + 1).rjust(gutter_width - 1)
-                    line = LINE_NUMBER_COLOR + num + " " + LINE_NUMBER_RESET + line
+                    line = LINE_NUMBER_COLOR + num + " " + SGR_RESET + line
                 if self.eol_mark:
-                    line += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
+                    line += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + SGR_RESET
                 rows.append(line)
             # \r\n, not just \n: the terminal is in raw mode (tty.setraw()
             # - see RawTerminal) for the whole run regardless of which
@@ -5391,8 +5383,7 @@ class Viewer:
 
     def hide_help(self):
         self.help_active = False
-        self._last_viewport_set = False  # help chars overlay the page
-        self._last_marker_bounds = None
+        self._invalidate_screen()  # help chars overlay the page
         self.refresh()
 
     def enter_text_mode(self):
@@ -5409,8 +5400,7 @@ class Viewer:
         # clicking hyperlinks in the page image; leave it off here so
         # the terminal's own click-drag text selection works normally.
         sys.stdout.write(MOUSE_OFF)
-        self._last_viewport_set = False
-        self._last_marker_bounds = None
+        self._invalidate_screen()
         reindex_search = (
             self.search_query and self.doc_handler.search_resets_on_text_mode_toggle()
         )
@@ -5447,8 +5437,7 @@ class Viewer:
             self.toggle_copy_mode()
         self.text_mode = False
         sys.stdout.write(MOUSE_ON)
-        self._last_viewport_set = False
-        self._last_marker_bounds = None
+        self._invalidate_screen()
         # self.page may have moved while browsing in text mode (n/p, g/G,
         # <N>g all update it), but self.img was never touched during that
         # - refresh() only reloads it on a resize - so without this it'd
@@ -5759,11 +5748,11 @@ class Viewer:
         width = max(0, width)
         label = f" {self._text_page_of_line(line_idx)}/{self.npages} "
         if len(label) + 2 > width:
-            return PAGE_SEPARATOR_COLOR + "─" * width + PAGE_SEPARATOR_RESET
+            return PAGE_SEPARATOR_COLOR + "─" * width + SGR_RESET
         return (
-            PAGE_SEPARATOR_COLOR + "──" + PAGE_SEPARATOR_RESET
-            + PAGE_NUMBER_COLOR + label + PAGE_NUMBER_RESET
-            + PAGE_SEPARATOR_COLOR + "─" * (width - 2 - len(label)) + PAGE_SEPARATOR_RESET
+            PAGE_SEPARATOR_COLOR + "──" + SGR_RESET
+            + PAGE_NUMBER_COLOR + label + SGR_RESET
+            + PAGE_SEPARATOR_COLOR + "─" * (width - 2 - len(label)) + SGR_RESET
         )
 
     def toggle_continuous(self) -> None:
@@ -5777,8 +5766,7 @@ class Viewer:
             start, _end = self._text_page_range(page)
             line_offset = max(0, self._top_text_line() - start)
         self.continuous = not self.continuous
-        self._last_viewport_set = False
-        self._last_marker_bounds = None
+        self._invalidate_screen()
         if self.text_mode:
             if self.doc_handler.text_mode_is_paginated():
                 self.page = page
@@ -5873,15 +5861,13 @@ class Viewer:
         toggle either way, on top of this default."""
         return self.doc_handler.default_text_wrap(self.wrap_default)
 
+    def _set_text_scroll(self, row: int) -> None:
+        """Scroll text mode to `row`, clamped to the current
+        text_scroll_min..text_scroll_max (see _clamp_text_scroll(),
+        which works those out)."""
+        self.text_scroll = max(self.text_scroll_min, min(self.text_scroll_max, row))
+
     def _clamp_text_scroll(self):
-        # The border sits at the page's actual edges - one row above the
-        # first line, one below the last; one column left of column 0,
-        # one right of the widest line - which is usually off-screen at
-        # the default scroll/pan position. It only comes into view by
-        # scrolling/panning one step past the content itself, so with the
-        # border on, the scroll/pan range is widened by exactly that much;
-        # with it off, the range is exactly what it was before this
-        # feature existed.
         avail_rows = self._text_avail_rows()
         if self.text_wrap:
             # No border while wrapped (see _draw_text_wrapped()) - the
@@ -5891,9 +5877,7 @@ class Viewer:
             self._ensure_display_rows()
             self.text_scroll_min = 0
             self.text_scroll_max = max(0, len(self._display_rows) - avail_rows)
-            self.text_scroll = max(
-                self.text_scroll_min, min(self.text_scroll, self.text_scroll_max)
-            )
+            self._set_text_scroll(self.text_scroll)
             self.text_x_offset_min = 0
             self.text_x_offset_max = 0
             self.text_x_offset = 0
@@ -5919,9 +5903,7 @@ class Viewer:
         else:
             self.text_scroll_min = 0
             self.text_scroll_max = max(0, len(self.text_lines) - avail_rows)
-        self.text_scroll = max(
-            self.text_scroll_min, min(self.text_scroll, self.text_scroll_max)
-        )
+        self._set_text_scroll(self.text_scroll)
 
         # The -N gutter (if on) lives outside this space entirely - see
         # _draw_text_unwrapped() - so the "page" is narrower by that much.
@@ -6078,12 +6060,8 @@ class Viewer:
         px_left, px_top, px_right, px_bottom = self._match_bbox_px(match)
         margin = self.avail_height_px // 4
         self.scroll = self._clamp_image_scroll(round(px_top) - margin)
-        max_x_offset = max(0, self._content_width() - self.crop_width)
         if px_left < self.x_offset or px_right > self.x_offset + self.crop_width:
-            self.x_offset = max(
-                0,
-                min(max_x_offset, round((px_left + px_right) / 2 - self.crop_width / 2)),
-            )
+            self._set_x_offset(round((px_left + px_right) / 2 - self.crop_width / 2))
 
     def _scroll_text_to_match(self, match):
         """Scroll/pan the text view so `match` is visible, landing it a
@@ -6119,12 +6097,10 @@ class Viewer:
             line_idx = page_start + (
                 round((ymin_pt / height_pt) * (page_end - page_start)) if height_pt else 0
             )
-            target_row = self._row_for_line(line_idx) if self.text_wrap else line_idx
+            target_row = self._text_row_for_line(line_idx)
         avail_rows = self._text_avail_rows()
         margin = avail_rows // 4
-        self.text_scroll = max(
-            self.text_scroll_min, min(self.text_scroll_max, target_row - margin)
-        )
+        self._set_text_scroll(target_row - margin)
 
     def go_to_page_text(self, page, scroll):
         """Show `page` in text mode: scroll=0 is its top, None its
@@ -6154,9 +6130,7 @@ class Viewer:
             # 0 means "top of page", which _load_text_page() already set
             # up (text_scroll_min, revealing the border if there is one);
             # anything else is a specific line to land on (e.g. <N>g).
-            self.text_scroll = max(
-                self.text_scroll_min, min(self.text_scroll_max, scroll)
-            )
+            self._set_text_scroll(scroll)
 
     def _go_to_page_continuous_text(self, page: int, scroll: "int | None") -> None:
         """go_to_page_text() for the continuous text view - where every
@@ -6179,7 +6153,7 @@ class Viewer:
             target = top_row
         else:
             target = self._text_row_for_line(min(max(start, end - 1), start + scroll))
-        self.text_scroll = max(self.text_scroll_min, min(self.text_scroll_max, target))
+        self._set_text_scroll(target)
 
     def go_to_text_line(self, n):
         """Jump to line `n` (1-based) within the current page's text -
@@ -6195,7 +6169,7 @@ class Viewer:
         # still the current page's own line n there.
         start, end = self._text_page_range(self.page)
         target_line = max(start, min(max(start, end - 1), start + n - 1))
-        row = self._row_for_line(target_line) if self.text_wrap else target_line
+        row = self._text_row_for_line(target_line)
         self.text_scroll = max(self.text_scroll_min, row)
 
     def text_scroll_down(self, n):
@@ -6304,7 +6278,7 @@ class Viewer:
         avail_rows = self._text_avail_rows()
         highlight = self._text_search_highlight()
 
-        out = [STATUS_COLOR_OFF, "\x1b[H\x1b[2J"]
+        out = [SGR_RESET, "\x1b[H\x1b[2J"]
         n_rows = len(self._display_rows)
         gutter_width = self._line_number_gutter_width()
 
@@ -6323,7 +6297,7 @@ class Viewer:
                 # wrapped continuation row (start != 0) stays blank.
                 if start == 0 and number is not None:
                     num = str(number).rjust(gutter_width - 1)
-                    gutter_text = LINE_NUMBER_COLOR + num + " " + LINE_NUMBER_RESET
+                    gutter_text = LINE_NUMBER_COLOR + num + " " + SGR_RESET
                 else:
                     gutter_text = " " * gutter_width
                 out.append(f"\x1b[{screen_row};1H{gutter_text}")
@@ -6347,7 +6321,7 @@ class Viewer:
                         rendered[:h_start]
                         + TEXT_HIGHLIGHT_COLOR
                         + rendered[h_start:h_end]
-                        + TEXT_HIGHLIGHT_RESET
+                        + SGR_RESET
                         + rendered[h_end:]
                     )
 
@@ -6355,7 +6329,7 @@ class Viewer:
                 # This segment reaches the actual end of the raw line -
                 # a real newline, not just where this row's wrapping
                 # happened to cut it - see NEWLINE_MARKER.
-                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
+                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + SGR_RESET
 
             out.append(f"\x1b[{screen_row};{gutter_width + 1}H{rendered}")
 
@@ -6392,7 +6366,7 @@ class Viewer:
         # mid-edit) is what \x1b[2J fills the newly-blanked cells with -
         # resetting only afterwards colors future writes but leaves
         # every cell the clear itself touched stuck in that stale color.
-        out = [STATUS_COLOR_OFF, "\x1b[H\x1b[2J"]
+        out = [SGR_RESET, "\x1b[H\x1b[2J"]
 
         left_col = -1 - self.text_x_offset
         right_col = self.text_max_line_width - self.text_x_offset
@@ -6410,7 +6384,7 @@ class Viewer:
                 )
                 if number is not None:
                     num = str(number).rjust(gutter_width - 1)
-                    gutter_text = LINE_NUMBER_COLOR + num + " " + LINE_NUMBER_RESET
+                    gutter_text = LINE_NUMBER_COLOR + num + " " + SGR_RESET
                 else:
                     # border row, page separator, or off the page
                     gutter_text = " " * gutter_width
@@ -6493,7 +6467,7 @@ class Viewer:
                         rendered[:start]
                         + TEXT_HIGHLIGHT_COLOR
                         + rendered[start:end]
-                        + TEXT_HIGHLIGHT_RESET
+                        + SGR_RESET
                         + rendered[end:]
                     )
 
@@ -6502,7 +6476,7 @@ class Viewer:
                 # newline position - not padded out to the border (see
                 # below), which would misleadingly suggest the line
                 # itself reaches all the way to the page edge.
-                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + NEWLINE_MARKER_RESET
+                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + SGR_RESET
                 shown_width += 1
 
             if right_visible:
@@ -6554,7 +6528,7 @@ class Viewer:
         row0 = max(1, (available_rows - box_h) // 2 + 1)
         col0 = max(1, (self.cols - box_w) // 2 + 1)
 
-        out = [STATUS_COLOR_OFF, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
+        out = [SGR_RESET, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
         for i, line in enumerate(lines):
             out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line.ljust(content_w)} │")
         out.append(f"\x1b[{row0 + box_h - 1};{col0}H└{'─' * (box_w - 2)}┘")
@@ -6666,7 +6640,7 @@ class Viewer:
         # draw_search_prompt(), which doesn't reset it since it's
         # mid-edit) is what a \x1b[2J/ECH fills the newly-blanked cells
         # with - see _draw_text()'s longer version of this comment.
-        out = [STATUS_COLOR_OFF, self._format_viewport_clear(crop_w, crop_h, full_clear)]
+        out = [SGR_RESET, self._format_viewport_clear(crop_w, crop_h, full_clear)]
         # Erase the previous marker before the new image lands; otherwise
         # box-drawing chars linger on iTerm2 inline-image cells (especially
         # when search is cleared or n/p jumps to another match).
@@ -6809,7 +6783,7 @@ class Viewer:
         self._remember_drawn_position()
 
         out = [
-            STATUS_COLOR_OFF,
+            SGR_RESET,
             f"\x1b[1;{avail_rows}r",
             f"\x1b[{shift}S" if shift > 0 else f"\x1b[{strip_rows}T",
             "\x1b[r",  # back to a full-screen scroll region right away -
@@ -6916,7 +6890,7 @@ class Viewer:
             status = pad_to_width(truncate_to_width(f" {text} ", self.cols), self.cols)
             return (
                 f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K"
-                f"{status}{STATUS_COLOR_OFF}"
+                f"{status}{SGR_RESET}"
             )
 
         # Truncate/pad by terminal column width, not Python string length:
@@ -6936,9 +6910,9 @@ class Viewer:
             out.append(f"{color}{chunk}")
             width_used += display_width(chunk)
         if width_used < self.cols:
-            out.append(f"{STATUS_COLOR_OFF}{' ' * (self.cols - width_used)}")
+            out.append(f"{SGR_RESET}{' ' * (self.cols - width_used)}")
 
-        return f"\x1b[{self.rows};1H\x1b[2K{''.join(out)}{STATUS_COLOR_OFF}"
+        return f"\x1b[{self.rows};1H\x1b[2K{''.join(out)}{SGR_RESET}"
 
     def draw_status(self, text=None):
         # \x1b[?25l re-hides the real terminal cursor draw_search_prompt()
@@ -7196,8 +7170,7 @@ class Viewer:
         self.page = max(1, min(self.npages, page))
         self._load_page()  # loads the image and recomputes scroll_max
         self.scroll = self._clamp_image_scroll(scroll)
-        max_x_offset = max(0, self._content_width() - self.crop_width)
-        self.x_offset = max(0, min(max_x_offset, x_offset))
+        self._set_x_offset(x_offset)
 
     def go_to_link_target(self, page, top_pt):
         """Jump to `page`, scrolled so the link's target y-position
@@ -7391,9 +7364,7 @@ class Viewer:
                 target_row = line_idx
             avail_rows = self._text_avail_rows()
             margin = avail_rows // 4
-            self.text_scroll = max(
-                self.text_scroll_min, min(self.text_scroll_max, target_row - margin)
-            )
+            self._set_text_scroll(target_row - margin)
             self.refresh()
             self.draw_status(
                 f'"{self.search_query}" match {idx + 1}/{len(self.search_matches)}'
@@ -7451,7 +7422,7 @@ class Viewer:
     def _format_marker_erase(self, row0, col0, row1, col1):
         """Wipe a previously drawn search-match box without clearing the screen."""
         width = col1 - col0 + 1
-        out = [SEARCH_MARKER_RESET]
+        out = [SGR_RESET]
         for row in range(row0, row1 + 1):
             out.append(f"\x1b[{row + 1};{col0 + 1}H\x1b[{width}X")
         return "".join(out)
@@ -7465,7 +7436,7 @@ class Viewer:
             out.append(f"\x1b[{row + 1};{col1 + 1}H┃")
         if row1 > row0:
             out.append(f"\x1b[{row1 + 1};{col0 + 1}H┗{'━' * (width - 2)}┛")
-        out.append(SEARCH_MARKER_RESET)
+        out.append(SGR_RESET)
         return "".join(out)
 
     def _half_page_step(self):
@@ -7608,7 +7579,7 @@ class Viewer:
         elif key in ("H", "SHIFT-LEFT"):
             self.x_offset = 0
         elif key in ("L", "SHIFT-RIGHT"):
-            self.x_offset = max(0, self._content_width() - self.crop_width)
+            self.x_offset = self._max_x_offset()
         elif key in ("K", "U", "SHIFT-UP", "g"):
             self.scroll = 0
         elif key in ("J", "D", "SHIFT-DOWN", "G"):
