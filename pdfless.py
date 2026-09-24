@@ -28,6 +28,7 @@ import base64
 import bisect
 import concurrent.futures
 import contextlib
+import dataclasses
 import fcntl
 import getpass
 import hashlib
@@ -4598,14 +4599,67 @@ class EncodeCache:
             self._cache.popitem(last=False)
 
 
+@dataclasses.dataclass(frozen=True)
+class ViewerOptions:
+    """How the viewer starts up, as the command line asked for it - built
+    once by main() (from_args()) and handed through run_viewer() to the
+    Viewer as one value, rather than as a dozen-odd keyword arguments
+    repeated at every step. Frozen: the ones that can change at runtime
+    (scrollbar, continuous, follow, ...) are copied onto the Viewer's own
+    attributes, and those are what change - this stays what was asked for
+    at startup (which some toggles, e.g. copy mode's restore, rely on)."""
+
+    fit: "str | None" = "width"  # -h/--fit-height: "height", else "width"
+    border: bool = True  # --no-border
+    wrap: bool = True  # -S/--chop-long-lines, inverted
+    eol_mark: bool = True  # --no-eol-mark
+    line_numbers: bool = False  # -N/--line-numbers
+    scrollbar: bool = True  # --no-scrollbar
+    wheel_scroll_step: int = 2  # --wheel-scroll-step
+    incremental_scroll: bool = True  # --no-incremental-scroll
+    debug: bool = False  # -d/--debug
+    office_render_scale: float = OFFICE_RENDER_SCALE  # -s/--rendering-scale
+    continuous: bool = False  # -c/--continuous
+    follow: bool = False  # -f/--follow
+    quit_if_one_screen: bool = False  # -F/--quit-if-one-screen
+    keep: bool = False  # -k/--keep (run_viewer() only)
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace, nfiles: int) -> "ViewerOptions":
+        """The options main()'s parsed command line asks for, `nfiles`
+        being how many files it's about to show."""
+        return cls(
+            fit="height" if args.fit_height else "width",
+            border=args.border,
+            wrap=not args.chop_long_lines,
+            eol_mark=args.eol_mark,
+            line_numbers=args.line_numbers,
+            scrollbar=args.scrollbar,
+            wheel_scroll_step=args.wheel_scroll_step,
+            incremental_scroll=args.incremental_scroll,
+            debug=args.debug,
+            office_render_scale=args.rendering_scale,
+            continuous=args.continuous,
+            follow=args.follow,
+            # Only meaningful for a single file - dumping the first of
+            # several and quitting would silently drop the rest.
+            quit_if_one_screen=args.quit_if_one_screen and nfiles == 1,
+            keep=args.keep,
+        )
+
+
 class Viewer:
-    def __init__(
-        self, files, file_index, page, tmpdir, fd, fit="width",
-        border=True, wrap=True, eol_mark=True, line_numbers=False,
-        scrollbar=True, wheel_scroll_step=2, incremental_scroll=True,
-        debug=False, office_render_scale=OFFICE_RENDER_SCALE,
-        continuous=False, follow=False, quit_if_one_screen=False,
-    ):
+    def __init__(self, files, file_index, page, tmpdir, fd, fit="width",
+                 options=None, **option_kwargs):
+        """`options` (a ViewerOptions) says how to start up; for
+        convenience - the tests build Viewers this way throughout - the
+        individual options can be given as keyword arguments instead
+        (`fit` positionally, as ever), which make up the ViewerOptions."""
+        if options is None:
+            options = ViewerOptions(fit=fit, **option_kwargs)
+        elif option_kwargs:
+            raise TypeError("pass either options= or individual option keywords, not both")
+        self.options = options
         self.files = files  # [DocumentHandler | path str, ...] - one per
         # CLI argument. main() only actually sniffs the one file it's
         # about to display first (a DocumentHandler there already,
@@ -4621,13 +4675,13 @@ class Viewer:
         # entry above is actually visited - None means that one turned
         # out not to be a usable file at all.
         self.tmpdir = tmpdir
-        self.follow = follow  # -f/--follow, or toggled at runtime with F
+        self.follow = options.follow  # -f/--follow, or toggled at runtime with F
         # (see toggle_follow()) - poll_follow() reloads the file whenever
         # its mtime changes while this is on
         self._follow_path = None  # the file poll_follow() is watching...
         self._follow_mtime = None  # ...its mtime when last looked at...
         self._follow_checked = 0.0  # ...and when that was (monotonic)
-        self.quit_if_one_screen = quit_if_one_screen  # -F/--quit-if-one-
+        self.quit_if_one_screen = options.quit_if_one_screen  # -F/--quit-if-one-
         # screen - set before _set_current_file() below so _ViewerProgress
         # can already see it: whether this first file ends up dumped-and-
         # quit or interactive isn't known until after that render
@@ -4647,21 +4701,21 @@ class Viewer:
         # exactly fill the terminal would make that \r\n force a one-line
         # scroll, pushing the dump's own top row out of view the instant
         # it's written
-        self.debug = debug  # -d/--debug: print office-preview stage timing
-        self.office_render_scale = office_render_scale  # --rendering-scale
-        self.continuous = continuous  # -c/--continuous, or toggled at
+        self.debug = options.debug  # -d/--debug: print office-preview stage timing
+        self.office_render_scale = options.office_render_scale  # --rendering-scale
+        self.continuous = options.continuous  # -c/--continuous, or toggled at
         # runtime with c: stack consecutive pages one after another
         # (image mode), or the whole document's text with a separator
         # row between pages (a paginated text mode), instead of showing
         # one page at a time - see _normalize_continuous() and
         # _text_continuous()
         self.fd = fd
-        self.fit = fit
-        self.eol_mark = eol_mark  # --no-eol-mark: mark a real end-of-line
+        self.fit = options.fit
+        self.eol_mark = options.eol_mark  # --no-eol-mark: mark a real end-of-line
         # (NEWLINE_MARKER) in text mode - independent of text_wrap/-S, on
         # by default either way (see _draw_text_wrapped()/_unwrapped())
-        self.wheel_scroll_step = wheel_scroll_step
-        self.incremental_scroll = incremental_scroll  # --no-incremental-
+        self.wheel_scroll_step = options.wheel_scroll_step
+        self.incremental_scroll = options.incremental_scroll  # --no-incremental-
         # scroll: force every redraw through _draw()'s full-viewport
         # path, skipping the _scroll_shift_rows()/_draw_shifted()
         # shortcut - an escape hatch for a terminal where that shortcut
@@ -4738,14 +4792,10 @@ class Viewer:
         self.text_x_offset_min = 0
         self.text_x_offset_max = 0
         self.text_max_line_width = 0
-        self.border_default = border  # --no-border, as given on the command line
         self.text_border = self._default_text_border()  # border around the
         # page's edges, in text mode; can be swept up along with the text
         # if you select-and-copy it, so it's toggled off with --no-border
         # (or on/off any time with the B key) - see _default_text_border()
-        self.wrap_default = wrap  # -S/--chop-long-lines, as given on the
-        # command line (inverted - this is "should it wrap", not "should
-        # it chop")
         self.text_wrap = self._default_text_wrap()  # soft-wrap long lines
         # instead of panning across them (h/l/H/L) - see
         # _default_text_wrap(); no border while wrapped (see
@@ -4753,7 +4803,7 @@ class Viewer:
         self._display_rows = None  # lazily built by _ensure_display_rows(),
         # only while text_wrap is on - [(line_idx, start, end), ...], one
         # entry per on-screen row
-        self.line_numbers = line_numbers  # -N/--line-numbers: right-
+        self.line_numbers = options.line_numbers  # -N/--line-numbers: right-
         # aligned gutter at the start of each row - see
         # _line_number_gutter_width(); no per-kind default (unlike
         # border/wrap/eol_mark) since there's no kind numbering wouldn't
@@ -4764,7 +4814,7 @@ class Viewer:
         # and the button hasn't come back up yet - see handle_drag()
         self._scrollbar_drag_row = None  # its latest position, not acted
         # on until flush_scrollbar_drag()
-        self.scrollbar = scrollbar  # --no-scrollbar: a column on the
+        self.scrollbar = options.scrollbar  # --no-scrollbar: a column on the
         # terminal's right edge showing scroll position - in both image
         # mode (_draw()) and text mode (_draw_text_wrapped()/
         # _draw_text_unwrapped()); "r" toggles it either way (see
@@ -5624,7 +5674,7 @@ class Viewer:
         --no-border, since there's usually no real "page" boundary in
         one worth bordering; otherwise whatever --no-border asked for).
         The B key can still toggle either way, on top of this default."""
-        return self.doc_handler.default_text_border(self.border_default)
+        return self.doc_handler.default_text_border(self.options.border)
 
     def toggle_text_wrap(self):
         """Switches between soft-wrapping long lines and panning across
@@ -5837,7 +5887,7 @@ class Viewer:
         otherwise; off for a PDF/Office's own derived text view, which
         pans instead, regardless of -S). The -S key sequence can still
         toggle either way, on top of this default."""
-        return self.doc_handler.default_text_wrap(self.wrap_default)
+        return self.doc_handler.default_text_wrap(self.options.wrap)
 
     def _set_text_scroll(self, row: int) -> None:
         """Scroll text mode to `row`, clamped to the current
@@ -7927,11 +7977,8 @@ def _suspend(fd: int, old_termios, keep: bool, viewer: Viewer) -> None:
 
 
 def run_viewer(
-    files, start_file_index, start_page, tmpdir, fd, old_termios, fit="width",
-    border=True, wrap=True, eol_mark=True, line_numbers=False, scrollbar=True,
-    follow=False, wheel_scroll_step=2, keep=False, incremental_scroll=True,
-    debug=False, office_render_scale=OFFICE_RENDER_SCALE,
-    continuous=False, quit_if_one_screen=False, viewer_out=None,
+    files, start_file_index, start_page, tmpdir, fd, old_termios,
+    options=ViewerOptions(), viewer_out=None,
 ):
     """Run the interactive viewer loop. Returns the Viewer instance so the
     caller can inspect its final geometry (e.g. to tidy up the screen).
@@ -7944,15 +7991,8 @@ def run_viewer(
     interactive loop below (a page render, a keypress handler, ...)
     would leave the terminal in whatever raw/alternate-screen/mouse-
     reporting state it was in when the exception hit - see main()."""
-    viewer = Viewer(
-        files, start_file_index, start_page, tmpdir, fd, fit=fit,
-        border=border, wrap=wrap, eol_mark=eol_mark, line_numbers=line_numbers,
-        scrollbar=scrollbar, wheel_scroll_step=wheel_scroll_step,
-        incremental_scroll=incremental_scroll,
-        debug=debug,
-        office_render_scale=office_render_scale, continuous=continuous,
-        follow=follow, quit_if_one_screen=quit_if_one_screen,
-    )
+    viewer = Viewer(files, start_file_index, start_page, tmpdir, fd, options=options)
+    keep = options.keep
     if viewer_out is not None:
         viewer_out.append(viewer)
 
@@ -7983,7 +8023,7 @@ def run_viewer(
             # only, no content) until something else happened to reload it.
             viewer._load_text_page()
 
-    if quit_if_one_screen:
+    if options.quit_if_one_screen:
         # -F/--quit-if-one-screen: real less(1)'s own -F. Only affects
         # whether/how this first file starts up - never entering the
         # alternate screen at all here is what leaves the dump in the
@@ -8483,20 +8523,9 @@ def main():
             keep = args.keep
             viewer_out = []
             try:
-                fit = "height" if args.fit_height else "width"
                 viewer = run_viewer(
                     files, start_file_index, start_page, tmpdir, fd, rt.old,
-                    fit=fit, border=args.border, wrap=not args.chop_long_lines,
-                    eol_mark=args.eol_mark, line_numbers=args.line_numbers,
-                    scrollbar=args.scrollbar, follow=args.follow,
-                    wheel_scroll_step=args.wheel_scroll_step, keep=args.keep,
-                    incremental_scroll=args.incremental_scroll,
-                    debug=args.debug,
-                    office_render_scale=args.rendering_scale,
-                    continuous=args.continuous,
-                    # Only meaningful for a single file - dumping the first
-                    # of several and quitting would silently drop the rest.
-                    quit_if_one_screen=args.quit_if_one_screen and len(files) == 1,
+                    options=ViewerOptions.from_args(args, len(files)),
                     viewer_out=viewer_out,
                 )
             except BaseException:
