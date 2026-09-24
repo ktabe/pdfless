@@ -9,14 +9,18 @@ View documents directly in your terminal, locally or over SSH.
 It has been tested with [iTerm2](https://iterm2.com) and
 [WezTerm](https://wezterm.org).
 
+---
+
+## Major Features
+
+- Display PDF, image (PNG/JPEG/GIF...), and plain text files on a terminal.
+- Office documents, SVG, and Markdown are also supported with additional dependencies.
 - Scroll, zoom, and pan with the keyboard or mouse.
 - Search PDF text and follow external and internal PDF links.
-- Support password-protected PDFs.
 - Switch to text mode to read or copy extracted text.
+- Show a clickable and draggable scrollbar.
 - Open multiple files and switch between them.
 - Reload the current file automatically when it changes (in follow mode).
-- Open plain text files and, with additional dependencies, Office documents,
-  SVG, and Markdown.
 
 ## Screenshots
 
@@ -96,24 +100,6 @@ and `q` to quit. `F1` or `:h` opens the keyboard help.
 
 With multiple files open, use `:n` / `:p` (or `}` / `{`) to switch files.
 With no filename, or with `-` as the filename, `pdfless` reads standard input.
-
-### Search and text selection
-
-Search is case-insensitive and supports
-[Python regular expressions](https://docs.python.org/3/library/re.html).
-An invalid regular expression is treated as literal text. Matches are boxed
-in PDF image mode and highlighted in text mode.
-
-While a search is active, `n` / `p` move between matches rather than pages.
-Search requires text: it is available for PDFs with extractable text, plain
-text files, and supported formats rendered to PDF. It is unavailable for
-plain images and previews without extractable text.
-
-To copy text from image mode, press `T` to switch to text mode with borders,
-line numbers, end-of-line markers, and the scrollbar hidden. You can also
-press `t`, then `C`. If you are already in text mode, use `C` to toggle these
-display elements. Select text using the terminal's normal selection controls;
-press `C` again to restore the previous display settings.
 
 ### Options
 
@@ -197,6 +183,16 @@ edit the input. These bindings apply only while the search prompt is active.
 | `^D`, `Delete` | Delete the character to the right of the cursor. |
 | `^H`, `Backspace` | Delete the character to the left of the cursor. |
 
+Search is case-insensitive and supports
+[Python regular expressions](https://docs.python.org/3/library/re.html).
+An invalid regular expression is treated as literal text. Matches are boxed
+in PDF image mode and highlighted in text mode.
+
+Search requires text: it is available for PDFs with extractable text, plain
+text files, and supported formats rendered to PDF. It is unavailable for
+plain images and previews without extractable text. While a search is active,
+`n` / `p` move between matches rather than pages.
+
 ### Display and interaction
 
 | Keys or gesture | Action |
@@ -220,7 +216,17 @@ edit the input. These bindings apply only while the search prompt is active.
 | `F1`, `:h` | Show keyboard help; press `q` to close it. |
 | `q`, `:q`, `^C` | Quit. |
 
+#### Copying text
+
+To copy text from image mode, press `T` to switch to text mode with borders,
+line numbers, end-of-line markers, and the scrollbar hidden. You can also
+press `t`, then `C`. If you are already in text mode, use `C` to toggle these
+display elements. Select text using the terminal's normal selection controls;
+press `C` again to restore the previous display settings.
+
 ## Additional formats (experimental)
+
+### Image formats
 
 PNG, JPEG, and other image formats supported by
 [Pillow](https://python-pillow.org) open directly. Press `t` or `T` to view
@@ -232,10 +238,12 @@ metadata includes decimal latitude and longitude and a coordinate pair you
 can paste into Google Maps. Embedded text may include screenshot-tool tags
 or AI image-generation prompts.
 
+### Office documents and other formats
+
 The formats below require additional software. PDF-based rendering also
 requires Poppler.
 
-### Optional dependencies
+#### Optional dependencies
 
 - **LibreOffice** enables OpenDocument, Visio, and WMF support. When installed,
   it is also preferred for Word, RTF, and PowerPoint rendering.
@@ -258,7 +266,7 @@ sudo apt install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0
 
 Install Chrome or Chromium separately if you need Quick Look or SVG rendering.
 
-### Format support and limitations
+#### Format support and limitations
 
 Preview quality and pagination depend on the format and available renderer.
 
