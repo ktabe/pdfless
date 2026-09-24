@@ -733,6 +733,17 @@ def _pdf_render_result(out_pdf: str, ok: bool = True) -> "tuple | None":
     return ("pdf", out_pdf, npages)
 
 
+# Bumped whenever a change to how pdfless renders a document would make
+# an already-cached rendering of it wrong (see _cached_render_dir()) -
+# the cache only checks the source file's own mtime for staleness, so
+# without this an entry made before such a fix would keep being served
+# until the file itself changed. Entries under an old version are simply
+# never looked up again, and age out via OFFICE_CACHE_MAX_ENTRIES.
+# 2: a multi-sheet Numbers workbook renders one page per sheet, with its
+#    embedded sheet images converted (it used to be one page showing a
+#    broken-image icon).
+RENDER_CACHE_VERSION = 2
+
 OFFICE_CACHE_MAX_ENTRIES = 50  # persistent rendered-pages cache (see
 # _office_cache_dir()) - entries beyond this many, least-recently-used
 # first (by atime - see _render_result_cached()), are pruned each time
@@ -807,8 +818,12 @@ def _cached_render_dir(path, key_suffix=""):
     screenshot-sliced result bakes in a fixed pixel resolution, unlike
     a real-PDF one, always re-rasterized on demand at whatever the
     current zoom needs) - caching one under a key the other could also
-    match would silently serve the wrong rendering."""
-    key = hashlib.sha256((os.path.abspath(path) + key_suffix).encode()).hexdigest()
+    match would silently serve the wrong rendering. RENDER_CACHE_VERSION
+    is part of the key too, so a rendering fix can retire every entry
+    made before it."""
+    key = hashlib.sha256(
+        f"{os.path.abspath(path)}{key_suffix}:v{RENDER_CACHE_VERSION}".encode()
+    ).hexdigest()
     return os.path.join(_office_cache_dir(), key)
 
 
@@ -1674,6 +1689,15 @@ class ExcelWorkbook(OfficeVariant):
         r'<a\s+href="([^"]+)">',
         re.IGNORECASE | re.DOTALL,
     )
+    # iWork.qlgenerator's own tab strip for a Numbers spreadsheet - a
+    # different shape for the same thing: one <div class="navpane-sheet
+    # ..."> per sheet, whose onclick="...SelectSheet(N, 'AttachmentN.html')"
+    # names that sheet's HTML and whose title="..." is its name.
+    _NAVPANE_SHEET_RE = re.compile(
+        r"<div\s+onclick=\"javascript:SelectSheet\(\d+,\s*'([^']+)'\);\"[^>]*?"
+        r'\stitle="([^"]*)"[^>]*\sclass="navpane-sheet[^"]*"',
+        re.IGNORECASE | re.DOTALL,
+    )
     _TAG_RE = re.compile(r'<[^>]+>')
 
     def __init__(self, chrome, html_path, width, height, tag, name):
@@ -1684,24 +1708,28 @@ class ExcelWorkbook(OfficeVariant):
         """For a multi-sheet Excel-like Quick Look preview, return an
         ordered [(sheet_name, absolute_html_path), ...] - one per sheet
         - by reading the tab strip out of `html_path`'s own content
-        (see _TAB_VIEW_ITEM_RE). A single-sheet workbook's Preview.html
-        *is* the sheet itself (no tab strip, no <iframe>) and this
-        returns []."""
+        (see _TAB_VIEW_ITEM_RE, or _NAVPANE_SHEET_RE for Numbers). A
+        single-sheet workbook's Preview.html *is* the sheet itself (no
+        tab strip, no <iframe>) and this returns []."""
         try:
             with open(html_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
         except OSError:
             return []
         base_dir = os.path.dirname(html_path)
+        # (raw sheet-name markup, href) per tab, in order - from Office's
+        # tab strip, or failing that Numbers' own.
+        found = [(m.group(1), m.group(2)) for m in self._TAB_VIEW_ITEM_RE.finditer(content)]
+        if not found:
+            found = [(m.group(2), m.group(1)) for m in self._NAVPANE_SHEET_RE.finditer(content)]
         tabs = []
-        for m in self._TAB_VIEW_ITEM_RE.finditer(content):
-            href = m.group(2)
+        for raw_name, href in found:
             if _ABSOLUTE_SRC_RE.match(href):
                 continue  # http(s)/data/... - not a local sibling file
             candidate = os.path.join(base_dir, href)
             if not os.path.isfile(candidate):
                 continue
-            name = html.unescape(self._TAG_RE.sub("", m.group(1))).strip()
+            name = html.unescape(self._TAG_RE.sub("", raw_name)).strip()
             tabs.append((name or f"Sheet {len(tabs) + 1}", candidate))
         return tabs
 
@@ -1751,11 +1779,16 @@ class ExcelWorkbook(OfficeVariant):
 
     def _build_single_sheet(self, tmpdir, debug, render_scale, progress):
         out_png = os.path.join(tmpdir, f"office-capture-{self.tag}.png")
+        # The same embedded-image fix every sheet of a multi-sheet
+        # workbook gets - see _build_multi_sheet(). A no-op (the path
+        # comes back unchanged) when nothing needs converting.
+        with _DebugTimer(debug, f"{self.name}: converting embedded images"):
+            html_path = _rasterize_broken_img_sources(self.html_path, tmpdir)
         label = f"{self.name}: rendering ({self.width * render_scale:.0f}x{self.height * render_scale:.0f})"
         try:
             with _DebugTimer(debug, label), progress.spin(label + "..."):
                 _capture_html_screenshot(
-                    self.chrome, self.html_path, self.width, self.height, out_png, render_scale
+                    self.chrome, html_path, self.width, self.height, out_png, render_scale
                 )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return None

@@ -16,6 +16,7 @@ import termios
 import tempfile
 
 import pdfless
+from PIL import Image
 from conftest import requires_office_support, requires_soffice
 
 
@@ -49,18 +50,31 @@ def test_xls_legacy_multisheet_renders_one_page_per_sheet(sample_multisheet_xls,
 
 
 @requires_office_support
-def test_numbers_multisheet_only_renders_first_sheet(sample_multisheet_numbers, tmp_path):
-    """Known gap (not a regression to fix here): Numbers' own Quick
-    Look generator (iWork.qlgenerator) marks up its multi-sheet tab
-    strip differently from Excel's (Office.qlgenerator) -
-    ExcelWorkbook._parse_sheet_tabs()'s TabViewItem-based regex
-    doesn't recognize it, so a multi-sheet .numbers workbook (unlike
-    the equivalent .xlsx/.xls) renders only its first sheet as a
-    single page rather than one page per sheet."""
+def test_numbers_multisheet_renders_one_page_per_sheet(sample_multisheet_numbers, tmp_path):
+    """Numbers' own Quick Look generator (iWork.qlgenerator) marks up
+    its multi-sheet tab strip differently from Excel's (see
+    ExcelWorkbook._NAVPANE_SHEET_RE), but it's still one page per
+    sheet, the same as the equivalent .xlsx/.xls."""
     handler = classify(sample_multisheet_numbers, tmp_path)
     assert isinstance(handler, pdfless.OfficeDocument)
     pages = handler.build_pages(str(tmp_path))
-    assert len(pages) == 1
+    assert len(pages) == 3
+
+
+@requires_office_support
+def test_numbers_sheets_have_no_broken_image(sample_multisheet_numbers, tmp_path):
+    """Each Numbers sheet embeds its content as <img src="AttachmentN.pdf">,
+    which Chrome can't display - it has to be converted first (see
+    _rasterize_broken_img_sources()), or all that's left is Chrome's
+    broken-image icon on an otherwise blank sheet. The sheet's own cell
+    grid is drawn in gray, so a converted sheet has plenty of non-white
+    pixels; a broken one has almost none."""
+    handler = classify(sample_multisheet_numbers, tmp_path)
+    pages = handler.build_pages(str(tmp_path))
+    for page in pages:
+        img = Image.open(page).convert("L")
+        dark = sum(img.histogram()[:200])  # pixels darker than 200/255
+        assert dark > img.width * img.height // 100
 
 
 @requires_office_support
