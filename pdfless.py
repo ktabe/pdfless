@@ -96,6 +96,7 @@ SEARCH_MARKER_COLOR = "\x1b[93m"  # bright yellow
 # just a soft-wrap continuation of the same line.
 NEWLINE_MARKER = "↵"
 NEWLINE_MARKER_COLOR = "\x1b[34m"  # blue
+EOL_MARK = NEWLINE_MARKER_COLOR + NEWLINE_MARKER + SGR_RESET  # ready to append
 
 # -N/--line-numbers: a right-aligned gutter at the start of each text-mode
 # row (see Viewer._line_number_gutter_width()).
@@ -5287,10 +5288,9 @@ class Viewer:
             rows = []
             for i, line in enumerate(self.text_lines):
                 if gutter_width:
-                    num = str(i + 1).rjust(gutter_width - 1)
-                    line = LINE_NUMBER_COLOR + num + " " + SGR_RESET + line
+                    line = self._gutter_text(i + 1, gutter_width) + line
                 if self.eol_mark:
-                    line += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + SGR_RESET
+                    line += EOL_MARK
                 rows.append(line)
             # \r\n, not just \n: the terminal is in raw mode (tty.setraw()
             # - see RawTerminal) for the whole run regardless of which
@@ -5996,13 +5996,47 @@ class Viewer:
         # Fall back to a proportional-position guess, for the rare case
         # where the two extractions disagree on how many times the query
         # appears on this page.
+        approx_line = self._approx_text_line(match)
+        return min(all_matches, key=lambda c: abs(c[0] - approx_line))
+
+    def _approx_text_line(self, match: tuple) -> int:
+        """A guess at the raw text_lines index a (page, xMin, yMin, xMax,
+        yMax) bbox match falls on - its vertical position on the page,
+        as the same fraction of that page's own lines - for when the
+        text extraction can't pin it down exactly (see
+        _text_highlight_for_match())."""
         page, _xmin_pt, ymin_pt, _xmax_pt, _ymax_pt = match
-        page_info = self._search_index[page - 1]
-        height_pt = page_info["height_pt"]
-        approx_line = page_start + (
+        height_pt = self._search_index[page - 1]["height_pt"]
+        page_start, page_end = self._text_page_range(page)
+        return page_start + (
             round((ymin_pt / height_pt) * (page_end - page_start)) if height_pt else 0
         )
-        return min(all_matches, key=lambda c: abs(c[0] - approx_line))
+
+    def _scroll_text_to_row(self, row: int) -> None:
+        """Scroll text mode so `row` lands a quarter of the screen down
+        rather than jammed against the top edge - where a search match
+        is put, so there's context above it."""
+        self._set_text_scroll(row - self._text_avail_rows() // 4)
+
+    def _scroll_text_to_highlight(self, line_idx: int, start: int, end: int) -> None:
+        """Bring characters start..end of raw line `line_idx` into view:
+        pan them to the middle if they're off to either side of an
+        unwrapped view (wrapped text has no pan to speak of), then scroll
+        their row into place (_scroll_text_to_row())."""
+        if not self.text_wrap:
+            avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
+            line = self.text_lines[line_idx]
+            col_start = display_width(line[:start])
+            col_end = display_width(line[:end])
+            if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
+                self.text_x_offset = max(
+                    self.text_x_offset_min,
+                    min(
+                        self.text_x_offset_max,
+                        round((col_start + col_end) / 2 - avail_cols / 2),
+                    ),
+                )
+        self._scroll_text_to_row(self._text_row_for_line(line_idx))
 
     def _scroll_image_to_match(self, match):
         """Scroll/pan the image view so `match` is visible, landing it a
@@ -6021,36 +6055,11 @@ class Viewer:
         view (the text-mode equivalent of _scroll_image_to_match()).
         Wrapped text has no pan to speak of - _row_for_line() converts
         the raw line position into a display-row scroll target instead."""
-        avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
         highlight = self._text_highlight_for_match(match)
         if highlight:
-            line_idx, start, end = highlight
-            if self.text_wrap:
-                target_row = self._row_for_line(line_idx)
-            else:
-                line = self.text_lines[line_idx]
-                col_start = display_width(line[:start])
-                col_end = display_width(line[:end])
-                if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
-                    self.text_x_offset = max(
-                        self.text_x_offset_min,
-                        min(
-                            self.text_x_offset_max,
-                            round((col_start + col_end) / 2 - avail_cols / 2),
-                        ),
-                    )
-                target_row = line_idx
+            self._scroll_text_to_highlight(*highlight)
         else:
-            page, _xmin_pt, ymin_pt, _xmax_pt, _ymax_pt = match
-            height_pt = self._search_index[page - 1]["height_pt"]
-            page_start, page_end = self._text_page_range(page)
-            line_idx = page_start + (
-                round((ymin_pt / height_pt) * (page_end - page_start)) if height_pt else 0
-            )
-            target_row = self._text_row_for_line(line_idx)
-        avail_rows = self._text_avail_rows()
-        margin = avail_rows // 4
-        self._set_text_scroll(target_row - margin)
+            self._scroll_text_to_row(self._text_row_for_line(self._approx_text_line(match)))
 
     def go_to_page_text(self, page, scroll):
         """Show `page` in text mode: scroll=0 is its top, None its
@@ -6208,6 +6217,51 @@ class Viewer:
                 rows.append((i, start, end))
         self._display_rows = rows
 
+    @staticmethod
+    def _gutter_text(number: "int | None", gutter_width: int) -> str:
+        """The -N gutter cell for a row: `number` right-aligned in gray,
+        or just blanks for a row that gets none (a wrapped continuation,
+        a border row, a page separator, ...)."""
+        if number is None:
+            return " " * gutter_width
+        return LINE_NUMBER_COLOR + str(number).rjust(gutter_width - 1) + " " + SGR_RESET
+
+    @staticmethod
+    def _splice_highlight(rendered: str, start: int, end: int) -> str:
+        """`rendered` with characters start..end (clipped to it) wrapped
+        in TEXT_HIGHLIGHT_COLOR - the search match's highlight. The
+        offsets are relative to `rendered` itself, so either caller
+        shifts them from the raw line first (by where its wrapped
+        segment or pan window starts)."""
+        start, end = max(start, 0), min(end, len(rendered))
+        if start >= len(rendered) or end <= start:
+            return rendered
+        return rendered[:start] + TEXT_HIGHLIGHT_COLOR + rendered[start:end] + SGR_RESET + rendered[end:]
+
+    def _scrollbar_escapes(self, avail_rows: int, start_frac: float, visible_frac: float) -> "list[str]":
+        """The scrollbar column's cells as positioned escape strings -
+        [] while it's off - for either mode's draw."""
+        if not self.scrollbar:
+            return []
+        cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
+        return [f"\x1b[{i + 1};{self.cols}H{cell}" for i, cell in enumerate(cells)]
+
+    def _finish_text_frame(self, rows: "list[str]", avail_rows: int) -> None:
+        """Write one text-mode frame: clear the screen, then `rows` (the
+        positioned row escapes _draw_text_wrapped()/_unwrapped() built),
+        the scrollbar and the status line. Attributes are reset *before*
+        clearing, not after: a still-active SGR state (e.g. a background
+        color left on by draw_search_prompt(), which doesn't reset it
+        since it's mid-edit) is what \x1b[2J fills the newly-blanked
+        cells with - resetting only afterwards colors future writes but
+        leaves every cell the clear itself touched stuck in that stale
+        color."""
+        out = [SGR_RESET, "\x1b[H\x1b[2J", *rows]
+        out += self._scrollbar_escapes(avail_rows, *self._text_scrollbar_fractions(avail_rows))
+        out.append(self.format_status())
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
     def _draw_text(self):
         self._sync_text_page()
         if self.text_wrap:
@@ -6228,7 +6282,7 @@ class Viewer:
         avail_rows = self._text_avail_rows()
         highlight = self._text_search_highlight()
 
-        out = [SGR_RESET, "\x1b[H\x1b[2J"]
+        out = []
         n_rows = len(self._display_rows)
         gutter_width = self._line_number_gutter_width()
 
@@ -6245,11 +6299,7 @@ class Viewer:
             if gutter_width:
                 # Only the line's first display row gets a number - a
                 # wrapped continuation row (start != 0) stays blank.
-                if start == 0 and number is not None:
-                    num = str(number).rjust(gutter_width - 1)
-                    gutter_text = LINE_NUMBER_COLOR + num + " " + SGR_RESET
-                else:
-                    gutter_text = " " * gutter_width
+                gutter_text = self._gutter_text(number if start == 0 else None, gutter_width)
                 out.append(f"\x1b[{screen_row};1H{gutter_text}")
 
             if line_idx in self._text_separator_lines:
@@ -6262,36 +6312,19 @@ class Viewer:
 
             if highlight and highlight[0] == line_idx:
                 # start/end are character offsets into the raw line;
-                # clip them to this segment, then shift into the
-                # segment's own (rendered-relative) coordinates.
+                # shift them into this segment's own coordinates.
                 _, h_start, h_end = highlight
-                h_start, h_end = max(h_start, start) - start, min(h_end, end) - start
-                if h_start < len(rendered) and h_end > h_start:
-                    rendered = (
-                        rendered[:h_start]
-                        + TEXT_HIGHLIGHT_COLOR
-                        + rendered[h_start:h_end]
-                        + SGR_RESET
-                        + rendered[h_end:]
-                    )
+                rendered = self._splice_highlight(rendered, h_start - start, h_end - start)
 
             if self.eol_mark and end == len(self.text_lines[line_idx]):
                 # This segment reaches the actual end of the raw line -
                 # a real newline, not just where this row's wrapping
                 # happened to cut it - see NEWLINE_MARKER.
-                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + SGR_RESET
+                rendered += EOL_MARK
 
             out.append(f"\x1b[{screen_row};{gutter_width + 1}H{rendered}")
 
-        if self.scrollbar:
-            start_frac, visible_frac = self._text_scrollbar_fractions(avail_rows)
-            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
-            for i, cell in enumerate(cells):
-                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
-
-        out.append(self.format_status())
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        self._finish_text_frame(out, avail_rows)
 
     def _draw_text_unwrapped(self):
         # The border sits at the page's own edges in this same scrollable/
@@ -6310,13 +6343,7 @@ class Viewer:
         gutter_width = self._line_number_gutter_width()
         avail_cols = max(1, self._text_avail_cols() - gutter_width)
         highlight = self._text_search_highlight()
-        # Reset text attributes *before* clearing, not after: a
-        # still-active SGR state (e.g. a background color left on by
-        # draw_search_prompt(), which doesn't reset it since it's
-        # mid-edit) is what \x1b[2J fills the newly-blanked cells with -
-        # resetting only afterwards colors future writes but leaves
-        # every cell the clear itself touched stuck in that stale color.
-        out = [SGR_RESET, "\x1b[H\x1b[2J"]
+        out = []
 
         left_col = -1 - self.text_x_offset
         right_col = self.text_max_line_width - self.text_x_offset
@@ -6328,17 +6355,12 @@ class Viewer:
             screen_row = i + 1
 
             if gutter_width:
+                # None (blank) for a border row, page separator, or off the page
                 number = (
                     self._text_line_number(virtual_row)
                     if 0 <= virtual_row < len(self.text_lines) else None
                 )
-                if number is not None:
-                    num = str(number).rjust(gutter_width - 1)
-                    gutter_text = LINE_NUMBER_COLOR + num + " " + SGR_RESET
-                else:
-                    # border row, page separator, or off the page
-                    gutter_text = " " * gutter_width
-                out.append(f"\x1b[{screen_row};1H{gutter_text}")
+                out.append(f"\x1b[{screen_row};1H{self._gutter_text(number, gutter_width)}")
 
             if virtual_row in self._text_separator_lines:
                 # The continuous text view's heading row for a page: a
@@ -6410,23 +6432,14 @@ class Viewer:
                 # rendered's own coordinates before slicing it up to
                 # splice in color codes.
                 _, start, end = highlight
-                start, end = start - base, end - base
-                start, end = max(start, 0), min(end, len(rendered))
-                if start < len(rendered) and end > start:
-                    rendered = (
-                        rendered[:start]
-                        + TEXT_HIGHLIGHT_COLOR
-                        + rendered[start:end]
-                        + SGR_RESET
-                        + rendered[end:]
-                    )
+                rendered = self._splice_highlight(rendered, start - base, end - base)
 
             if show_marker:
                 # Right after the real content - i.e. at the actual
                 # newline position - not padded out to the border (see
                 # below), which would misleadingly suggest the line
                 # itself reaches all the way to the page edge.
-                rendered += NEWLINE_MARKER_COLOR + NEWLINE_MARKER + SGR_RESET
+                rendered += EOL_MARK
                 shown_width += 1
 
             if right_visible:
@@ -6445,15 +6458,7 @@ class Viewer:
             start_col = (left_col if left_visible else content_start) + 1 + gutter_width
             out.append(f"\x1b[{screen_row};{start_col}H{''.join(parts)}")
 
-        if self.scrollbar:
-            start_frac, visible_frac = self._text_scrollbar_fractions(avail_rows)
-            cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
-            for i, cell in enumerate(cells):
-                out.append(f"\x1b[{i + 1};{self.cols}H{cell}")
-
-        out.append(self.format_status())
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        self._finish_text_frame(out, avail_rows)
 
     def _draw_help(self):
         # Overlay the help as a boxed panel centered over the page, instead
@@ -6761,12 +6766,10 @@ class Viewer:
         # this page's own (self.scroll, avail_height_px, img.height)
         # fraction into a whole-document position - see
         # _scrollbar_fractions() - rather than just this page's own.
-        avail_rows = max(1, self.rows - 1)
         start_frac, visible_frac = self._scrollbar_fractions(
             self.scroll, self.avail_height_px, self.img.height, self.page, self.npages
         )
-        cells = self._scrollbar_column(avail_rows, start_frac, visible_frac)
-        return [f"\x1b[{i + 1};{self.cols}H{cell}" for i, cell in enumerate(cells)]
+        return self._scrollbar_escapes(max(1, self.rows - 1), start_frac, visible_frac)
 
     def status_segments(self):
         """The default status line, as (text, color) fields in order."""
@@ -7292,29 +7295,7 @@ class Viewer:
         self.search_pos = idx
 
         if self._search_uses_text_lines():
-            line_idx, start, end = self.search_matches[idx]
-            if self.text_wrap:
-                # No pan to speak of while wrapped - _row_for_line()
-                # converts the raw line position into a display-row
-                # scroll target instead (same as _scroll_text_to_match()).
-                target_row = self._row_for_line(line_idx)
-            else:
-                avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
-                line = self.text_lines[line_idx]
-                col_start = display_width(line[:start])
-                col_end = display_width(line[:end])
-                if col_start < self.text_x_offset or col_end > self.text_x_offset + avail_cols:
-                    self.text_x_offset = max(
-                        self.text_x_offset_min,
-                        min(
-                            self.text_x_offset_max,
-                            round((col_start + col_end) / 2 - avail_cols / 2),
-                        ),
-                    )
-                target_row = line_idx
-            avail_rows = self._text_avail_rows()
-            margin = avail_rows // 4
-            self._set_text_scroll(target_row - margin)
+            self._scroll_text_to_highlight(*self.search_matches[idx])
             self.refresh()
             self.draw_status(
                 f'"{self.search_query}" match {idx + 1}/{len(self.search_matches)}'
