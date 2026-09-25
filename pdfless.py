@@ -73,6 +73,8 @@ RenderResult = Union[Tuple[str, str, int], List[str]]
 TextMatch = Tuple[int, int, int]
 BBoxMatch = Tuple[int, float, float, float, float]
 SearchMatch = Union[TextMatch, BBoxMatch]  # Viewer.search_matches holds one kind
+# A page image as PageCache.get() is asked for it: (page, target_px, fit).
+PageRequest = Tuple[int, int, str]
 
 # A many-page/many-slide office document's full-height capture (see
 # OfficeDocument._render_office_pages()) routinely exceeds Pillow's default "decompression
@@ -2379,7 +2381,7 @@ class DocumentHandler:
             # (reload()'s caller in run_viewer) don't need to know
             # anything PIL-specific to catch it.
             raise RuntimeError(f"cannot load {source}: {e}") from e
-        cache._native_images[page] = img
+        cache._store_native(page, img)
         return img
 
     def _source_for_page(self, cache: PageCache, page: int) -> str:
@@ -4761,7 +4763,13 @@ class PageCache:
     own rendered page list, self.pages), which reaches back into this
     cache's own bookkeeping (_cached()/_store(), and tmpdir) since that
     bookkeeping - LRU eviction, the "loaded once natively" table - is
-    shared machinery rather than any one kind's own concern."""
+    shared machinery rather than any one kind's own concern.
+
+    Safe to use from two threads at once - the main thread drawing, and
+    Viewer's background render of a neighboring page (see
+    Viewer._schedule_page_prefetch()): the same request (page, target_px,
+    fit) is only ever rendered once at a time, a second asker waiting
+    for the first instead (see get())."""
 
     def __init__(self, tmpdir: str, handler: DocumentHandler, size: int = CACHE_SIZE) -> None:
         self.tmpdir = tmpdir
@@ -4772,30 +4780,108 @@ class PageCache:
         # there's only ever page 1, but kind == "office" has one source
         # file per pre-rendered page (handler.pages).
         self.handler = handler
+        # Guards every structure below and above - held only for
+        # bookkeeping, never across an actual render.
+        self._lock = threading.RLock()
+        # Requests being rendered right now, each with an Event set when
+        # that render ends (see get()).
+        self._in_flight: dict[PageRequest, threading.Event] = {}
+        # Which image each request last produced - the key a request maps
+        # to is the handler's own business (a PDF's depends on the page's
+        # size in points, say), so has() looks the image itself up among
+        # the cached ones instead.
+        self._served: dict[PageRequest, Image.Image] = {}
+        # Bumped by clear(): a render that started before it (a
+        # background one, finishing after a reload) mustn't put its
+        # now-stale image into the emptied cache - see _store().
+        self._generation = 0
+        self._render_generation = threading.local()
 
     def clear(self) -> None:
-        self._cache.clear()
-        self._native_images.clear()  # re-read the file(s), e.g. for -f/--follow
+        with self._lock:
+            self._generation += 1
+            self._cache.clear()
+            self._served.clear()
+            self._native_images.clear()  # re-read the file(s), e.g. for -f/--follow
 
     def get(self, page: int, target_px: int, fit: str = 'width') -> Image.Image:
         """The PDF page, or a pre-rendered page (a plain image file for
         kind=="image", or one of the pre-sliced Quick Look preview PNGs
         for kind=="office"), scaled so it's `target_px` wide (fit="width")
-        or tall (fit="height")."""
-        return self.handler.get_page_image(self, page, target_px, fit)
+        or tall (fit="height").
+
+        If another thread is rendering this very request right now, this
+        waits for it and then (normally) finds its result in the cache,
+        rather than running a second pdftoppm alongside for the same
+        page."""
+        request: PageRequest = (page, target_px, fit)
+        while True:
+            with self._lock:
+                pending = self._in_flight.get(request)
+                if pending is None:
+                    done = self._in_flight[request] = threading.Event()
+                    generation = self._generation
+                    break
+            # Someone else's render of it: wait, then go round again - it
+            # is normally cached by then, but if that render failed or
+            # was for a since-cleared generation, this becomes the owner.
+            pending.wait()
+        self._render_generation.value = generation
+        try:
+            img = self.handler.get_page_image(self, page, target_px, fit)
+            with self._lock:
+                if generation == self._generation:
+                    self._served[request] = img
+            return img
+        finally:
+            del self._render_generation.value
+            with self._lock:
+                del self._in_flight[request]
+            done.set()
+
+    def has(self, page: int, target_px: int, fit: str = 'width') -> bool:
+        """Whether get() with these arguments would return at once (or
+        wait on a render already under way) rather than start one."""
+        request: PageRequest = (page, target_px, fit)
+        with self._lock:
+            if request in self._in_flight:
+                return True
+            img = self._served.get(request)
+            return img is not None and any(v is img for v in self._cache.values())
 
     def _cached(self, key: tuple[int, int]) -> Image.Image | None:
         """A previously-computed page image for `key`, or None - shared
         LRU bookkeeping used by every DocumentHandler.get_page_image()."""
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
-        return None
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            return None
+
+    def _current_generation(self) -> bool:
+        """Whether the render under way on this thread (if any - see
+        get()) started after the latest clear(). Call with _lock held."""
+        return getattr(self._render_generation, "value", self._generation) == self._generation
+
+    def _store_native(self, page: int, img: Image.Image) -> None:
+        """Remember `page`'s natively-loaded image (see
+        DocumentHandler._native_page_image()) - unless, like _store(),
+        it was loaded for a generation clear() has since thrown away."""
+        with self._lock:
+            if self._current_generation():
+                self._native_images[page] = img
 
     def _store(self, key: tuple[int, int], img: Image.Image) -> None:
-        self._cache[key] = img
-        if len(self._cache) > self.size:
-            self._cache.popitem(last=False)
+        with self._lock:
+            # Rendered for a generation clear() has since thrown away
+            # (see __init__): hand it back to its caller, but don't keep it.
+            if not self._current_generation():
+                return
+            self._cache[key] = img
+            if len(self._cache) > self.size:
+                _key, evicted = self._cache.popitem(last=False)
+                for request in [r for r, v in self._served.items() if v is evicted]:
+                    del self._served[request]
 
 
 class EncodeCache:
@@ -4899,6 +4985,13 @@ class Viewer:
         # Event set once it's finished, and the thread doing it (at most
         # one at a time).
         self._prefetching: dict[int, threading.Event] = {}
+        # And of the page next to the one(s) on screen (see
+        # _schedule_page_prefetch()): the thread doing it (at most one at
+        # a time), and which way pages were last turned (+1/-1), so the
+        # page that way is prepared first.
+        self._page_prefetch_thread: threading.Thread | None = None
+        self._page_direction = 1
+        self._page_direction_from = 1  # the page that direction was last judged from
         self._prefetch_thread: threading.Thread | None = None  # file_index -> DocumentHandler | None,
         # populated by _classify() the first time each lazy (path-string)
         # entry above is actually visited - None means that one turned
@@ -5355,15 +5448,71 @@ class Viewer:
         self._display_rows = None  # stale - self.cols may have changed,
         # which is what wrapping is measured against
 
+    def _page_target(self) -> tuple[int, str]:
+        """(target_px, fit) for PageCache.get() at the current fit mode
+        and zoom - the same for every page."""
+        if self.fit == "height":
+            return max(1, round(self.avail_height_px * self.zoom)), "height"
+        return max(1, round(self.base_width_px * self.zoom)), "width"
+
     def _page_image(self, page: int) -> Image.Image:
         """`page`'s raster at the current fit mode and zoom - the one
         _load_page() shows, and, under -c/--continuous, each of the
         other pages stacked around it (see _build_continuous_layout())."""
-        if self.fit == "height":
-            target_height = max(1, round(self.avail_height_px * self.zoom))
-            return self.cache.get(page, target_height, fit="height")
-        target_width = max(1, round(self.base_width_px * self.zoom))
-        return self.cache.get(page, target_width, fit="width")
+        target_px, fit = self._page_target()
+        return self.cache.get(page, target_px, fit=fit)
+
+    def _schedule_page_prefetch(self) -> None:
+        """In image mode, start rendering a page next to the one(s) on
+        screen in the background - the one after the last page shown and
+        the one before the first, whichever way pages were last turned
+        first - so that turning to it only has to encode what's already
+        rasterized. Called on every pass of run_viewer()'s input loop:
+        a no-op while one is already under way, or once both neighbors
+        are in the page cache (see PageCache.has()). Showing a page
+        still being rendered waits for that render instead of starting
+        a second one (see PageCache.get()). A daemon thread, so quitting
+        never waits for it."""
+        if self.text_mode or self.file_missing or self.help_active or self.npages <= 1:
+            return
+        if self._page_prefetch_thread is not None and self._page_prefetch_thread.is_alive():
+            return
+        # Which way the pages were last turned, judged from how far
+        # self.page moved since the last call.
+        if self.page != self._page_direction_from:
+            self._page_direction = 1 if self.page > self._page_direction_from else -1
+            self._page_direction_from = self.page
+        last_shown = self._layout[-1][0] if self.continuous and self._layout else self.page
+        after, before = last_shown + 1, self.page - 1
+        target_px, fit = self._page_target()
+        for page in ((after, before) if self._page_direction > 0 else (before, after)):
+            if 1 <= page <= self.npages and not self.cache.has(page, target_px, fit):
+                break
+        else:
+            return
+        self._page_prefetch_thread = threading.Thread(
+            target=self._prefetch_page, args=(self.cache, page, target_px, fit),
+            name=f"pdfless-page-prefetch-{page}", daemon=True,
+        )
+        self._page_prefetch_thread.start()
+
+    def _prefetch_page(self, cache: PageCache, page: int, target_px: int, fit: str) -> None:
+        """_schedule_page_prefetch()'s background work: render `page`
+        into `cache` (the one it was scheduled for - by the time this
+        runs, self.cache may already be another file's). Under
+        -d/--debug, a start and a finish line, queued for the main
+        thread to print (see _debug_log()). Any failure is left for the
+        real visit to that page to hit again, visibly."""
+        if self.debug:
+            _debug_log(f"page {page}: rendering in the background")
+        t_start = time.monotonic()
+        try:
+            cache.get(page, target_px, fit)
+            outcome = f"rendered in the background in {time.monotonic() - t_start:.2f}s"
+        except BaseException as e:  # SystemExit too - see die()
+            outcome = f"background render failed ({e})"
+        if self.debug:
+            _debug_log(f"page {page}: {outcome}")
 
     def _load_page(self) -> None:
         self.encode_cache.clear()
@@ -8511,6 +8660,7 @@ def run_viewer(
     viewer.refresh()
     viewer._schedule_prefetch()
     while True:
+        viewer._schedule_page_prefetch()
         r, _, _ = select.select([fd], [], [], 0.3)
         flush_background_debug()  # -d lines from a background prefetch
         viewer.poll_follow()
