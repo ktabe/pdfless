@@ -237,8 +237,8 @@ GPS位置情報は，10進数の緯度・経度と，Google Mapsに貼り付け�
 
 #### 追加の依存ソフトウェア
 
-- **LibreOffice**：OpenDocument，Visio，WMFの表示に必要です．インストールされている場合は，Word，RTF，PowerPointの描画にも優先して使用します．
-- **macOSのQuick LookとChrome/Chromium**：ExcelとiWorkのプレビューに必要です．LibreOfficeがない場合は，Word，RTF，PowerPointの表示にも使用します．
+- **LibreOffice**：OpenDocument，Visio，WMFの表示に必要です．インストールされている場合は，Word，RTF，PowerPoint，Excelの描画にも優先して使用します．
+- **macOSのQuick LookとChrome/Chromium**：iWorkのプレビューに必要です．LibreOfficeがない場合は，Word，RTF，PowerPoint，Excelの表示にも使用します．
 - **Chrome/Chromium**：SVGの描画に使用します．Quick Lookは不要です．
 - **WeasyPrintが必要とするシステムライブラリ**：Markdownの描画に必要です．Pythonパッケージの`markdown`と`weasyprint`は，他のPython依存パッケージとともにインストールされます．
 
@@ -261,13 +261,13 @@ Quick LookプレビューまたはSVGの描画を利用する場合は，Chrome�
 | 形式 | 拡張子 | 必要なソフトウェアと動作 |
 | --- | --- | --- |
 | Word | `.doc`, `.docx`, `.docm` | LibreOfficeを優先し，なければQuick Look + Chromeを使用します．テキストモードと検索に対応します．代替の描画方法ではページ分割が異なる場合があります． |
-| Excel | `.xls`, `.xlsx`, `.xlsm` | Quick Look + Chromeが必要です．1シートを1ページとして表示します．テキストモードと検索には対応しません． |
+| Excel | `.xls`, `.xlsx`, `.xlsm` | LibreOfficeを優先し，なければQuick Look + Chromeを使用します．1シートを1ページとして表示します．LibreOfficeではシート全体を1ページに収め，テキストモードと検索に対応します．Quick Lookのプレビューでは大きなシートの一部しか表示されず，テキストモードと検索には対応しません． |
 | PowerPoint | `.ppt`, `.pptx`, `.pptm` | LibreOfficeを優先し，なければQuick Look + Chromeを使用します．1スライドを1ページとして表示します．テキストモードと検索にはLibreOfficeが必要です． |
 | RTF | `.rtf` | LibreOfficeでは改ページを維持し，代替のQuick Look + Chromeでは1枚の長いページとして表示します．テキストモードと検索に対応し，描画できない場合はプレーンテキストとして表示します． |
 | Pages | `.pages` | Quick Look + Chromeが必要です．1枚の長いページとして表示します．テキストモードと検索には対応しません． |
 | Numbers | `.numbers` | Quick Look + Chromeが必要です．シートごとに1ページとして表示します．テキストモードと検索には対応しません． |
 | Keynote | `.key` | Quick Look + Chromeが必要です．通常は1枚の長いページとして表示しますが，一部のプレビューではスライド単位のページ表示に対応します．テキストモードと検索には対応しません． |
-| OpenDocument | `.odt`, `.odp`, `.odg`, `.ods` | LibreOfficeが必要です．テキストモードと検索に対応します．表計算文書のページ分割は印刷レイアウトに従います． |
+| OpenDocument | `.odt`, `.odp`, `.odg`, `.ods` | LibreOfficeが必要です．テキストモードと検索に対応します．表計算文書はシート全体を1ページとして表示します． |
 | Visio | `.vsd`, `.vsdx` | LibreOfficeが必要です．Visioの各ページを1ページとして表示します．`.vsdx`の対応は手動では未検証です． |
 | WMF | `.wmf` | LibreOfficeが必要です．1ページとして表示します． |
 | SVG | `.svg` | Chrome/Chromiumを使用します．拡大・縮小に対応しますが，SVG内のリンクはクリックできません．Chromeがない場合はXMLソースを表示します． |
@@ -279,9 +279,10 @@ Markdownのプレビュー中は`/`がレンダリング結果を検索します
 
 画像として表示するQuick Lookプレビューの解像度を上げるには`-s`を使用します．
 このオプションは，LibreOfficeのみで対応する形式やMarkdownの解像度には影響しません．
-ExcelはLibreOfficeの印刷レイアウトではなく，Quick Lookのシート単位の表示を使用します．
+LibreOfficeで表計算文書を表示する場合は，印刷レイアウトではなく，シート全体を1ページとして出力します（LibreOfficeの`SinglePageSheets`オプション）．
+罫線のないセルには枠線が描かれません．
 
-パスワード保護されたWord，PowerPoint，Visioファイル（`.docx`／`.pptx`／`.vsdx`とそのマクロ有効版）は，
+パスワード保護されたWord，PowerPoint，Excel，Visioファイル（`.docx`／`.pptx`／`.xlsx`／`.vsdx`とそのマクロ有効版）は，
 LibreOfficeもQuick Lookもパスワードなしには描画できないため，事前に検出してスキップします．
 
 ## キャッシュ

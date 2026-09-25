@@ -246,9 +246,9 @@ requires Poppler.
 #### Optional dependencies
 
 - **LibreOffice** enables OpenDocument, Visio, and WMF support. When installed,
-  it is also preferred for Word, RTF, and PowerPoint rendering.
-- **macOS Quick Look and Chrome/Chromium** enable Excel and iWork previews and
-  provide a fallback for Word, RTF, and PowerPoint when LibreOffice is absent.
+  it is also preferred for Word, RTF, PowerPoint, and Excel rendering.
+- **macOS Quick Look and Chrome/Chromium** enable iWork previews and provide a
+  fallback for Word, RTF, PowerPoint, and Excel when LibreOffice is absent.
 - **Chrome/Chromium** enables SVG rendering without Quick Look.
 - **WeasyPrint system libraries** enable Markdown rendering. The Python
   packages `markdown` and `weasyprint` are installed with the other Python
@@ -273,13 +273,13 @@ Preview quality and pagination depend on the format and available renderer.
 | Format | Extensions | Requirements and behavior |
 | --- | --- | --- |
 | Word | `.doc`, `.docx`, `.docm` | LibreOffice preferred; otherwise Quick Look + Chrome. Supports text mode and search. Pagination may differ with the fallback renderer. |
-| Excel | `.xls`, `.xlsx`, `.xlsm` | Quick Look + Chrome. One page per sheet; no text mode or search. |
+| Excel | `.xls`, `.xlsx`, `.xlsm` | LibreOffice preferred; otherwise Quick Look + Chrome. One page per sheet. With LibreOffice, each page holds the whole sheet and supports text mode and search; the Quick Look preview shows only part of a large sheet, with no text mode or search. |
 | PowerPoint | `.ppt`, `.pptx`, `.pptm` | LibreOffice preferred; otherwise Quick Look + Chrome. One page per slide. Text mode and search require LibreOffice. |
 | RTF | `.rtf` | LibreOffice preserves page breaks; the Quick Look + Chrome fallback shows one continuous page. Supports text mode and search, with a plain-text fallback if rendering is unavailable. |
 | Pages | `.pages` | Quick Look + Chrome. Shown as one continuous page; no text mode or search. |
 | Numbers | `.numbers` | Quick Look + Chrome. One page per sheet; no text mode or search. |
 | Keynote | `.key` | Quick Look + Chrome. Usually shown as one continuous page; some previews support per-slide paging. No text mode or search. |
-| OpenDocument | `.odt`, `.odp`, `.odg`, `.ods` | LibreOffice required. Supports text mode and search. Spreadsheet pagination follows the print layout. |
+| OpenDocument | `.odt`, `.odp`, `.odg`, `.ods` | LibreOffice required. Supports text mode and search. Spreadsheets are shown one whole sheet per page. |
 | Visio | `.vsd`, `.vsdx` | LibreOffice required. One page per Visio page. `.vsdx` support has not been manually verified. |
 | WMF | `.wmf` | LibreOffice required. Single-page view. |
 | SVG | `.svg` | Chrome/Chromium. Scalable rendering; links within the SVG are not clickable. Falls back to XML source if Chrome is unavailable. |
@@ -291,10 +291,12 @@ mode, `/` searches the rendered PDF; press `t` first to search the raw source.
 
 Use `-s` to increase the resolution of image-based Quick Look previews. This
 option does not change the resolution of LibreOffice-only formats or Markdown.
-Excel uses Quick Look's sheet-based view rather than LibreOffice's print layout.
+With LibreOffice, spreadsheets are exported one whole sheet per page
+(LibreOffice's `SinglePageSheets` option) rather than by their print layout.
+Cells without borders are drawn without grid lines.
 
-A password-protected Word, PowerPoint, or Visio file (`.docx`/`.pptx`/`.vsdx`
-and their macro-enabled variants) is detected up front and skipped, since
+A password-protected Word, PowerPoint, Excel, or Visio file
+(`.docx`/`.pptx`/`.xlsx`/`.vsdx` and their macro-enabled variants) is detected up front and skipped, since
 neither LibreOffice nor Quick Look can render one without its password.
 
 ## Cache

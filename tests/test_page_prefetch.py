@@ -170,3 +170,19 @@ def test_has_forgets_an_evicted_page(tmp_path):
         cache.get(page, 10)
     assert not cache.has(1, 10)
     assert cache.has(2, 10) and cache.has(3, 10)
+
+
+def test_the_memory_budget_evicts_all_but_the_pages_in_use(tmp_path, monkeypatch):
+    """Past PAGE_CACHE_MAX_BYTES, the least recently used pages go -
+    but never below PAGE_CACHE_MIN_KEEP (the page on screen and its
+    two prefetched neighbors)."""
+    monkeypatch.setattr(pdfless, "PAGE_CACHE_MAX_BYTES", 10 * 100 * 100 * 3)  # ten 100x100 RGB pages
+    handler = _SlowHandler()
+    monkeypatch.setattr(pdfless.time, "sleep", lambda s: None)
+    cache = pdfless.PageCache(str(tmp_path), handler, size=20)
+    for page in range(1, 13):
+        cache.get(page, 100)
+    assert [p for p in range(1, 13) if cache.has(p, 100)] == list(range(3, 13))
+    cache.get(20, 1000)  # one page far over the budget on its own
+    assert [p for p in range(1, 13) if cache.has(p, 100)] == [11, 12]
+    assert cache.has(20, 1000)
