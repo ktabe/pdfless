@@ -90,6 +90,13 @@ STATUS_COLOR_ON = "\x1b[44;97m"  # white on blue - used for one-off messages
 # Resets every SGR attribute (color, reverse video, ...) at once - how
 # every colored piece of output here ends, whatever set the color.
 SGR_RESET = "\x1b[0m"
+# Synchronized output (DEC private mode 2026): a terminal that supports
+# it (iTerm2 3.5+, WezTerm, ...) holds off repainting between these two,
+# so a frame built from several steps - shift the image, then repaint
+# the scrollbar over it - appears all at once instead of showing each
+# step; one that doesn't simply ignores an unknown mode.
+SYNC_BEGIN = "\x1b[?2026h"
+SYNC_END = "\x1b[?2026l"
 
 # The default status line is split into differently-colored fields so
 # filename/page/loc%/zoom% each stand out, with the trailing key-hints
@@ -7168,7 +7175,7 @@ class Viewer:
         # draw_search_prompt(), which doesn't reset it since it's
         # mid-edit) is what a \x1b[2J/ECH fills the newly-blanked cells
         # with - see _draw_text()'s longer version of this comment.
-        out = [SGR_RESET, self._format_viewport_clear(crop_w, crop_h, full_clear)]
+        out = [SYNC_BEGIN, SGR_RESET, self._format_viewport_clear(crop_w, crop_h, full_clear)]
         # Erase the previous marker before the new image lands; otherwise
         # box-drawing chars linger on iTerm2 inline-image cells (especially
         # when search is cleared or n/p jumps to another match).
@@ -7185,6 +7192,7 @@ class Viewer:
 
         out.extend(self._scrollbar_column_escapes())
         out.append(self.format_status())
+        out.append(SYNC_END)
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
@@ -7312,7 +7320,12 @@ class Viewer:
 
         self._remember_drawn_position()
 
+        # All in one synchronized frame (see SYNC_BEGIN): the scroll
+        # region spans the full width, so the shift below moves the
+        # scrollbar column along with the image - shown on its own, that
+        # displaced scrollbar is a visible flicker until it's repainted.
         out = [
+            SYNC_BEGIN,
             SGR_RESET,
             f"\x1b[1;{avail_rows}r",
             f"\x1b[{shift}S" if shift > 0 else f"\x1b[{strip_rows}T",
@@ -7323,6 +7336,7 @@ class Viewer:
         ]
         out.extend(self._scrollbar_column_escapes())
         out.append(self.format_status())
+        out.append(SYNC_END)
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
