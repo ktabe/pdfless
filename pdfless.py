@@ -2803,18 +2803,23 @@ class PdfDocument(DocumentHandler):
         if cached is not None:
             return cached
 
+        # Uncompressed PPM (pdftoppm's default), not -png: the file is
+        # only read back into memory and deleted, never kept, so PNG's
+        # zlib compression would be pure overhead - and it's most of
+        # pdftoppm's run time (e.g. ~700ms of ~770ms for a 1600px-wide
+        # page), far more than writing/reading the bigger raw file.
         prefix = os.path.join(cache.tmpdir, f"page-{page}-{round(dpi)}")
         run_subprocess(
             [
-                "pdftoppm", *self._password_args(self.password), "-png", "-r", str(dpi),
+                "pdftoppm", *self._password_args(self.password), "-r", str(dpi),
                 "-f", str(page), "-l", str(page),
                 "-singlefile", self.path, prefix,
             ],
             check=True,
         )
-        img = Image.open(prefix + ".png")
+        img = Image.open(prefix + ".ppm")
         img.load()
-        os.unlink(prefix + ".png")
+        os.unlink(prefix + ".ppm")
 
         cache._store(key, img)
         return img
