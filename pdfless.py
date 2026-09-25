@@ -54,7 +54,7 @@ import time
 import tty
 import unicodedata
 import webbrowser
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 from typing import Any, Callable, Iterator, List, NoReturn, Protocol, Sequence, Tuple, Union, cast
 
@@ -473,8 +473,33 @@ def _debug_log(msg: str) -> None:
     first/only file is rendered lazily, from Viewer.__init__), where a
     bare "\n" doesn't return the cursor to column 1 (that's OPOST's
     job, and raw mode turns it off) - every line after the first would
-    print staggered one column further right than the last otherwise."""
-    print(f"pdfless: [debug] {msg}", file=sys.stderr, end="\r\n")
+    print staggered one column further right than the last otherwise.
+
+    Off the main thread (Viewer's background prefetch - see
+    Viewer._schedule_prefetch()), the line is queued instead, for the
+    main thread to print between its own screen writes
+    (flush_background_debug()) - printed from another thread, it could
+    land in the middle of an inline image's escape sequence and garble
+    it."""
+    line = f"pdfless: [debug] {msg}"
+    if threading.current_thread() is not threading.main_thread():
+        _BACKGROUND_DEBUG.append(line)
+        return
+    print(line, file=sys.stderr, end="\r\n")
+
+
+# _debug_log() lines from a background thread, waiting for the main
+# thread to print them (flush_background_debug()) - a deque, so the
+# background thread's append() and the main thread's popleft() are each
+# atomic without a lock.
+_BACKGROUND_DEBUG: deque[str] = deque()
+
+
+def flush_background_debug() -> None:
+    """Print every queued background _debug_log() line - from the main
+    thread only, between its own screen writes (see _debug_log())."""
+    while _BACKGROUND_DEBUG:
+        print(_BACKGROUND_DEBUG.popleft(), file=sys.stderr, end="\r\n")
 
 
 class _DebugTimer:
@@ -4371,7 +4396,13 @@ def run_subprocess(
     would suspend the process without it ever running, skipping the
     terminal cleanup that handling does first)."""
     fd = _CTRL_C_FD
-    if fd is None:
+    if fd is None or threading.current_thread() is not threading.main_thread():
+        # Off the main thread (Viewer's background prefetch - see
+        # _schedule_prefetch()) the tty's settings are the main thread's
+        # to juggle, not this one's: two threads saving/restoring them
+        # around overlapping calls could leave either with the other's.
+        # ^C still stops a background child - it's in the same process
+        # group as the main thread's own, whenever that one has ISIG on.
         return subprocess.run(args, timeout=timeout, **kwargs)
     vdisable = os.fpathconf(fd, "PC_VDISABLE")
     attrs = termios.tcgetattr(fd)
@@ -4857,7 +4888,13 @@ class Viewer:
         # what keeps startup with a large batch of files from decoding
         # every single one of them just to show the first.
         self.file_index = file_index
-        self._handler_cache: dict[int, DocumentHandler | None] = {}  # file_index -> DocumentHandler | None,
+        self._handler_cache: dict[int, DocumentHandler | None] = {}
+        # Background preparation of the file after the one on screen (see
+        # _schedule_prefetch()): each index it was started for, with an
+        # Event set once it's finished, and the thread doing it (at most
+        # one at a time).
+        self._prefetching: dict[int, threading.Event] = {}
+        self._prefetch_thread: threading.Thread | None = None  # file_index -> DocumentHandler | None,
         # populated by _classify() the first time each lazy (path-string)
         # entry above is actually visited - None means that one turned
         # out not to be a usable file at all.
@@ -5047,23 +5084,91 @@ class Viewer:
         # normal view, which always does a full redraw at the new size.
         self.help_active = False
 
-    def _classify(self, index: int) -> DocumentHandler | None:
+    def _classify(self, index: int, wait: bool = True, debug: bool | None = None) -> DocumentHandler | None:
         """files[index]'s DocumentHandler - already one (the file about
         to be shown first, or a test harness's direct handler) is
         returned as-is; a bare path string (every other file - see
         __init__) is sniffed once, via _sniff_file(), and the result
         cached, so a later revisit to the same file doesn't repeat the
         work. None means that file turned out not to be usable at all -
-        go_to_file() treats it the same as an out-of-range index."""
+        go_to_file() treats it the same as an out-of-range index.
+
+        If that file is being prepared in the background right now (see
+        _schedule_prefetch()), this waits for it to finish - with a
+        spinner on the status line - rather than classifying and
+        rendering it a second time alongside. `wait=False` is the
+        background prefetch itself asking; `debug` overrides self.debug
+        for the sniff (the prefetch keeps -d's output off the screen)."""
+        pending = self._prefetching.get(index)
+        if wait and pending is not None and not pending.is_set():
+            name = os.path.basename(str(self.files[index]))
+            with _ViewerProgress(self).spin(f"{name}: finishing its background render..."):
+                while not pending.wait(0.1):
+                    flush_background_debug()
+            flush_background_debug()
         entry = self.files[index]
         if isinstance(entry, DocumentHandler):
             return entry
         if index not in self._handler_cache:
             try:
-                self._handler_cache[index] = _sniff_file(entry, self.tmpdir, debug=self.debug)
+                self._handler_cache[index] = _sniff_file(
+                    entry, self.tmpdir, debug=self.debug if debug is None else debug,
+                )
             except UnusableFile:
                 self._handler_cache[index] = None
         return self._handler_cache[index]
+
+    def _schedule_prefetch(self) -> None:
+        """With several files open, start preparing the one after the
+        file now on screen in the background - classifying it and, for a
+        RenderedDocument (Word/Excel/.../SVG/Markdown), rendering it - so
+        that :n/} lands on it without waiting for soffice/Quick Look/
+        Chrome/WeasyPrint. Called once a file is on screen. Only one
+        prefetch runs at a time, and each file is prefetched at most
+        once; switching to a file still being prepared waits for it (see
+        _classify()). A daemon thread, so quitting never waits for it."""
+        nxt = self.file_index + 1
+        if nxt >= len(self.files) or nxt in self._prefetching:
+            return
+        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            return
+        done = threading.Event()
+        self._prefetching[nxt] = done
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_file, args=(nxt, done),
+            name=f"pdfless-prefetch-{nxt}", daemon=True,
+        )
+        self._prefetch_thread.start()
+
+    def _prefetch_file(self, index: int, done: threading.Event) -> None:
+        """_schedule_prefetch()'s background work for files[index]: no
+        progress line, so nothing is drawn over the file on screen - but
+        under -d/--debug, the same stage timings a foreground render
+        prints, bracketed by a start and a finish line, queued for the
+        main thread to print (see _debug_log()). Any failure is left for
+        the real switch to that file to hit again, visibly."""
+        name = os.path.basename(str(self.files[index]))
+        where = f"file {index + 1}/{len(self.files)}"
+        if self.debug:
+            _debug_log(f"{name}: preparing in the background ({where})")
+        t_start = time.monotonic()
+        try:
+            handler = self._classify(index, wait=False, debug=self.debug)
+            if isinstance(handler, RenderedDocument):
+                handler.ensure_pages(
+                    self.tmpdir, debug=self.debug, render_scale=self.office_render_scale,
+                    progress=_ProgressLine(enabled=False),
+                )
+            outcome = (
+                "not a usable file" if handler is None
+                else f"prepared in the background in {time.monotonic() - t_start:.2f}s"
+            )
+        except Exception as e:
+            outcome = f"background preparation failed ({e})"
+        finally:
+            done.set()
+        if self.debug:
+            _debug_log(f"{name}: {outcome}")
 
     def _is_usable(self, index: int) -> bool:
         """Whether files[index] can actually be switched to -
@@ -5220,6 +5325,7 @@ class Viewer:
         else:
             self._load_page()
         self.refresh()  # its normal status line already includes "file i/N"
+        self._schedule_prefetch()
 
     def _recompute_geometry(self) -> None:
         rows, cols, _, _ = get_term_cells(self.fd)
@@ -8398,8 +8504,10 @@ def run_viewer(
     last_search_query = None  # remembered across searches, for a bare "/"/"?"
 
     viewer.refresh()
+    viewer._schedule_prefetch()
     while True:
         r, _, _ = select.select([fd], [], [], 0.3)
+        flush_background_debug()  # -d lines from a background prefetch
         viewer.poll_follow()
 
         if viewer.resized:
