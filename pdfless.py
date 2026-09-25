@@ -152,6 +152,15 @@ PAGE_NUMBER_COLOR = "\x1b[1;32m"  # bold green
 SCROLLBAR_TRACK = "\x1b[90m│\x1b[0m"  # a thin gray line
 SCROLLBAR_THUMB = "\x1b[7m \x1b[0m"  # a solid block
 CACHE_SIZE = 6
+# PageCache's memory budget, on top of CACHE_SIZE: a whole spreadsheet
+# sheet on one page (see _SOFFICE_SPREADSHEET_PDF_FILTER) can rasterize
+# to tens of thousands of pixels tall - over 200MB for one page at a
+# 1600px-wide fit - so six of those would take well over a gigabyte.
+# Past this many bytes of page images, the least recently used are
+# dropped, down to PAGE_CACHE_MIN_KEEP (the page on screen and the two
+# neighbors Viewer._schedule_page_prefetch() prepares).
+PAGE_CACHE_MAX_BYTES = 512 * 1024 * 1024
+PAGE_CACHE_MIN_KEEP = 3
 
 # SGR mouse reporting (extended coordinates), only enabled while showing
 # the page image - where a click can hit a PDF hyperlink or the
@@ -807,7 +816,9 @@ def _pdf_render_result(out_pdf: str, ok: bool = True) -> tuple | None:
 # 2: a multi-sheet Numbers workbook renders one page per sheet, with its
 #    embedded sheet images converted (it used to be one page showing a
 #    broken-image icon).
-RENDER_CACHE_VERSION = 2
+# 3: Excel/.ods render via soffice, one whole sheet per PDF page (see
+#    _SOFFICE_SPREADSHEET_PDF_FILTER).
+RENDER_CACHE_VERSION = 3
 
 OFFICE_CACHE_MAX_ENTRIES = 50  # persistent rendered-pages cache (see
 # _office_cache_dir()) - entries beyond this many, least-recently-used
@@ -1033,11 +1044,29 @@ def _publish_cached_render(entry_dir: str, result: RenderResult) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# Spreadsheets soffice converts with Calc's SinglePageSheets PDF export
+# option (see _convert_via_soffice()): each sheet becomes exactly one PDF
+# page, sized to fit the whole sheet, instead of being paginated by its
+# print area/page setup - which, for a workbook never tuned for
+# printing, cuts one sheet into many oddly-split pages (confirmed by
+# hand: a real 13-sheet workbook came out as 224 pages without it, 13
+# with it). See https://help.libreoffice.org/latest/en-US/text/shared/guide/pdf_params.html
+_SOFFICE_SPREADSHEET_EXTENSIONS = (".xls", ".xlsx", ".xlsm", ".ods")
+_SOFFICE_SPREADSHEET_PDF_FILTER = (
+    'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}'
+)
+# A whole sheet on one page can take much longer to lay out than a
+# document's pages do (confirmed by hand: a real 18-sheet workbook took
+# 43s), so spreadsheets get more time before giving up.
+_SOFFICE_SPREADSHEET_TIMEOUT = 180
+
+
 def _convert_via_soffice(
     soffice: str, path: str, tmpdir: str, timeout: int = 60, debug: bool = False,
 ) -> str | None:
-    """Convert `path` (a Word/RTF/PowerPoint document - see
-    OfficeDocument._SOFFICE_EXTENSIONS) to a real PDF via LibreOffice's
+    """Convert `path` (a Word/RTF/PowerPoint/Excel document - see
+    OfficeDocument._SOFFICE_EXTENSIONS - or a SofficeOnlyDocument) to a
+    real PDF via LibreOffice's
     `soffice --convert-to pdf`, natively - no Quick Look/Chrome
     involved at all - returning the output PDF's path, or None on any
     failure (timeout, non-zero exit, or no output file), so callers
@@ -1055,17 +1084,25 @@ def _convert_via_soffice(
     (e.g. two files opened around the same time) don't collide over a
     shared user profile lock.
 
+    A spreadsheet (_SOFFICE_SPREADSHEET_EXTENSIONS) is exported one page
+    per sheet (see _SOFFICE_SPREADSHEET_PDF_FILTER), with at least
+    _SOFFICE_SPREADSHEET_TIMEOUT seconds to finish.
+
     With debug=True (-d/--debug), a failure to actually produce a PDF
     is reported to stderr - see below for why that's not rare (soffice
     routinely exits 0 without one)."""
     profile_dir = os.path.join(tmpdir, "soffice-profile")
     name = os.path.basename(path)
+    convert_to = "pdf"
+    if path.lower().endswith(_SOFFICE_SPREADSHEET_EXTENSIONS):
+        convert_to = _SOFFICE_SPREADSHEET_PDF_FILTER
+        timeout = max(timeout, _SOFFICE_SPREADSHEET_TIMEOUT)
     try:
         result = run_subprocess(
             [
                 soffice,
                 f"-env:UserInstallation=file://{profile_dir}",
-                "--convert-to", "pdf",
+                "--convert-to", convert_to,
                 "--outdir", tmpdir,
                 path,
             ],
@@ -2137,7 +2174,7 @@ _CFB_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # OLE/Compound File Binary
 
 
 def is_password_protected_ooxml_or_visio(path: str) -> bool:
-    """A modern Word/PowerPoint/Visio file (.docx/.pptx/.vsdx/...) is
+    """A modern Word/PowerPoint/Excel/Visio file (.docx/.pptx/.xlsx/.vsdx/...) is
     ordinarily a ZIP archive - MS-OFFCRYPTO password protection instead
     wraps the whole encrypted package in an OLE/CFB container (the same
     on-disk shape a *legacy* .doc/.ppt/.vsd already has natively,
@@ -3381,9 +3418,10 @@ class RenderedDocument(DocumentHandler):
     def supports_search(self) -> bool:
         # Real per-page/bbox search (build_search_index()/
         # find_search_matches() below) only works against a real PDF -
-        # a screenshot-based OfficeVariant (always true for Excel/
-        # Keynote/Pages/Numbers; for Word/RTF/PowerPoint, only when
-        # neither soffice nor Chrome's --print-to-pdf could be used)
+        # a screenshot-based OfficeVariant (always true for
+        # Keynote/Pages/Numbers; for Excel, only without soffice; for
+        # Word/RTF/PowerPoint, only when neither soffice nor Chrome's
+        # --print-to-pdf could be used)
         # has no such index to search.
         return self._pdf_delegate is not None
 
@@ -3427,7 +3465,7 @@ class RenderedDocument(DocumentHandler):
 class OfficeDocument(RenderedDocument):
     """Anything this Mac's Quick Look generators can preview (Word,
     Excel, PowerPoint, Keynote, Pages, ...) via qlmanage + a local
-    Chrome - or, for Word/RTF/PowerPoint, soffice when it's installed
+    Chrome - or, for Word/RTF/PowerPoint/Excel, soffice when it's installed
     (see _soffice_pages_if_eligible()). The actual rendering
     (_render_office_pages()) picks one of the ExcelWorkbook/SlideDeck/
     FlowingText OfficeVariant strategies and delegates to it; the lazy
@@ -3442,14 +3480,17 @@ class OfficeDocument(RenderedDocument):
     # (macro-enabled Word/PowerPoint) already classify as
     # OfficeDocument via the same Office.qlgenerator that handles
     # .docx/.pptx (confirmed by hand), so they get the same treatment.
-    # Deliberately excludes Excel (.xls/.xlsx/.xlsm): soffice
-    # paginates a spreadsheet by its print area/page setup, which for
-    # a workbook never tuned for printing fragments one sheet across
-    # several oddly-cut pages (confirmed by hand on a real 2-sheet
-    # workbook: 9 soffice pages, split mid-column with no header row)
-    # - nothing like qlmanage's "one full sheet per page". See
-    # _soffice_pages_if_eligible().
-    _SOFFICE_EXTENSIONS = (".doc", ".docx", ".docm", ".ppt", ".pptx", ".pptm", ".rtf")
+    # Excel (.xls/.xlsx/.xlsm) is exported one page per sheet (see
+    # _SOFFICE_SPREADSHEET_PDF_FILTER) - the same "one full sheet per
+    # page" as qlmanage's, except that the page holds the whole sheet
+    # (a Quick Look preview only shows its top-left part), and it's a
+    # real PDF, so it's searchable and stays sharp when zoomed. It
+    # also opens workbooks qlmanage times out on. Without that option,
+    # soffice paginates by print area/page setup, fragmenting one
+    # sheet across several oddly-cut pages.
+    _SOFFICE_EXTENSIONS = (
+        ".doc", ".docx", ".docm", ".ppt", ".pptx", ".pptm", ".rtf", ".xls", ".xlsx", ".xlsm",
+    )
 
     # The subset of _SOFFICE_EXTENSIONS that's ordinarily a ZIP archive
     # (OOXML) rather than always-OLE/CFB (.doc/.ppt) or plain text
@@ -3457,7 +3498,7 @@ class OfficeDocument(RenderedDocument):
     # is paired with in sniff() to reject a password-protected one
     # upfront instead of committing to a soffice/qlmanage render that's
     # bound to fail uninformatively.
-    _OOXML_ZIP_EXTENSIONS = (".docx", ".docm", ".pptx", ".pptm")
+    _OOXML_ZIP_EXTENSIONS = (".docx", ".docm", ".pptx", ".pptm", ".xlsx", ".xlsm")
 
     @classmethod
     def sniff(cls, path: str, tmpdir: str, debug: bool = False) -> OfficeDocument | None:
@@ -3595,7 +3636,7 @@ class OfficeDocument(RenderedDocument):
     ) -> RenderResult | None:
         """The one place that decides whether _try_soffice_pages() is
         even worth attempting for `path` - both call sites
-        (_render_office_pages(), for Word/PowerPoint, and
+        (_render_office_pages(), for Word/PowerPoint/Excel, and
         RtfOfficeDocument.build_pages(), for RTF) delegate here instead
         of repeating the same two checks:
 
@@ -3604,7 +3645,7 @@ class OfficeDocument(RenderedDocument):
           qlmanage/Chrome screenshot path, there's no way to collapse
           that back into a single continuously-scrollable page.
         - the extension must be one of _SOFFICE_EXTENSIONS - see its
-          comment for why Excel is deliberately excluded.
+          comment for how Excel is exported (one page per sheet).
 
         Returns the ("pdf", pdf_path, npages) tuple _try_soffice_pages()
         produces, or None - either because it wasn't eligible to try at
@@ -3738,7 +3779,7 @@ class OfficeDocument(RenderedDocument):
         Chrome fallback always asks for continuous=True regardless
         (see its build_pages()), since a converted RTF's page-height
         metadata doesn't correspond to anything in the original file
-        either way. Word and PowerPoint (see _SOFFICE_EXTENSIONS) try
+        either way. Word, PowerPoint and Excel (see _SOFFICE_EXTENSIONS) try
         LibreOffice's soffice before any of this (see
         _soffice_pages_if_eligible(), called at the very top of this
         method) when it's installed, since it paginates natively and
@@ -3969,12 +4010,10 @@ class SofficeOnlyDocument(RenderedDocument):
     work for any of these extensions, and because it would risk
     reproducing the .odt crash above just to classify a file.
 
-    .ods (Calc) carries the same print-area/page-setup pagination
-    caveat as Excel (see _SOFFICE_EXTENSIONS's docstring - confirmed
-    by hand: a real 4-sheet workbook came out as 8 soffice pages, with
-    a chart split across two of them) - but unlike Excel, there's no
-    working qlmanage fallback to prefer instead, so it's included here
-    anyway rather than left entirely unsupported.
+    .ods (Calc) is exported one page per sheet, the same as Excel (see
+    _SOFFICE_SPREADSHEET_PDF_FILTER) - without that, a real 4-sheet
+    workbook came out as 8 soffice pages, with a chart split across
+    two of them.
 
     .vsdx hasn't been verified by hand (no local sample was
     available) - LibreOffice's Visio import filter (libvisio) handles
@@ -4761,6 +4800,12 @@ def _strip_leading_home(s: str) -> str:
     return s
 
 
+def _image_bytes(img: Image.Image) -> int:
+    """Roughly how much memory `img`'s pixels take - one byte per band
+    per pixel, true of the RGB/RGBA/L images PageCache holds."""
+    return img.width * img.height * len(img.getbands())
+
+
 class PageCache:
     """Caches rasterized/resized page images, keyed by (page, size) -
     the actual per-kind work (rasterize a PDF page at some DPI, resize
@@ -4885,7 +4930,14 @@ class PageCache:
             if not self._current_generation():
                 return
             self._cache[key] = img
-            if len(self._cache) > self.size:
+            self._cache.move_to_end(key)
+            # Least recently used first: past the entry count, or past
+            # the memory budget while more than the few pages actually
+            # in use are held (see PAGE_CACHE_MAX_BYTES).
+            while len(self._cache) > self.size or (
+                len(self._cache) > PAGE_CACHE_MIN_KEEP
+                and sum(_image_bytes(v) for v in self._cache.values()) > PAGE_CACHE_MAX_BYTES
+            ):
                 _key, evicted = self._cache.popitem(last=False)
                 for request in [r for r, v in self._served.items() if v is evicted]:
                     del self._served[request]
