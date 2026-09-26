@@ -365,7 +365,7 @@ Keys:
   r                       toggle the scrollbar
   F                       toggle follow mode (auto-reload on file change)
                         <MISCELLANEOUS COMMANDS>
-  O v                     open the file in its own app (macOS only) and
+  v                       open the file in its own app (macOS only) and
                           switch follow mode on
   ^L                      redraw the screen
   F1 :h                   show this help (q to close it)
@@ -392,7 +392,7 @@ def positive_int(s: str) -> int:
 
 def _open_in_default_app(path: str) -> bool:
     """Hand `path` off to macOS's own default app for it, via `open` -
-    the macOS-only half of "O"/"v" (see run_viewer()). Fire-and-forget:
+    the macOS-only half of "v" (see run_viewer()). Fire-and-forget:
     this only launches `open` itself and doesn't wait for or know
     anything about whatever app ends up handling the file. Returns
     True if that launch succeeded, False if this isn't macOS at all or
@@ -8424,7 +8424,7 @@ class Viewer:
 
     def _start_following(self) -> None:
         """(Re)start follow mode's watch on the current file - whenever
-        follow is turned on (-f, F, O/v) or switches to watching a
+        follow is turned on (-f, F, v) or switches to watching a
         different file (:n/:p). The next periodic check is due
         FOLLOW_INTERVAL seconds from now; what it compares against is
         _displayed_mtime, the version actually on screen."""
@@ -8487,7 +8487,7 @@ class Viewer:
         self.refresh()
 
     def open_in_default_app(self) -> None:
-        """O/v: hand the current file off to macOS's own default app for
+        """v: hand the current file off to macOS's own default app for
         it (Preview/Word/Excel/...), and switch follow mode on (if it
         wasn't already) so an edit made there comes back automatically.
         self.path is always the original file, never a temporary
@@ -8543,7 +8543,7 @@ class Viewer:
             self.toggle_continuous()
         elif key == "F":
             self.toggle_follow()
-        elif key in ("O", "v"):
+        elif key == "v":
             self.open_in_default_app()
         elif key == "F1":
             # less(1) puts its help on "h"/"H", which pdfless can't - both
