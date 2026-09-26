@@ -37,6 +37,7 @@ import hashlib
 import html
 import io
 import json
+import logging
 import os
 import pathlib
 import plistlib
@@ -59,6 +60,12 @@ from collections import OrderedDict, deque
 from typing import Any, Callable, Iterator, List, NoReturn, Protocol, Sequence, Tuple, Union, cast
 
 from PIL import ExifTags, Image, ImageChops, ImageOps
+
+# pypdf (link/outline extraction) reports a malformed PDF's quirks - e.g.
+# "Ignoring wrong pointing object" - through the logging module, whose
+# last-resort handler prints them on stderr: straight over the page on
+# screen. It recovers from those on its own, so they're only noise here.
+logging.getLogger("pypdf").setLevel(logging.CRITICAL + 1)
 
 # Type aliases for the shapes that travel between functions here. Spelled
 # with typing's generics rather than `X | Y`, since these (unlike the
@@ -209,15 +216,24 @@ FOCUS_OFF = "\x1b[?1004l"
 
 
 def char_width(ch: str) -> int:
-    """Terminal column width of one character: 2 for wide/fullwidth East
-    Asian characters (e.g. most Japanese/Chinese/Korean text), 1 otherwise.
+    """Terminal column width of one character: 0 for a combining mark,
+    2 for wide/fullwidth East Asian characters (e.g. most Japanese/
+    Chinese/Korean text), 1 otherwise.
     Needed because the status line is truncated/padded to fit exactly
     self.cols columns - doing that by Python string length (len()) rather
     than actual terminal column width overshoots whenever the text
     contains such characters, since each one is 1 Python character but 2
     terminal columns; that overshoot pushes the write past the last
     column of the last row, and autowrap then scrolls the whole screen up
-    a line."""
+    a line.
+
+    A combining mark is drawn on top of the character before it, taking
+    no column of its own - and has to be checked first: the combining
+    (han)dakuten U+3099/U+309A of decomposed (NFD) kana, as in a macOS
+    file name, are "W" to east_asian_width(), so "ク" + U+3099 ("グ")
+    would otherwise count as four columns instead of two."""
+    if unicodedata.combining(ch):
+        return 0
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
@@ -328,7 +344,9 @@ Keys:
   mouse wheel             scroll up / down
                                 <LINKS>
   [ ]                     back / forward, through the positions internal
-                          links have jumped from (PDF only)
+                          links (and o below) have jumped from (PDF only)
+  o TAB                   table of contents (the PDF's bookmarks): pick
+                          an entry with j/k and jump to it with ENTER
                                <TOGGLES>
   t                       toggle plain-text view
   T                       toggle plain-text view already cleared for
@@ -2785,6 +2803,66 @@ class PdfDocument(DocumentHandler):
             result.append({"width_pt": width_pt, "height_pt": height_pt, "links": links})
         return result
 
+    def build_outline(self) -> list[dict[str, Any]]:
+        """Extract the document's outline (its bookmarks, a.k.a. table
+        of contents), via pypdf. Returns a flat list in document order,
+        one dict per entry: {"title": str, "level": int (0 = top level),
+        "page": int | None, "top_pt": float | None} - page/top_pt as
+        _resolve_link_dest() gives them (top_pt bottom-up, in PDF
+        points), or both None for an entry whose destination can't be
+        resolved (kept anyway, so the entries below it keep their
+        place in the hierarchy). An empty list if there's no outline,
+        or pypdf is missing or can't read the file."""
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return []
+
+        try:
+            reader = PdfReader(self.path)
+            if reader.is_encrypted:
+                reader.decrypt(self.password or "")
+            outline = reader.outline
+        except Exception:
+            return []
+
+        page_num_by_ref = {}
+        for i, p in enumerate(reader.pages):
+            ref = p.indirect_reference
+            if ref is not None:
+                page_num_by_ref[(ref.idnum, ref.generation)] = i + 1
+
+        entries: list[dict[str, Any]] = []
+
+        # pypdf's outline is a list of Destinations, where a nested list
+        # right after an entry holds that entry's children - so a list
+        # item means "one level deeper", not an entry of its own.
+        def walk(items: list[Any], level: int) -> None:
+            for item in items:
+                if isinstance(item, list):
+                    walk(item, level + 1)
+                    continue
+                try:
+                    # NFC: a title made from a macOS file name is often
+                    # decomposed (NFD - "グ" as "ク" + a combining
+                    # dakuten), which truncating by width could split.
+                    title = unicodedata.normalize("NFC", str(item.title or ""))
+                    title = re.sub(r"\s+", " ", title).strip()
+                    resolved = self._resolve_link_dest(reader, page_num_by_ref, item.dest_array)
+                except Exception:
+                    continue  # one malformed entry shouldn't lose the rest
+                page_num, top_pt = resolved if resolved is not None else (None, None)
+                entries.append({
+                    "title": title or "(untitled)", "level": level,
+                    "page": page_num, "top_pt": top_pt,
+                })
+
+        try:
+            walk(outline, 0)
+        except Exception:
+            pass  # keep whatever was read before the malformed part
+        return entries
+
     @staticmethod
     def find_search_matches(index: list[dict[str, Any]], query: str) -> list[BBoxMatch]:
         """Return every match of `query` (a case-insensitive regex, or a
@@ -5162,6 +5240,12 @@ class Viewer:
         self._text_max_page_lines = 0  # the -N gutter's width, per page
         self.help_active = False
         self.help_scroll = 0
+        # The table-of-contents box (o/TAB - see show_outline()): whether
+        # it's up, which entry is selected, and the first entry in view.
+        self.outline_active = False
+        self.outline_sel = 0
+        self.outline_scroll = 0
+        self._outline: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_outline()
         self._search_index: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_search_index()
         self._link_index: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_link_index()
         self._history_back: list[tuple[int, int, int]] = []  # [(page, scroll, x_offset), ...]
@@ -5239,7 +5323,9 @@ class Viewer:
         # The help box's size/position and the underlying page raster are
         # both stale after a resize; simplest is to just drop back to the
         # normal view, which always does a full redraw at the new size.
+        # The same goes for the table-of-contents box.
         self.help_active = False
+        self.outline_active = False
 
     def _classify(self, index: int, wait: bool = True, debug: bool | None = None) -> DocumentHandler | None:
         """files[index]'s DocumentHandler - already one (the file about
@@ -5460,6 +5546,7 @@ class Viewer:
         self._search_index = None
         self.clear_search()
         self._link_index = None
+        self._outline = None
         self._history_back = []
         self._history_forward = []
         self.text_mode = self.doc_handler.starts_in_text_mode()
@@ -5859,6 +5946,8 @@ class Viewer:
         self._load_content()
         if self.help_active:
             self._draw_help()
+        elif self.outline_active:
+            self._draw_outline()
         elif self.text_mode:
             self._draw_text()
         else:
@@ -5942,6 +6031,174 @@ class Viewer:
             self.scroll_help(max(1, self.rows - 3))
         elif key in BACKWARD_WINDOW_KEYS:
             self.scroll_help(-max(1, self.rows - 3))
+
+    def _ensure_outline(self) -> list[dict[str, Any]]:
+        """self._outline (see PdfDocument.build_outline()), built on
+        first use - an empty list for anything without a real PDF behind
+        it (see _pdf_source())."""
+        if self._outline is None:
+            pdf_source = self._pdf_source()
+            self._outline = pdf_source.build_outline() if pdf_source is not None else []
+        return self._outline
+
+    def show_outline(self) -> None:
+        """o/TAB: put up the table of contents (the PDF's bookmarks) as a
+        box over the page, with the entry for the page on screen already
+        selected - or just say so on the status line if there isn't one."""
+        outline = self._ensure_outline()
+        if not outline:
+            self.draw_status("no table of contents in this file")
+            return
+        # The last entry starting at or before the current page is the
+        # section being read - the same one a PDF viewer's sidebar
+        # highlights. Entries without a page don't count.
+        self.outline_sel = 0
+        for i, entry in enumerate(outline):
+            if entry["page"] is not None and entry["page"] <= self.page:
+                self.outline_sel = i
+        self.outline_active = True
+        self.outline_scroll = 0
+        self._draw_outline()
+
+    def hide_outline(self) -> None:
+        self.outline_active = False
+        self._invalidate_screen()  # the box overlays the page
+        self.refresh()
+
+    def _outline_box(self) -> tuple[int, int, int, int]:
+        """Where the table-of-contents box goes: (row0, col0, content_h,
+        content_w) - its top-left corner (1-based terminal cells) and the
+        size of the list inside its border - for both _draw_outline() and
+        handle_outline_mouse()'s click hit-testing."""
+        outline = self._ensure_outline()
+        available_rows = max(1, self.rows - 1)  # bottom row is the status bar
+        # Wide enough for the longest entry (indent + title, a space, and
+        # its page number), but never wider than the terminal allows.
+        longest = max(
+            2 * e["level"] + display_width(e["title"]) + 1 + len(str(e["page"] or ""))
+            for e in outline
+        )
+        content_w = min(max(20, self.cols - 4), max(30, longest))
+        content_h = min(max(1, available_rows - 2), len(outline))
+        box_w = content_w + 4  # border (2) + padding (2)
+        box_h = content_h + 2  # top/bottom border
+        row0 = max(1, (available_rows - box_h) // 2 + 1)
+        col0 = max(1, (self.cols - box_w) // 2 + 1)
+        return row0, col0, content_h, content_w
+
+    def _draw_outline(self) -> None:
+        """Draw the table-of-contents box over the page, the same boxed
+        overlay _draw_help() uses: one entry per line, indented by its
+        level, with its page number flush right and the selected entry
+        in reverse video."""
+        outline = self._ensure_outline()
+        row0, col0, content_h, content_w = self._outline_box()
+        # Scroll just enough to keep the selection in view.
+        self.outline_sel = max(0, min(len(outline) - 1, self.outline_sel))
+        if self.outline_sel < self.outline_scroll:
+            self.outline_scroll = self.outline_sel
+        elif self.outline_sel >= self.outline_scroll + content_h:
+            self.outline_scroll = self.outline_sel - content_h + 1
+        self.outline_scroll = max(0, min(len(outline) - content_h, self.outline_scroll))
+
+        box_w = content_w + 4
+        out = [SGR_RESET, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
+        for i in range(content_h):
+            idx = self.outline_scroll + i
+            entry = outline[idx]
+            page_label = str(entry["page"]) if entry["page"] is not None else ""
+            # The title gets whatever the page number (and a space before
+            # it) leaves - truncated by terminal columns, since titles are
+            # often Japanese (two columns per character).
+            title_w = max(0, content_w - len(page_label) - 1)
+            title = truncate_to_width("  " * entry["level"] + entry["title"], title_w)
+            line = pad_to_width(title, content_w - len(page_label)) + page_label
+            if idx == self.outline_sel:
+                line = f"\x1b[7m{line}{SGR_RESET}"
+            out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line} │")
+        out.append(f"\x1b[{row0 + content_h + 1};{col0}H└{'─' * (box_w - 2)}┘")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        self.draw_status(
+            f"ENTER to jump, q to close - {self.outline_sel + 1}/{len(outline)}"
+        )
+
+    def _move_outline_selection(self, delta: int) -> None:
+        """Move the selection `delta` entries down (negative = up),
+        stopping at either end."""
+        n = len(self._ensure_outline())
+        new_sel = max(0, min(n - 1, self.outline_sel + delta))
+        if new_sel != self.outline_sel:
+            self.outline_sel = new_sel
+            self._draw_outline()
+
+    def jump_to_outline_entry(self, index: int) -> None:
+        """Close the table of contents and go to entry `index`'s place:
+        in image mode, exactly where its destination points (like an
+        internal link, and recorded in the same [/] history); in text
+        mode, the top of its page."""
+        entry = self._ensure_outline()[index]
+        if entry["page"] is None:
+            self.draw_status("this entry doesn't point to a page in this file")
+            return
+        self.outline_active = False
+        self._invalidate_screen()
+        if self.text_mode:
+            self.go_to_page_text(entry["page"], 0)
+        else:
+            self._push_history()
+            self.go_to_link_target(entry["page"], entry["top_pt"])
+        self.refresh()
+
+    def handle_outline_key(self, key: str) -> None:
+        """A key pressed while the table of contents is up: ENTER jumps
+        to the selected entry, q/ESC/o/TAB close it, the usual line/
+        window keys and g/G/</>/HOME/END move the selection. Everything
+        else is swallowed, like handle_help_key()."""
+        n = len(self._ensure_outline())
+        window = max(1, self._outline_box()[2] - 1)
+        # ENTER before the line keys: "\r" is one of FORWARD_LINE_KEYS.
+        if key in ("\r", "\n"):
+            self.jump_to_outline_entry(self.outline_sel)
+        elif key in ("q", "\x1b", "o", "\t"):
+            self.hide_outline()
+        elif key in ("\x0c", "FOCUS_IN"):
+            # ^L (or a focus change - see handle_global_key()): repaint
+            # the page underneath, then the box back over it.
+            self._invalidate_screen()
+            if self.text_mode:
+                self._draw_text()
+            else:
+                self._draw()
+            self._draw_outline()
+        elif key in FORWARD_LINE_KEYS:
+            self._move_outline_selection(1)
+        elif key in BACKWARD_LINE_KEYS:
+            self._move_outline_selection(-1)
+        elif key in FORWARD_WINDOW_KEYS or key in ("d", "\x04"):
+            self._move_outline_selection(window)
+        elif key in BACKWARD_WINDOW_KEYS or key in ("u", "\x15"):
+            self._move_outline_selection(-window)
+        elif key in ("g", "<", "HOME"):
+            self._move_outline_selection(-n)
+        elif key in ("G", ">", "END"):
+            self._move_outline_selection(n)
+
+    def handle_outline_mouse(self, kind: str, col: int, row: int) -> None:
+        """A mouse event while the table of contents is up: the wheel
+        moves the selection, a click on an entry jumps to it, and a
+        click anywhere outside the box closes it."""
+        if kind == "MOUSE_WHEEL_UP":
+            self._move_outline_selection(-1)
+        elif kind == "MOUSE_WHEEL_DOWN":
+            self._move_outline_selection(1)
+        elif kind == "MOUSE_CLICK":
+            row0, col0, content_h, content_w = self._outline_box()
+            inside_cols = col0 <= col < col0 + content_w + 4
+            if inside_cols and row0 < row <= row0 + content_h:
+                self.jump_to_outline_entry(self.outline_scroll + row - row0 - 1)
+            elif not (inside_cols and row0 <= row <= row0 + content_h + 1):
+                self.hide_outline()  # outside the box (its border doesn't count)
 
     def can_enter_text_mode(self) -> bool:
         """Whether this file has any text-mode content to show at all -
@@ -7824,6 +8081,8 @@ class Viewer:
         self.cache.clear()
         self._search_index = None
         self._text_pages = None  # stale too - re-extracted on demand
+        self._outline = None  # the outline may have changed too
+        self.outline_active = False  # ... and its entries with it
         self.clear_search()
         if self.text_mode:
             self._load_text_page()
@@ -8293,6 +8552,8 @@ class Viewer:
             # F1, with ":h" as a second way in for terminals that send
             # something unexpected for F1.
             self.show_help()
+        elif key in ("o", "\t"):
+            self.show_outline()
         elif key in ("t", "T"):
             # T is t and C combined into one press/undo - see
             # toggle_clean_text_mode().
@@ -8352,6 +8613,8 @@ class Viewer:
                 self.scroll_help(-1)
             elif kind == "MOUSE_WHEEL_DOWN":
                 self.scroll_help(1)
+        elif self.outline_active:
+            self.handle_outline_mouse(kind, col, row)
         elif kind == "MOUSE_CLICK":
             self.handle_click(col, row)
         elif kind == "MOUSE_DRAG":
@@ -8795,6 +9058,9 @@ def run_viewer(
 
             if viewer.help_active:
                 viewer.handle_help_key(key)
+                continue
+            if viewer.outline_active:
+                viewer.handle_outline_key(key)
                 continue
 
             if viewer.handle_global_key(key):

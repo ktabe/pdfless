@@ -17,6 +17,7 @@ It has been tested with [iTerm2](https://iterm2.com) and
 - Office documents, SVG, and Markdown are also supported with additional dependencies.
 - Scroll, zoom, and pan with the keyboard or mouse.
 - Search PDF text and follow external and internal PDF links.
+- Jump to a section from the PDF's table of contents (bookmarks).
 - Switch to text mode to read or copy extracted text.
 - Show a clickable and draggable scrollbar.
 - Open multiple files and switch between them.
@@ -208,7 +209,8 @@ plain images and previews without extractable text. While a search is active,
 | `r` | Toggle the scrollbar (shown by default). |
 | `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-f`/`--follow` is specified. |
 | Click a PDF link | Open a URL in the system browser or follow an internal link. |
-| `[` / `]` | Go back / forward through internal-link navigation history. |
+| `[` / `]` | Go back / forward through the positions internal links and the table of contents (`o`) jumped from. |
+| `o`, `TAB` | Show the PDF's table of contents (bookmarks), with the current section selected. Move with `j`/`k` (or the mouse wheel) and press `ENTER` or click an entry to jump there; `q` closes it. |
 | Click or drag the scrollbar | Jump to a document position in image mode. In text mode, the scrollbar is display-only. |
 | Mouse wheel | Scroll by two lines in image mode (configurable) or one line in text mode. |
 | `O`, `v` | Open the file in its default app (macOS only) and switch follow mode on, so an edit made there is picked up automatically. |
