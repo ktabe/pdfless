@@ -16,6 +16,7 @@ It has been tested with [iTerm2](https://iterm2.com) and
 - Display PDF, image (PNG/JPEG/GIF...), and plain text files on a terminal.
 - Office documents, SVG, and Markdown are also supported with additional dependencies.
 - Scroll, zoom, and pan with the keyboard or mouse.
+- View paginated documents continuously, with adjacent pages on screen together.
 - Search PDF text and follow external and internal PDF links.
 - Jump to a section from the PDF's table of contents (bookmarks).
 - Switch to text mode to read or copy extracted text.
@@ -33,6 +34,8 @@ It has been tested with [iTerm2](https://iterm2.com) and
 | Search in image mode | ![Search in image mode](docs/screenshots/pdfless-search-pdf-mode.png) |
 | Search in text mode | ![Search in text mode](docs/screenshots/pdfless-search-text-mode.png) |
 | PDF hyperlinks | ![PDF hyperlinks](docs/screenshots/pdfless-hyperlinks.png) |
+| Table of contents | ![Table of contents](docs/screenshots/pdfless-table-of-contents.png) |
+| Continuous mode | ![Continuous mode](docs/screenshots/pdfless-continuous-mode.png) |
 | Image file | ![Image file](docs/screenshots/pdfless-image.png) |
 | Keyboard help | ![Keyboard help](docs/screenshots/pdfless-help.png) |
 
@@ -95,7 +98,7 @@ cat document.pdf | pdfless     # Read from standard input
 ```
 
 Pages fit the terminal width by default. Use `j` / `k` to scroll,
-`Space` / `b` to move by a window, and `n` / `p` to change pages.
+`Space` / `b` to move by a window, and `n` / `p` to move between pages.
 Press `+` / `-` to zoom, `/` to search, `t` to switch to text mode,
 and `q` to quit. `F1` or `:h` opens the keyboard help.
 
@@ -205,12 +208,12 @@ plain images and previews without extractable text. While a search is active,
 | `E` | Toggle end-of-line markers in text mode (shown by default). |
 | `#`, `-N` | Toggle line numbers in text mode (hidden by default). |
 | `C` | Toggle a clean text display for copying, restoring previous settings on the second press. |
-| `c` | Toggle the continuous view (`-c`/`--continuous`) in both image and text mode, keeping the current position. |
+| `c` | Toggle continuous view (`-c`/`--continuous`) in image or text mode while keeping the current position. |
 | `r` | Toggle the scrollbar (shown by default). |
 | `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-f`/`--follow` is specified. |
 | Click a PDF link | Open a URL in the system browser or follow an internal link. |
 | `[` / `]` | Go back / forward through the positions internal links and the table of contents (`o`) jumped from. |
-| `o`, `TAB` | Show the PDF's table of contents (bookmarks), with the current section selected. Move with `j`/`k` (or the mouse wheel) and press `ENTER` or click an entry to jump there; `q` closes it. |
+| `o`, `TAB` | Show the PDF's table of contents (bookmarks), with the current section selected. Move with `j`/`k` or the mouse wheel, then press `ENTER` or click an entry to jump there. Press `q` to close it. |
 | Click or drag the scrollbar | Jump to a document position in image mode. In text mode, the scrollbar is display-only. |
 | Mouse wheel | Scroll by two lines in image mode (configurable) or one line in text mode. |
 | `v` | Open the file in its default app (macOS only) and switch follow mode on, so an edit made there is picked up automatically. |
