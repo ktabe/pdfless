@@ -298,6 +298,7 @@ MAX_ZOOM = 4.0
 ZOOM_STEP = 1.15
 PAN_STEP_CELLS = 8
 FOLLOW_INTERVAL = 3.0  # seconds between checks, under -f/--follow
+OUTLINE_MIN_W = 30  # the table of contents box is never narrower (in columns)
 
 KEY_TABLE = """\
 Keys:
@@ -5994,6 +5995,96 @@ class Viewer:
             sys.stdout.write(wrap_for_tmux(osc) + "\r\n")
         sys.stdout.flush()
 
+    def _overlay_box(
+        self, lines: list[tuple[str, str]], min_w: int = 0
+    ) -> tuple[int, int, int, int]:
+        """Where a boxed overlay (the help, the table of contents) goes:
+        centered over the page, above the status bar, wide enough for its
+        longest line but shrunk to fit the terminal - for _draw_box() and
+        for the callers' own scrolling and click hit-testing.
+
+        Args:
+            lines: every line of the box's content, as _draw_box() takes them.
+            min_w: the narrowest the content area may be.
+
+        Returns:
+            (row0, col0, content_h, content_w): the box's top-left corner
+            (1-based terminal cells) and the size of the content area
+            inside its border - content_h < len(lines) means it scrolls.
+        """
+        available_rows = max(1, self.rows - 1)  # bottom row is the status bar
+        # A line with a right part needs a space between its two parts.
+        longest = max(
+            display_width(left) + (1 + display_width(right) if right else 0)
+            for left, right in lines
+        )
+        content_w = min(max(20, self.cols - 4), max(min_w, longest))
+        content_h = min(max(1, available_rows - 2), len(lines))
+        box_w = content_w + 4  # border (2) + padding (2)
+        box_h = content_h + 2  # top/bottom border
+        row0 = max(1, (available_rows - box_h) // 2 + 1)
+        col0 = max(1, (self.cols - box_w) // 2 + 1)
+        return row0, col0, content_h, content_w
+
+    def _draw_box(
+        self, lines: list[tuple[str, str]], scroll: int,
+        selected: int | None = None, min_w: int = 0,
+    ) -> tuple[int, int]:
+        """Draw a boxed overlay (see _overlay_box()) over the page, showing
+        the window of `lines` that starts at `scroll`. We only ever move
+        the cursor and rewrite the exact cells the box covers, instead of
+        clearing the screen, so the page still showing in the rest of the
+        terminal is left untouched.
+
+        Args:
+            lines: every line of the content, each a (left, right) pair:
+                `left` is truncated to fit (by terminal columns - it may be
+                Japanese) and `right` (e.g. a page number, or "") is shown
+                in full, flush right.
+            scroll: the index of the first line in view.
+            selected: the index of the line to show in reverse video -
+                also scrolled into view - or None for no selection.
+            min_w: as for _overlay_box().
+
+        Returns:
+            (scroll, max_scroll): `scroll` clamped to what the box can
+            actually show (e.g. after a resize shrank it), for the caller
+            to store back, and the largest scroll there is (0 = no scrolling).
+        """
+        row0, col0, content_h, content_w = self._overlay_box(lines, min_w)
+        max_scroll = max(0, len(lines) - content_h)
+        # Scroll just enough to keep the selection in view.
+        if selected is not None:
+            if selected < scroll:
+                scroll = selected
+            elif selected >= scroll + content_h:
+                scroll = selected - content_h + 1
+        scroll = max(0, min(max_scroll, scroll))
+
+        box_w = content_w + 4
+        out = [SGR_RESET, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
+        for i in range(content_h):
+            left, right = lines[scroll + i]
+            # `left` gets whatever `right` (and a space before it) leaves.
+            left_w = content_w - display_width(right)
+            left = truncate_to_width(left, max(0, left_w - 1) if right else left_w)
+            line = pad_to_width(left, left_w) + right
+            if scroll + i == selected:
+                line = f"\x1b[7m{line}{SGR_RESET}"
+            out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line} │")
+        out.append(f"\x1b[{row0 + content_h + 1};{col0}H└{'─' * (box_w - 2)}┘")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        return scroll, max_scroll
+
+    def _help_lines(self) -> list[tuple[str, str]]:
+        """The help box's content (KEY_TABLE), as _draw_box() takes it."""
+        return [(line, "") for line in KEY_TABLE.splitlines()]
+
+    def _help_box(self) -> tuple[int, int, int, int]:
+        """_overlay_box() for the help - see there."""
+        return self._overlay_box(self._help_lines())
+
     def show_help(self) -> None:
         self.help_active = True
         self.help_scroll = 0
@@ -6003,8 +6094,7 @@ class Viewer:
         """Scroll the help box by `delta` lines (negative = up), for when
         KEY_TABLE has grown taller than the box can show at once."""
         lines = KEY_TABLE.splitlines()
-        available_rows = max(1, self.rows - 1)
-        content_h = min(max(1, available_rows - 2), len(lines))
+        content_h = self._help_box()[2]
         max_scroll = max(0, len(lines) - content_h)
         new_scroll = max(0, min(max_scroll, self.help_scroll + delta))
         if new_scroll != self.help_scroll:
@@ -6065,60 +6155,27 @@ class Viewer:
         self._invalidate_screen()  # the box overlays the page
         self.refresh()
 
+    def _outline_lines(self) -> list[tuple[str, str]]:
+        """The table-of-contents box's content, as _draw_box() takes it:
+        each entry's title indented by its level, with its page number
+        (if it has one) flush right."""
+        return [
+            ("  " * e["level"] + e["title"], str(e["page"]) if e["page"] is not None else "")
+            for e in self._ensure_outline()
+        ]
+
     def _outline_box(self) -> tuple[int, int, int, int]:
-        """Where the table-of-contents box goes: (row0, col0, content_h,
-        content_w) - its top-left corner (1-based terminal cells) and the
-        size of the list inside its border - for both _draw_outline() and
-        handle_outline_mouse()'s click hit-testing."""
-        outline = self._ensure_outline()
-        available_rows = max(1, self.rows - 1)  # bottom row is the status bar
-        # Wide enough for the longest entry (indent + title, a space, and
-        # its page number), but never wider than the terminal allows.
-        longest = max(
-            2 * e["level"] + display_width(e["title"]) + 1 + len(str(e["page"] or ""))
-            for e in outline
-        )
-        content_w = min(max(20, self.cols - 4), max(30, longest))
-        content_h = min(max(1, available_rows - 2), len(outline))
-        box_w = content_w + 4  # border (2) + padding (2)
-        box_h = content_h + 2  # top/bottom border
-        row0 = max(1, (available_rows - box_h) // 2 + 1)
-        col0 = max(1, (self.cols - box_w) // 2 + 1)
-        return row0, col0, content_h, content_w
+        """_overlay_box() for the table of contents - see there."""
+        return self._overlay_box(self._outline_lines(), OUTLINE_MIN_W)
 
     def _draw_outline(self) -> None:
-        """Draw the table-of-contents box over the page, the same boxed
-        overlay _draw_help() uses: one entry per line, indented by its
-        level, with its page number flush right and the selected entry
-        in reverse video."""
+        """Draw the table-of-contents box over the page, with the selected
+        entry in reverse video and scrolled into view."""
         outline = self._ensure_outline()
-        row0, col0, content_h, content_w = self._outline_box()
-        # Scroll just enough to keep the selection in view.
         self.outline_sel = max(0, min(len(outline) - 1, self.outline_sel))
-        if self.outline_sel < self.outline_scroll:
-            self.outline_scroll = self.outline_sel
-        elif self.outline_sel >= self.outline_scroll + content_h:
-            self.outline_scroll = self.outline_sel - content_h + 1
-        self.outline_scroll = max(0, min(len(outline) - content_h, self.outline_scroll))
-
-        box_w = content_w + 4
-        out = [SGR_RESET, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
-        for i in range(content_h):
-            idx = self.outline_scroll + i
-            entry = outline[idx]
-            page_label = str(entry["page"]) if entry["page"] is not None else ""
-            # The title gets whatever the page number (and a space before
-            # it) leaves - truncated by terminal columns, since titles are
-            # often Japanese (two columns per character).
-            title_w = max(0, content_w - len(page_label) - 1)
-            title = truncate_to_width("  " * entry["level"] + entry["title"], title_w)
-            line = pad_to_width(title, content_w - len(page_label)) + page_label
-            if idx == self.outline_sel:
-                line = f"\x1b[7m{line}{SGR_RESET}"
-            out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line} │")
-        out.append(f"\x1b[{row0 + content_h + 1};{col0}H└{'─' * (box_w - 2)}┘")
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        self.outline_scroll, _max_scroll = self._draw_box(
+            self._outline_lines(), self.outline_scroll, self.outline_sel, OUTLINE_MIN_W
+        )
         self.draw_status(
             f"ENTER to jump, q to close - {self.outline_sel + 1}/{len(outline)}"
         )
@@ -7350,34 +7407,9 @@ class Viewer:
         self._finish_text_frame(out, avail_rows)
 
     def _draw_help(self) -> None:
-        # Overlay the help as a boxed panel centered over the page, instead
-        # of clearing the screen: we only ever move the cursor and rewrite
-        # the exact cells the box covers, so the PDF still showing in the
-        # rest of the terminal is left untouched.
-        available_rows = max(1, self.rows - 1)  # bottom row is the status bar
-        all_lines = KEY_TABLE.splitlines()
-
-        content_w = min(max(20, self.cols - 4), max(len(l) for l in all_lines))
-        all_lines = [l[:content_w] for l in all_lines]
-        content_h = min(max(1, available_rows - 2), len(all_lines))
-        # KEY_TABLE may be taller than the box can show at once; clamp the
-        # scroll position (e.g. after a resize shrank the box) and slice
-        # out just the window of lines currently in view.
-        max_scroll = max(0, len(all_lines) - content_h)
-        self.help_scroll = max(0, min(max_scroll, self.help_scroll))
-        lines = all_lines[self.help_scroll:self.help_scroll + content_h]
-
-        box_w = content_w + 4  # border (2) + padding (2)
-        box_h = content_h + 2  # top/bottom border
-        row0 = max(1, (available_rows - box_h) // 2 + 1)
-        col0 = max(1, (self.cols - box_w) // 2 + 1)
-
-        out = [SGR_RESET, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
-        for i, line in enumerate(lines):
-            out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line.ljust(content_w)} │")
-        out.append(f"\x1b[{row0 + box_h - 1};{col0}H└{'─' * (box_w - 2)}┘")
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        """Overlay the help (KEY_TABLE) as a box over the page, scrolled
+        to self.help_scroll."""
+        self.help_scroll, max_scroll = self._draw_box(self._help_lines(), self.help_scroll)
         if max_scroll:
             pct = round(100 * self.help_scroll / max_scroll)
             self.draw_status(f"q to close help - j/k or wheel to scroll ({pct}%)")
