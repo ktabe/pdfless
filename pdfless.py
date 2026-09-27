@@ -4253,6 +4253,12 @@ class MarkdownDocument(_RawTextView, RenderedDocument):
     # picks as the system default, so CJK text (which needs a real CJK
     # font) renders using whatever's actually installed rather than a
     # Latin-only font silently dropping every Japanese glyph.
+    # `code` in a table cell is an inline-block: WeasyPrint sizes a
+    # column as if a cell like "`.doc`, `.docx`, `.docm`" could wrap
+    # between the code spans, but then can't break a line there, so the
+    # cell ran on into the next column (confirmed with WeasyPrint 70 and
+    # this README's format table). As atomic boxes, the spans wrap
+    # between one another as the column width expects.
     MARKDOWN_CSS = """
 body { line-height: 1.5; padding: 2em; }
 h1, h2, h3, h4, h5, h6 { line-height: 1.2; margin-top: 1em; }
@@ -4263,6 +4269,7 @@ pre code { padding: 0; background: none; }
 blockquote { border-left: 4px solid #ccc; margin-left: 0; padding-left: 1em; color: #555; }
 table { border-collapse: collapse; max-width: 100%; }
 th, td { border: 1px solid #ccc; padding: 0.3em 0.6em; }
+th code, td code { display: inline-block; }
 img { max-width: 100%; height: auto; }
 """
 
