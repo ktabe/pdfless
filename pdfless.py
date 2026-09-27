@@ -6453,7 +6453,17 @@ class Viewer:
         scroll = max(0, min(max_scroll, scroll))
 
         box_w = content_w + 4
-        out = [SGR_RESET, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
+        out = [SGR_RESET]
+        # Blank the box's cells first. Over text mode's lines, a cell can
+        # be the right half of a double-width character; a wide character
+        # of the box's written there makes the terminal (iTerm2, at least)
+        # drop the old one and move over a column, shifting the rest of
+        # the row (redrawing the box put it right, as its own cells were
+        # all that was left underneath by then). Plain spaces split such a
+        # character cleanly, leaving nothing for the box to trip on.
+        for row in range(row0, row0 + content_h + 2):
+            out.append(f"\x1b[{row};{col0}H{' ' * box_w}")
+        out.append(f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐")
         for i in range(content_h):
             left, right = lines[scroll + i]
             # `left` gets whatever `right` (and a space before it) leaves.
