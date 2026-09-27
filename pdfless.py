@@ -2246,11 +2246,12 @@ def read_plain_text_lines(path: str, tab_width: int = 8) -> list[str]:
 
 
 def compile_search_pattern(query: str) -> re.Pattern[str]:
-    """Compile `query` as a case-insensitive regex, NFKC-normalized to
-    match the text it's run against (see normalize_for_search()). If it
-    isn't valid regex syntax (e.g. a literal query like "C++" - "+"
-    repeating nothing is a regex error), fall back to matching it
-    literally instead of just failing the search.
+    """Compile `query` as a case-insensitive regex, normalized the way
+    normalize_for_search() normalizes the text it's run against (NFKC,
+    and the same whitespace folding). If it isn't valid regex syntax
+    (e.g. a literal query like "C++" - "+" repeating nothing is a regex
+    error), fall back to matching it literally instead of just failing
+    the search.
 
     Only what the user typed as regex syntax counts as such: a part that
     normalizing changes (full-width "（案）", "＊" from a Japanese input
@@ -2261,15 +2262,69 @@ def compile_search_pattern(query: str) -> re.Pattern[str]:
 
     Returns:
         The pattern, for search_spans()."""
-    parts = []
+    # Each piece of the query as (its NFKC form, the regex text for it).
+    pieces = []
     for seg_start, seg_end in _search_segments(query):
         segment = query[seg_start:seg_end]
         normalized = unicodedata.normalize("NFKC", segment)
-        parts.append(segment if normalized == segment else re.escape(normalized))
+        pieces.append((normalized, segment if normalized == segment else re.escape(normalized)))
+    # Fold whitespace by the same rule as the text (see
+    # _fold_search_spaces()): a run of whitespace pieces is dropped or
+    # becomes a single space, judged by the pieces either side of it.
+    parts = []
+    i = 0
+    while i < len(pieces):
+        if not pieces[i][0].isspace():
+            parts.append(pieces[i][1])
+            i += 1
+            continue
+        run_end = i
+        while run_end < len(pieces) and pieces[run_end][0].isspace():
+            run_end += 1
+        before = pieces[i - 1][0][-1] if i > 0 else ""
+        after = pieces[run_end][0][0] if run_end < len(pieces) else ""
+        if not (_is_unspaced_script(before) or _is_unspaced_script(after)):
+            parts.append(" ")
+        i = run_end
     try:
         return re.compile("".join(parts), re.IGNORECASE)
     except re.error:
         return re.compile(re.escape(normalize_for_search(query)[0]), re.IGNORECASE)
+
+
+# Scripts written without spaces between words - Han (Chinese and
+# Japanese alike), hiragana, katakana, bopomofo, and CJK punctuation -
+# as ranges of code points (after NFKC, so no half-width katakana or
+# full-width ASCII). Hangul is deliberately not here: Korean puts spaces
+# between words, so they mean something.
+_UNSPACED_SCRIPT_RANGES = (
+    (0x3001, 0x303F),    # CJK symbols and punctuation (not U+3000, a space)
+    (0x3040, 0x30FF),    # hiragana, katakana
+    (0x3100, 0x312F),    # bopomofo
+    (0x31A0, 0x31FF),    # bopomofo extended, CJK strokes, katakana extensions
+    (0x3400, 0x4DBF),    # CJK unified ideographs extension A
+    (0x4E00, 0x9FFF),    # CJK unified ideographs
+    (0xF900, 0xFAFF),    # CJK compatibility ideographs
+    (0xFE30, 0xFE4F),    # CJK compatibility forms
+    (0x20000, 0x3FFFF),  # CJK unified ideographs extensions B and on
+)
+_UNSPACED_SCRIPT_CLASS = "".join(
+    f"\\U{lo:08x}-\\U{hi:08x}" for lo, hi in _UNSPACED_SCRIPT_RANGES
+)
+# Whitespace _fold_search_spaces() would change: a run of two or more,
+# anything but a plain space, or a run next to an unspaced-script character.
+_FOLDABLE_SPACE_RE = re.compile(
+    rf"\s{{2,}}|[^\S ]|(?<=[{_UNSPACED_SCRIPT_CLASS}])\s|\s(?=[{_UNSPACED_SCRIPT_CLASS}])"
+)
+
+
+def _is_unspaced_script(ch: str) -> bool:
+    """Whether `ch` (one character, or "" for none) belongs to a script
+    written without spaces between words - see _UNSPACED_SCRIPT_RANGES."""
+    if not ch:
+        return False
+    code = ord(ch)
+    return any(lo <= code <= hi for lo, hi in _UNSPACED_SCRIPT_RANGES)
 
 
 def _search_segments(text: str) -> Iterator[tuple[int, int]]:
@@ -2305,7 +2360,8 @@ def normalize_for_search(text: str) -> NormalizedText:
     finds text stored another: decomposed kana (NFD "ク" + U+3099, common
     in PDFs made from macOS file names) or Latin, full-width ASCII
     ("第５回"), half-width katakana ("ﾃﾞｰﾀ"), circled digits, ligatures
-    ("ﬁle", common in LaTeX PDFs) and the like.
+    ("ﬁle", common in LaTeX PDFs) and the like. Whitespace is folded
+    too - see _fold_search_spaces().
 
     Normalizing changes the text's length, so it also records where each
     normalized character came from, for mapping a match back onto the
@@ -2319,21 +2375,75 @@ def normalize_for_search(text: str) -> NormalizedText:
     Returns:
         (normalized, starts, ends): starts[i]/ends[i] are the original
         offsets of the segment normalized[i] came from. Both are None when
-        `text` is already NFKC - the common case, checked at C speed - and
-        offsets carry over unchanged.
+        normalizing changes nothing - the common case, checked at C speed -
+        and offsets carry over unchanged.
     """
     if text.isascii() or unicodedata.is_normalized("NFKC", text):
-        return text, None, None
-    pieces: list[str] = []
-    starts: list[int] = []
-    ends: list[int] = []
+        normalized: NormalizedText = (text, None, None)
+    else:
+        pieces: list[str] = []
+        starts: list[int] = []
+        ends: list[int] = []
+        for seg_start, seg_end in _search_segments(text):
+            piece = unicodedata.normalize("NFKC", text[seg_start:seg_end])
+            pieces.append(piece)
+            starts.extend([seg_start] * len(piece))
+            ends.extend([seg_end] * len(piece))
+        normalized = ("".join(pieces), starts, ends)
+    return _fold_search_spaces(normalized)
 
-    for seg_start, seg_end in _search_segments(text):
-        piece = unicodedata.normalize("NFKC", text[seg_start:seg_end])
-        pieces.append(piece)
-        starts.extend([seg_start] * len(piece))
-        ends.extend([seg_end] * len(piece))
-    return "".join(pieces), starts, ends
+
+def _fold_search_spaces(normalized: NormalizedText) -> NormalizedText:
+    """normalize_for_search()'s second step: fold the whitespace in its
+    NFKC-normalized text, so that spacing a PDF's text layer adds (or
+    leaves out) doesn't stop a match. Word and LibreOffice set a gap
+    between Japanese and Latin text ("Xプロジェクト"), which pdftotext
+    reads back as a space ("X プロジェクト"); it splits CJK runs at
+    wide letter spacing too ("会 議"); and pdftotext -layout pads
+    justified lines with runs of spaces.
+
+    A run of whitespace next to a character of a script written without
+    spaces between words (Chinese, Japanese - see _is_unspaced_script())
+    is dropped; any other run becomes a single space.
+
+    Args:
+        normalized: (text, starts, ends), as normalize_for_search()
+            describes them.
+
+    Returns:
+        The same, with the whitespace folded and starts/ends following
+        along - unchanged (and as cheap as one regex search) when there's
+        nothing to fold, the common case.
+    """
+    text, starts, ends = normalized
+    if not _FOLDABLE_SPACE_RE.search(text):
+        return normalized
+    out: list[str] = []
+    new_starts: list[int] = []
+    new_ends: list[int] = []
+
+    def keep(i: int, j: int, replacement: str | None = None) -> None:
+        # Carry text[i:j] over (or `replacement`, one character standing
+        # for all of it), with where it came from in the original.
+        if replacement is None:
+            out.append(text[i:j])
+            new_starts.extend(starts[i:j] if starts is not None else range(i, j))
+            new_ends.extend(ends[i:j] if ends is not None else range(i + 1, j + 1))
+        else:
+            out.append(replacement)
+            new_starts.append(starts[i] if starts is not None else i)
+            new_ends.append(ends[j - 1] if ends is not None else j)
+
+    pos = 0
+    for m in re.finditer(r"\s+", text):
+        keep(pos, m.start())
+        before = text[m.start() - 1] if m.start() > 0 else ""
+        after = text[m.end()] if m.end() < len(text) else ""
+        if not (_is_unspaced_script(before) or _is_unspaced_script(after)):
+            keep(m.start(), m.end(), " ")
+        pos = m.end()
+    keep(pos, len(text))
+    return "".join(out), new_starts, new_ends
 
 
 def search_spans(
@@ -2752,9 +2862,22 @@ class PdfDocument(DocumentHandler):
         """Extract per-page text and word positions (via poppler's pdftotext
         -bbox) for searching. Returns a list, one entry per page, each
         {"width_pt": float, "height_pt": float, "text": str,
-        "words": [(start, end, xMin, yMin, xMax, yMax), ...]} (all in points)
-        where (start, end) are offsets into "text" for that word.
-        find_search_matches() adds each page's normalize_for_search() of
+        "words": [(start, end, xMin, yMin, xMax, yMax), ...], "rows": ...}
+        (all in points) where (start, end) are offsets into "text" for that
+        word.
+
+        "text"/"words" follow the order pdftotext -bbox gives the words
+        in, which is usually reading order - including across a line
+        break inside one column of a two-column page. But it isn't always
+        the order they appear in on screen: a table row laid out cell by
+        cell can come out with its cells out of order (a cell ahead of
+        the one left of it). So "rows" is the same words again, sorted
+        into rows as they appear on the page (see _screen_row_order()):
+        {"text": str, "words": [...like "words"...], "order": [the
+        index in "words" of each of them]} - or None when that's the order
+        they're already in. find_search_matches() searches both.
+
+        find_search_matches() also adds normalize_for_search() of each
         "text" as "normalized" the first time it searches it."""
         out = self._poppler_stdout(
             "pdftotext", self.path, self.password, "-bbox", to_stdout=True,
@@ -2762,30 +2885,88 @@ class PdfDocument(DocumentHandler):
 
         pages = []
         for width, height, body in self._BBOX_PAGE_RE.findall(out):
-            words = []
-            parts = []
-            offset = 0
+            found = []
             for xmin, ymin, xmax, ymax, word_html in self._BBOX_WORD_RE.findall(body):
                 word_text = html.unescape(word_html)
-                if not word_text:
-                    continue
-                start = offset
-                parts.append(word_text)
-                offset += len(word_text)
-                words.append(
-                    (start, offset, float(xmin), float(ymin), float(xmax), float(ymax))
-                )
-                parts.append(" ")
-                offset += 1
-            pages.append(
-                {
-                    "width_pt": float(width),
-                    "height_pt": float(height),
-                    "text": "".join(parts),
-                    "words": words,
-                }
-            )
+                if word_text:
+                    found.append((word_text, float(xmin), float(ymin), float(xmax), float(ymax)))
+            pages.append(self._index_page(float(width), float(height), found))
         return pages
+
+    @staticmethod
+    def _index_page(
+        width_pt: float, height_pt: float, found: list[tuple[str, float, float, float, float]],
+    ) -> dict[str, Any]:
+        """One page's entry in build_search_index() - see there.
+
+        Args:
+            width_pt, height_pt: the page's size.
+            found: (text, xMin, yMin, xMax, yMax) of each word on it, in
+                pdftotext's order.
+
+        Returns:
+            The entry, with "rows" filled in.
+        """
+        text, words = PdfDocument._join_words(found)
+        order = PdfDocument._screen_row_order(found)
+        rows = None
+        if order != list(range(len(found))):
+            row_text, row_words = PdfDocument._join_words([found[i] for i in order])
+            rows = {"text": row_text, "words": row_words, "order": order}
+        return {
+            "width_pt": width_pt, "height_pt": height_pt,
+            "text": text, "words": words, "rows": rows,
+        }
+
+    @staticmethod
+    def _join_words(
+        found: list[tuple[str, float, float, float, float]],
+    ) -> tuple[str, list[tuple[int, int, float, float, float, float]]]:
+        """Join words into one searchable string, a space between each.
+
+        Args:
+            found: (text, xMin, yMin, xMax, yMax) of each word, in order.
+
+        Returns:
+            (text, words): the joined string, and each word's
+            (start, end, xMin, yMin, xMax, yMax) with (start, end) its
+            offsets in it.
+        """
+        parts = []
+        words = []
+        offset = 0
+        for word_text, xmin, ymin, xmax, ymax in found:
+            parts.append(word_text)
+            words.append((offset, offset + len(word_text), xmin, ymin, xmax, ymax))
+            offset += len(word_text) + 1
+        return " ".join(parts) + (" " if parts else ""), words
+
+    @staticmethod
+    def _screen_row_order(found: list[tuple[str, float, float, float, float]]) -> list[int]:
+        """The order words appear in on screen, row by row: words whose
+        vertical extents overlap by at least half the shorter one's height
+        share a row; rows go top to bottom, words in a row left to right.
+
+        Args:
+            found: (text, xMin, yMin, xMax, yMax) of each word.
+
+        Returns:
+            The indices into `found`, in that order.
+        """
+        by_middle = sorted(range(len(found)), key=lambda i: found[i][2] + found[i][4])
+        rows: list[list[int]] = []
+        row_top = row_bottom = 0.0
+        for i in by_middle:
+            _text, _xmin, ymin, _xmax, ymax = found[i]
+            if rows:
+                overlap = min(row_bottom, ymax) - max(row_top, ymin)
+                if overlap >= 0.5 * min(row_bottom - row_top, ymax - ymin):
+                    rows[-1].append(i)
+                    row_top, row_bottom = min(row_top, ymin), max(row_bottom, ymax)
+                    continue
+            rows.append([i])
+            row_top, row_bottom = ymin, ymax
+        return [i for row in rows for i in sorted(row, key=lambda i: found[i][1])]
 
     @staticmethod
     def _resolve_link_dest(
@@ -2981,41 +3162,82 @@ class PdfDocument(DocumentHandler):
         normalize_for_search() - so "第5回" also finds "第５回") across the whole
         document, as a list of (page_number, xMin, yMin, xMax, yMax) bounding
         boxes (in points, the union of every word the match touches), in
-        reading order."""
+        reading order.
+
+        Each page is searched in both of build_search_index()'s word
+        orders - pdftotext's and the on-screen rows - and a match found in
+        both counts once."""
         pattern = compile_search_pattern(query)
-        matches = []
+        matches: list[BBoxMatch] = []
         for page_num, page in enumerate(index, start=1):
-            # Normalized once per page and kept in the index, which the
-            # Viewer holds on to across searches.
-            if "normalized" not in page:
-                page["normalized"] = normalize_for_search(page["text"])
-            for pos, match_end in search_spans(pattern, page["text"], page["normalized"]):
-                box = None
-                for word_start, word_end, xmin, ymin, xmax, ymax in page["words"]:
-                    if word_start < match_end and word_end > pos:
-                        # poppler often lumps a whole run of CJK text (with no
-                        # spaces to split on) into a single <word>, sometimes
-                        # spanning most of a line. Highlighting that whole word
-                        # would hugely overstate the match, so narrow the box
-                        # to just the matched characters' share of it, assuming
-                        # roughly uniform character width left-to-right.
-                        word_len = word_end - word_start
-                        local_start = max(pos, word_start) - word_start
-                        local_end = min(match_end, word_end) - word_start
-                        frac_start = local_start / word_len if word_len else 0.0
-                        frac_end = local_end / word_len if word_len else 1.0
-                        sub_xmin = xmin + frac_start * (xmax - xmin)
-                        sub_xmax = xmin + frac_end * (xmax - xmin)
-                        if box is None:
-                            box = [sub_xmin, ymin, sub_xmax, ymax]
-                        else:
-                            box[0] = min(box[0], sub_xmin)
-                            box[1] = min(box[1], ymin)
-                            box[2] = max(box[2], sub_xmax)
-                            box[3] = max(box[3], ymax)
-                if box is not None:
-                    matches.append((page_num, box[0], box[1], box[2], box[3]))
+            views = [page]
+            if page.get("rows") is not None:
+                views.append(page["rows"])
+            # (index in page["words"] of the first word it touches, where
+            # in that word it starts) -> box: the key both orders agree on
+            # for the same match, and what puts them in reading order.
+            found: dict[tuple[int, int], tuple[float, float, float, float]] = {}
+            for view in views:
+                # Normalized once per page and kept in the index, which
+                # the Viewer holds on to across searches.
+                if "normalized" not in view:
+                    view["normalized"] = normalize_for_search(view["text"])
+                order = view.get("order")
+                for pos, match_end in search_spans(pattern, view["text"], view["normalized"]):
+                    hit = PdfDocument._match_box(view["words"], pos, match_end)
+                    if hit is None:
+                        continue  # only the spaces between words
+                    word_idx, local_start, box = hit
+                    key = (order[word_idx] if order is not None else word_idx, local_start)
+                    found.setdefault(key, box)
+            for key in sorted(found):
+                matches.append((page_num, *found[key]))
         return matches
+
+    @staticmethod
+    def _match_box(
+        words: list[tuple[int, int, float, float, float, float]], pos: int, match_end: int,
+    ) -> tuple[int, int, tuple[float, float, float, float]] | None:
+        """Where a match at text[pos:match_end] is on the page.
+
+        Args:
+            words: the (start, end, xMin, yMin, xMax, yMax) of each word
+                in the text searched.
+            pos, match_end: the match's offsets in that text.
+
+        Returns:
+            (index of the first word it touches, its offset in that word,
+            (xMin, yMin, xMax, yMax) - the union of every word it
+            touches), or None if it touches no word at all.
+        """
+        box = None
+        first = None
+        for word_idx, (word_start, word_end, xmin, ymin, xmax, ymax) in enumerate(words):
+            if word_start < match_end and word_end > pos:
+                # poppler often lumps a whole run of CJK text (with no
+                # spaces to split on) into a single <word>, sometimes
+                # spanning most of a line. Highlighting that whole word
+                # would hugely overstate the match, so narrow the box
+                # to just the matched characters' share of it, assuming
+                # roughly uniform character width left-to-right.
+                word_len = word_end - word_start
+                local_start = max(pos, word_start) - word_start
+                local_end = min(match_end, word_end) - word_start
+                frac_start = local_start / word_len if word_len else 0.0
+                frac_end = local_end / word_len if word_len else 1.0
+                sub_xmin = xmin + frac_start * (xmax - xmin)
+                sub_xmax = xmin + frac_end * (xmax - xmin)
+                if box is None:
+                    first = (word_idx, local_start)
+                    box = [sub_xmin, ymin, sub_xmax, ymax]
+                else:
+                    box[0] = min(box[0], sub_xmin)
+                    box[1] = min(box[1], ymin)
+                    box[2] = max(box[2], sub_xmax)
+                    box[3] = max(box[3], ymax)
+        if box is None or first is None:
+            return None
+        return first[0], first[1], (box[0], box[1], box[2], box[3])
 
     def supports_text_mode(self) -> bool:
         return True
