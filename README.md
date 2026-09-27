@@ -194,6 +194,7 @@ It also ignores Unicode width and composition differences (NFKC):
 and `file` finds the `ﬁ` ligature. Spaces next to Japanese or Chinese text
 are ignored, so `Xプロジェクト` also finds the `X プロジェクト` a Word
 document's PDF often reads as; elsewhere, any run of spaces matches one space.
+A match can also run across a line break, as a paragraph's words in a PDF often do.
 An invalid regular expression is treated as literal text. Matches are boxed
 in PDF image mode and highlighted in text mode.
 

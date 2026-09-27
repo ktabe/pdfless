@@ -15,7 +15,7 @@ from conftest import FIXTURES_DIR, requires_soffice
 from test_search import make_viewer
 
 sys.path.insert(0, FIXTURES_DIR)
-from make_sample_search_variants import ROWS  # noqa: E402
+from make_sample_search_variants import ROWS, WRAPPED, WRAPPED_QUERIES  # noqa: E402
 
 NFD = lambda s: unicodedata.normalize("NFD", s)  # noqa: E731
 
@@ -214,3 +214,68 @@ def test_rows_are_left_out_when_the_order_already_matches():
         ("下の行", 50, 120, 110, 135),
     )
     assert page["rows"] is None
+
+
+def text_viewer(tmp_path, lines):
+    path = tmp_path / "wrapped.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return make_viewer(pdfless.TextDocument(str(path)))
+
+
+def test_text_mode_search_runs_across_line_breaks(tmp_path):
+    """A PDF's text comes one printed line at a time, so a paragraph's
+    words get split across lines ("ござ" / "います"): the lines are
+    searched joined, the break dropped next to Japanese and read as a
+    space between Latin words."""
+    viewer = text_viewer(tmp_path, ["誠にありがとうござ", "います。Supports text mode and", "search here."])
+    viewer.start_search("ございます")
+    assert viewer.search_matches == [(0, 7, 9 + 1 + 3)]  # `end` counts on into line 1
+    assert viewer._text_highlight_segments(viewer.search_matches[0]) == {0: (7, 9), 1: (0, 3)}
+
+    viewer.start_search("and search")
+    [(line_idx, start, end)] = viewer.search_matches
+    and_at = viewer.text_lines[1].index("and")
+    assert (line_idx, start, end) == (1, and_at, len(viewer.text_lines[1]) + 1 + len("search"))
+    assert viewer._text_highlight_segments((line_idx, start, end)) == {
+        1: (and_at, and_at + 3), 2: (0, 6),
+    }
+    viewer.start_search("andsearch")
+    assert viewer.search_matches == []  # a line break between Latin words is still a space
+
+
+def test_a_page_separator_is_never_searched_across(tmp_path):
+    viewer = text_viewer(tmp_path, ["ありがとうござ", "(separator)", "います"])
+    viewer._text_separator_lines = frozenset({1})
+    viewer.search_query = "ございます"
+    assert viewer._find_all_text_matches() == []
+
+
+@pytest.mark.parametrize("wrap", [False, True])
+def test_a_highlight_across_lines_is_drawn_on_each(tmp_path, capsys, wrap):
+    viewer = text_viewer(tmp_path, ["誠にありがとうござ", "います。"])
+    viewer.text_wrap = wrap
+    viewer._display_rows = None
+    viewer.start_search("ございます")
+    capsys.readouterr()
+    if wrap:
+        pdfless.Viewer._draw_text_wrapped(viewer)
+    else:
+        pdfless.Viewer._draw_text_unwrapped(viewer)
+    out = capsys.readouterr().out
+    assert pdfless.TEXT_HIGHLIGHT_COLOR + "ござ" + pdfless.SGR_RESET in out
+    assert pdfless.TEXT_HIGHLIGHT_COLOR + "います" + pdfless.SGR_RESET in out
+
+
+@pytest.mark.parametrize("query", WRAPPED_QUERIES)
+def test_a_word_split_across_a_pdfs_lines_is_found_in_both_modes(variants_pdf, query):
+    """Page 3 of the fixture breaks WRAPPED's words mid-word."""
+    handler = pdfless.PdfDocument(variants_pdf)
+    assert 3 in {m[0] for m in handler.find_search_matches(handler.build_search_index(), query)}
+
+    viewer = make_viewer(pdfless.PdfDocument(variants_pdf))
+    viewer.text_mode = True
+    viewer.start_search(query)
+    segments = viewer._text_highlight_segments(viewer._text_search_highlight())
+    assert len(segments) == 2, query  # the highlight is on both lines
+    highlighted = "\n".join(viewer.text_lines[i][a:b] for i, (a, b) in sorted(segments.items()))
+    assert highlighted.replace("\n", "" if query == "ございます" else " ") == query

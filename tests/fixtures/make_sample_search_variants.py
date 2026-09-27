@@ -6,7 +6,9 @@ ligatures.
 
 Page 1 is a table of every variant with its code points; page 2 has
 each one again inside a sentence. ROWS is also what
-tests/test_search_normalization.py searches for.
+tests/test_search_normalization.py searches for. Page 3 is a paragraph
+broken mid-word, the way a PDF's text comes one printed line at a time:
+WRAPPED's words, each split across a line break.
 
 Run from the repo root (needs WeasyPrint and the Hiragino fonts macOS
 ships):
@@ -43,11 +45,25 @@ ROWS: list[tuple[str, str, str]] = [
     ("丸数字", "手順①②③", "手順123"),
     ("組文字", "㈱テスト　㍻　㎏", "（株）テスト"),  # typed full-width, as an IME would
     ("合字（LaTeX由来のPDFに多い）", "ﬁle ﬂow ofﬁce", "file"),
+    # U+2F24/U+2F12, radicals looking just like 大/力 - Word's PDFs often
+    # carry them. Neither 大 nor 力 appears anywhere else here, so their
+    # shared glyphs keep the radicals' mapping (see the NFC row below).
+    ("康熙部首（WordのPDFに多い）", "\u2F24学と協\u2F12", "大学と協力"),
     # WeasyPrint gives each glyph a single ToUnicode mapping, so a glyph
     # shared with an NFD row above would come out decomposed here too -
     # the NFC control uses glyphs of its own.
     ("NFC（比較用：正規形）", "ゲーム　ボーナス", "ゲーム"),
 ]
+
+
+# Page 3's lines - each pair of consecutive lines splits one word of
+# WRAPPED_QUERIES between them.
+WRAPPED = [
+    "この度は休日のところ、懇談会の運営にご支援くださり、誠にありがとうござ",
+    "います。Supports text mode and",
+    "search in every format.",
+]
+WRAPPED_QUERIES = ["ございます", "and search"]
 
 
 def codepoints(s: str) -> str:
@@ -80,6 +96,7 @@ td.cp {{ font-family: Menlo, monospace; font-size: 7pt; color: #555; }}
 <p>2列目が PDF のテキスト層に保存されている形です。</p>
 <table><tr><th>種類</th><th>PDF内の表記</th><th>コードポイント</th></tr>{rows}</table>
 <h2 style="break-before: page">本文中の例</h2>{prose}
+<h2 style="break-before: page">行をまたぐ語</h2><p>{"<br>".join(html.escape(line) for line in WRAPPED)}</p>
 </body></html>"""
 
 
