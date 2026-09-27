@@ -279,3 +279,105 @@ def test_a_word_split_across_a_pdfs_lines_is_found_in_both_modes(variants_pdf, q
     assert len(segments) == 2, query  # the highlight is on both lines
     highlighted = "\n".join(viewer.text_lines[i][a:b] for i, (a, b) in sorted(segments.items()))
     assert highlighted.replace("\n", "" if query == "ございます" else " ") == query
+
+
+def test_which_queries_are_literal():
+    for query in ("ございます", "and search", "（案）", "ｘ＊", "f(x", "第 データ"):  # "f(x": invalid, so literal
+        assert pdfless.search_query_is_literal(query), query
+    for query in ("foo.*bar", "a|b", "ござ(い|り)ます", r"\d+", "^foo"):
+        assert not pdfless.search_query_is_literal(query), query
+
+
+def test_a_regex_stays_within_a_line_unless_asked(tmp_path):
+    """Joined up, "foo.*bar" would reach from a "foo" to a "bar" any
+    number of lines on - so a regex is matched line by line, as in
+    less(1), unless ^T at the prompt turned multi-line matching on."""
+    viewer = text_viewer(tmp_path, ["foo is here", "(far away)", "and bar there", "foo bar"])
+    viewer.start_search("foo.*bar")
+    assert viewer.search_matches == [(3, 0, 7)]
+    viewer.start_search("foo.*bar", multiline=True)
+    assert viewer.search_matches[0][:2] == (0, 0)  # from line 0 on...
+    assert viewer._text_highlight_segments(viewer.search_matches[0]).keys() == {0, 1, 2, 3}
+    viewer.start_search("ござ(い|り)ます")
+    assert viewer.search_matches == []
+    viewer = text_viewer(tmp_path, ["ありがとうござ", "います"])
+    viewer.start_search("ござ(い|り)ます", multiline=True)
+    assert viewer.search_matches == [(0, 5, 7 + 1 + 3)]
+
+
+def test_ctrl_t_at_the_prompt_toggles_multi_line(tmp_path, capsys):
+    editor = pdfless._LineEditor()
+    assert editor.handle("\x14") == "changed"
+    assert editor.multiline
+    assert editor.handle("\x14") == "changed"
+    assert not editor.multiline
+    assert editor.text == ""  # ^T itself isn't typed in
+
+    viewer = text_viewer(tmp_path, ["x"])
+    capsys.readouterr()
+    viewer.draw_search_prompt("foo", 3, multiline=True)
+    assert "Multi-line /foo" in capsys.readouterr().out
+
+
+def test_the_prompt_shows_a_ctrl_t_reminder_while_there_is_room(tmp_path, capsys):
+    viewer = text_viewer(tmp_path, ["x"])
+    capsys.readouterr()
+    viewer.draw_search_prompt("foo", 3)
+    out = capsys.readouterr().out
+    assert "^T multi-line" in out
+    # ...and the cursor still ends up right after "/foo", not after the hint
+    assert out.endswith(f"\x1b[{viewer.rows};5H\x1b[?25h")
+    viewer.draw_search_prompt("foo", 3, multiline=True)
+    assert "^T single-line" in capsys.readouterr().out
+    long_query = "x" * (viewer.cols - 5)
+    viewer.draw_search_prompt(long_query, len(long_query))
+    assert "^T" not in capsys.readouterr().out
+
+
+def test_a_regex_stays_within_a_printed_line_in_a_pdf(sample_pdf):
+    """In the page/bbox index a page is one run of words, so
+    "labore.*labore" would box half a page, from one "labore" to
+    another lines on - a regex is matched one printed line at a time,
+    unless ^T turned multi-line on."""
+    handler = pdfless.PdfDocument(sample_pdf)
+    index = handler.build_search_index()
+    line_height = max(w[5] - w[3] for w in index[1]["words"])
+    per_line = handler.find_search_matches(index, "labore.*labore")
+    assert per_line and all(m[4] - m[2] <= line_height for m in per_line)
+    across = handler.find_search_matches(index, "labore.*labore", multiline=True)
+    assert max(m[4] - m[2] for m in across) > 10 * line_height
+
+
+def test_printed_lines_are_found_in_both_word_orders():
+    page = page_of(
+        ("first", 50, 100, 90, 112), ("line", 95, 100, 120, 112),
+        ("second", 50, 120, 100, 132),
+        ("right", 300, 100, 340, 112),  # a second column, read after the first
+    )
+    assert [page["text"][a:b] for a, b in page["lines"]] == ["first line", "second", "right"]
+    rows = page["rows"]
+    assert [rows["text"][a:b] for a, b in rows["lines"]] == ["first line right", "second"]
+    assert pdfless.PdfDocument.find_search_matches([page], "first.*second") == []
+    assert pdfless.PdfDocument.find_search_matches([page], "line.*right") != []  # the same screen row
+
+
+def test_a_full_width_space_can_be_typed_at_the_prompt():
+    """str.isprintable() is False for "　" (U+3000), which a Japanese
+    input method types - the prompt still takes it."""
+    editor = pdfless._LineEditor()
+    for key in "ゲーム　ボーナス":
+        editor.handle(key)
+    assert editor.text == "ゲーム　ボーナス"
+    assert editor.handle("\t") is None  # other non-printables are still swallowed
+
+
+def test_a_space_alone_is_boxed_as_the_gap_between_two_words():
+    """A PDF has no space characters - the index joins its words with
+    them - so a search for " " is boxed as the gap between two words on
+    the same line, and a line break isn't boxed at all."""
+    page = page_of(
+        ("foo", 50, 100, 80, 112), ("bar", 90, 100, 120, 112),
+        ("baz", 50, 120, 80, 132),
+    )
+    assert pdfless.PdfDocument.find_search_matches([page], " ") == [(1, 80, 100, 90, 112)]
+    assert pdfless.PdfDocument.find_search_matches([page], "　") == [(1, 80, 100, 90, 112)]

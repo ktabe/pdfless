@@ -330,6 +330,8 @@ Keys:
                           substring if it isn't valid regex syntax)
   ?<regex> ENTER          the same search, landing on the last match
                           before here instead
+  ^T (while typing)       let a regex match across line breaks (a plain
+                          string always may)
   / ENTER  ? ENTER        repeat the last search pattern, forward / back
   N P                     jump to next / previous search match
                             <CHANGING FILES>
@@ -2333,6 +2335,36 @@ def _is_unspaced_script(ch: str) -> bool:
     return any(lo <= code <= hi for lo, hi in _UNSPACED_SCRIPT_RANGES)
 
 
+# ASCII characters with a meaning in Python's regex syntax.
+_REGEX_METACHARS = frozenset(".^$*+?{}[]\\|()")
+
+
+def search_query_is_literal(query: str) -> bool:
+    """Whether `query` matches only its own characters - no regex syntax
+    in it (full-width "（" or "＊" from an input method doesn't count:
+    see compile_search_pattern()), or none that's valid, since an invalid
+    regex is searched for literally. Such a query can't reach further
+    than itself, so text mode lets it match across line breaks by
+    default (see Viewer._find_all_text_matches()).
+
+    Args:
+        query: the search as typed.
+
+    Returns:
+        True for a literal query.
+    """
+    try:
+        re.compile(query)
+    except re.error:
+        return True
+    return not any(
+        ch in _REGEX_METACHARS
+        for seg_start, seg_end in _search_segments(query)
+        if unicodedata.normalize("NFKC", query[seg_start:seg_end]) == query[seg_start:seg_end]
+        for ch in query[seg_start:seg_end]
+    )
+
+
 def _search_segments(text: str) -> Iterator[tuple[int, int]]:
     """Cut `text` into the pieces normalize_for_search() normalizes one
     at a time: a character plus any combining marks after it, since NFKC
@@ -2607,8 +2639,11 @@ class DocumentHandler:
         PdfDocument.build_search_index() for its shape)."""
         return None
 
-    def find_search_matches(self, index: list[dict[str, Any]], query: str) -> list[BBoxMatch]:
-        """Every match for `query` in a build_search_index() index."""
+    def find_search_matches(
+        self, index: list[dict[str, Any]], query: str, multiline: bool = False,
+    ) -> list[BBoxMatch]:
+        """Every match for `query` in a build_search_index() index - see
+        PdfDocument.find_search_matches() for `multiline`."""
         return []
 
     def text_mode_is_paginated(self) -> bool:
@@ -2922,13 +2957,15 @@ class PdfDocument(DocumentHandler):
         the order they appear in on screen: a table row laid out cell by
         cell can come out with its cells out of order (a cell ahead of
         the one left of it). So "rows" is the same words again, sorted
-        into rows as they appear on the page (see _screen_row_order()):
+        into rows as they appear on the page (see _screen_rows()):
         {"text": str, "words": [...like "words"...], "order": [the
         index in "words" of each of them]} - or None when that's the order
         they're already in. find_search_matches() searches both.
 
+        "lines" (in both) holds each printed line's (start, end) offsets
+        in its "text", for a regex matched one line at a time.
         find_search_matches() also adds normalize_for_search() of each
-        "text" as "normalized" the first time it searches it."""
+        "text" (or of its lines) the first time it searches it."""
         out = self._poppler_stdout(
             "pdftotext", self.path, self.password, "-bbox", to_stdout=True,
         )
@@ -2957,30 +2994,60 @@ class PdfDocument(DocumentHandler):
         Returns:
             The entry, with "rows" filled in.
         """
-        text, words = PdfDocument._join_words(found)
-        order = PdfDocument._screen_row_order(found)
+        text, words, lines = PdfDocument._join_words(found, PdfDocument._stream_line_starts(found))
+        screen_rows = PdfDocument._screen_rows(found)
+        order = [i for row in screen_rows for i in row]
         rows = None
         if order != list(range(len(found))):
-            row_text, row_words = PdfDocument._join_words([found[i] for i in order])
-            rows = {"text": row_text, "words": row_words, "order": order}
+            row_starts: list[int] = []
+            for row in screen_rows[:-1]:
+                row_starts.append((row_starts[-1] if row_starts else 0) + len(row))
+            row_text, row_words, row_lines = PdfDocument._join_words(
+                [found[i] for i in order], [0] + row_starts,
+            )
+            rows = {"text": row_text, "words": row_words, "lines": row_lines, "order": order}
         return {
             "width_pt": width_pt, "height_pt": height_pt,
-            "text": text, "words": words, "rows": rows,
+            "text": text, "words": words, "lines": lines, "rows": rows,
         }
 
     @staticmethod
-    def _join_words(
-        found: list[tuple[str, float, float, float, float]],
-    ) -> tuple[str, list[tuple[int, int, float, float, float, float]]]:
-        """Join words into one searchable string, a space between each.
+    def _stream_line_starts(found: list[tuple[str, float, float, float, float]]) -> list[int]:
+        """Where each printed line starts among words in pdftotext's own
+        order: a word begins a new line unless it's on the same line as
+        the one before - overlapping it vertically by at least half the
+        shorter one's height - and further right.
 
         Args:
             found: (text, xMin, yMin, xMax, yMax) of each word, in order.
 
         Returns:
-            (text, words): the joined string, and each word's
+            The index in `found` of each line's first word.
+        """
+        starts = []
+        for i, (_text, xmin, ymin, _xmax, ymax) in enumerate(found):
+            if i:
+                _p_text, p_xmin, p_ymin, _p_xmax, p_ymax = found[i - 1]
+                overlap = min(p_ymax, ymax) - max(p_ymin, ymin)
+                if overlap >= 0.5 * min(p_ymax - p_ymin, ymax - ymin) and xmin >= p_xmin:
+                    continue
+            starts.append(i)
+        return starts
+
+    @staticmethod
+    def _join_words(
+        found: list[tuple[str, float, float, float, float]], line_starts: list[int],
+    ) -> tuple[str, list[tuple[int, int, float, float, float, float]], list[tuple[int, int]]]:
+        """Join words into one searchable string, a space between each.
+
+        Args:
+            found: (text, xMin, yMin, xMax, yMax) of each word, in order.
+            line_starts: the index in `found` of each line's first word.
+
+        Returns:
+            (text, words, lines): the joined string; each word's
             (start, end, xMin, yMin, xMax, yMax) with (start, end) its
-            offsets in it.
+            offsets in it; and each line's (start, end) offsets in it.
         """
         parts = []
         words = []
@@ -2989,19 +3056,23 @@ class PdfDocument(DocumentHandler):
             parts.append(word_text)
             words.append((offset, offset + len(word_text), xmin, ymin, xmax, ymax))
             offset += len(word_text) + 1
-        return " ".join(parts) + (" " if parts else ""), words
+        bounds = list(line_starts) + [len(found)]
+        lines = [
+            (words[a][0], words[b - 1][1]) for a, b in zip(bounds, bounds[1:]) if a < b
+        ]
+        return " ".join(parts) + (" " if parts else ""), words, lines
 
     @staticmethod
-    def _screen_row_order(found: list[tuple[str, float, float, float, float]]) -> list[int]:
-        """The order words appear in on screen, row by row: words whose
-        vertical extents overlap by at least half the shorter one's height
-        share a row; rows go top to bottom, words in a row left to right.
+    def _screen_rows(found: list[tuple[str, float, float, float, float]]) -> list[list[int]]:
+        """The rows words appear in on screen: words whose vertical extents
+        overlap by at least half the shorter one's height share a row;
+        rows go top to bottom, words in a row left to right.
 
         Args:
             found: (text, xMin, yMin, xMax, yMax) of each word.
 
         Returns:
-            The indices into `found`, in that order.
+            Each row's indices into `found`, in that order.
         """
         by_middle = sorted(range(len(found)), key=lambda i: found[i][2] + found[i][4])
         rows: list[list[int]] = []
@@ -3016,7 +3087,7 @@ class PdfDocument(DocumentHandler):
                     continue
             rows.append([i])
             row_top, row_bottom = ymin, ymax
-        return [i for row in rows for i in sorted(row, key=lambda i: found[i][1])]
+        return [sorted(row, key=lambda i: found[i][1]) for row in rows]
 
     @staticmethod
     def _resolve_link_dest(
@@ -3206,7 +3277,9 @@ class PdfDocument(DocumentHandler):
         return entries
 
     @staticmethod
-    def find_search_matches(index: list[dict[str, Any]], query: str) -> list[BBoxMatch]:
+    def find_search_matches(
+        index: list[dict[str, Any]], query: str, multiline: bool = False,
+    ) -> list[BBoxMatch]:
         """Return every match of `query` (a case-insensitive regex, or a
         literal substring if it isn't valid regex syntax, matched through
         normalize_for_search() - so "第5回" also finds "第５回") across the whole
@@ -3216,8 +3289,13 @@ class PdfDocument(DocumentHandler):
 
         Each page is searched in both of build_search_index()'s word
         orders - pdftotext's and the on-screen rows - and a match found in
-        both counts once."""
+        both counts once. A literal query (see search_query_is_literal())
+        or any query with `multiline` (^T at the prompt) is matched against
+        a whole page at once, so it can run across line breaks; any other
+        regex, one printed line at a time - "labore.*labore" would
+        otherwise reach from one to another half a page on."""
         pattern = compile_search_pattern(query)
+        across_lines = multiline or search_query_is_literal(query)
         matches: list[BBoxMatch] = []
         for page_num, page in enumerate(index, start=1):
             views = [page]
@@ -3228,21 +3306,48 @@ class PdfDocument(DocumentHandler):
             # for the same match, and what puts them in reading order.
             found: dict[tuple[int, int], tuple[float, float, float, float]] = {}
             for view in views:
-                # Normalized once per page and kept in the index, which
-                # the Viewer holds on to across searches.
-                if "normalized" not in view:
-                    view["normalized"] = normalize_for_search(view["text"])
                 order = view.get("order")
-                for pos, match_end in search_spans(pattern, view["text"], view["normalized"]):
+                for pos, match_end in PdfDocument._view_spans(pattern, view, across_lines):
                     hit = PdfDocument._match_box(view["words"], pos, match_end)
                     if hit is None:
-                        continue  # only the spaces between words
+                        continue  # a line break (see _gap_box())
                     word_idx, local_start, box = hit
                     key = (order[word_idx] if order is not None else word_idx, local_start)
                     found.setdefault(key, box)
             for key in sorted(found):
                 matches.append((page_num, *found[key]))
         return matches
+
+    @staticmethod
+    def _view_spans(
+        pattern: re.Pattern[str], view: dict[str, Any], across_lines: bool,
+    ) -> Iterator[tuple[int, int]]:
+        """search_spans() of `pattern` in one of a page's word orders (see
+        build_search_index()), as a whole or line by line.
+
+        Args:
+            pattern: from compile_search_pattern().
+            view: the page entry, or its "rows".
+            across_lines: search the whole text at once, rather than each
+                of view["lines"] on its own.
+
+        Returns:
+            (start, end) offsets of each match in view["text"].
+        """
+        # Normalized once and kept in the index, which the Viewer holds
+        # on to across searches.
+        if across_lines:
+            if "normalized" not in view:
+                view["normalized"] = normalize_for_search(view["text"])
+            yield from search_spans(pattern, view["text"], view["normalized"])
+            return
+        if "normalized_lines" not in view:
+            view["normalized_lines"] = [
+                normalize_for_search(view["text"][a:b]) for a, b in view["lines"]
+            ]
+        for (a, b), normalized in zip(view["lines"], view["normalized_lines"]):
+            for start, end in search_spans(pattern, view["text"][a:b], normalized):
+                yield a + start, a + end
 
     @staticmethod
     def _match_box(
@@ -3258,7 +3363,7 @@ class PdfDocument(DocumentHandler):
         Returns:
             (index of the first word it touches, its offset in that word,
             (xMin, yMin, xMax, yMax) - the union of every word it
-            touches), or None if it touches no word at all.
+            touches), or - touching no word at all - _gap_box().
         """
         box = None
         first = None
@@ -3286,8 +3391,35 @@ class PdfDocument(DocumentHandler):
                     box[2] = max(box[2], sub_xmax)
                     box[3] = max(box[3], ymax)
         if box is None or first is None:
-            return None
+            return PdfDocument._gap_box(words, pos, match_end)
         return first[0], first[1], (box[0], box[1], box[2], box[3])
+
+    @staticmethod
+    def _gap_box(
+        words: list[tuple[int, int, float, float, float, float]], pos: int, match_end: int,
+    ) -> tuple[int, int, tuple[float, float, float, float]] | None:
+        """_match_box() for a match that touches no word: only the space
+        joining two words (a search for " "), which isn't in the PDF
+        itself - boxed as the gap between those two words, if they're on
+        the same printed line.
+
+        Args:
+            words, pos, match_end: as for _match_box().
+
+        Returns:
+            (index of the word after the gap, -1 - so it sorts ahead of
+            any match inside that word, (xMin, yMin, xMax, yMax) of the
+            gap), or None if the gap is a line break.
+        """
+        k = bisect.bisect_right([w[0] for w in words], pos)  # the first word after it
+        if not 0 < k < len(words) or not (words[k - 1][1] <= pos and match_end <= words[k][0]):
+            return None
+        _s, _e, _xmin, p_ymin, p_xmax, p_ymax = words[k - 1]
+        _s, _e, n_xmin, n_ymin, _xmax, n_ymax = words[k]
+        overlap = min(p_ymax, n_ymax) - max(p_ymin, n_ymin)
+        if overlap < 0.5 * min(p_ymax - p_ymin, n_ymax - n_ymin) or n_xmin < p_xmax:
+            return None
+        return k, -1, (p_xmax, min(p_ymin, n_ymin), n_xmin, max(p_ymax, n_ymax))
 
     def supports_text_mode(self) -> bool:
         return True
@@ -3896,9 +4028,11 @@ class RenderedDocument(DocumentHandler):
             return self._pdf_delegate.build_search_index()
         return None
 
-    def find_search_matches(self, index: list[dict[str, Any]], query: str) -> list[BBoxMatch]:
+    def find_search_matches(
+        self, index: list[dict[str, Any]], query: str, multiline: bool = False,
+    ) -> list[BBoxMatch]:
         if self._pdf_delegate is not None:
-            return self._pdf_delegate.find_search_matches(index, query)
+            return self._pdf_delegate.find_search_matches(index, query, multiline)
         return []
 
     def _source_for_page(self, cache: PageCache, page: int) -> str:
@@ -5643,6 +5777,10 @@ class Viewer:
         self._history_back: list[tuple[int, int, int]] = []  # [(page, scroll, x_offset), ...]
         self._history_forward: list[tuple[int, int, int]] = []
         self.search_query: str | None = None
+        # Whether a regex search may match across line breaks (^T at the
+        # search prompt) - see _find_all_text_matches() and
+        # PdfDocument.find_search_matches().
+        self.search_multiline = False
         self.search_matches: Sequence[SearchMatch] = []
         self.search_pos: int | None = None
         # A plain text file has no image view at all - it's permanently
@@ -7299,6 +7437,9 @@ class Viewer:
         The lines are searched joined together, so a match can run across
         a line break - a PDF's text comes one printed line at a time, so
         a paragraph's words are often split between two ("ござ" / "います").
+        That's only for a literal query (see search_query_is_literal()),
+        or with self.search_multiline on: otherwise a regex is matched
+        one line at a time.
         The line break is whitespace like any other to
         normalize_for_search(): dropped next to Japanese or Chinese, one
         space between Latin words. Such a match's `end` counts on past
@@ -7309,6 +7450,14 @@ class Viewer:
         pattern = compile_search_pattern(self.search_query)
         start, end = line_range if line_range else (0, len(self.text_lines))
         results = []
+        if not (self.search_multiline or search_query_is_literal(self.search_query)):
+            # A regex - "foo.*bar" - stays within one line, as in less(1),
+            # unless ^T at the prompt said otherwise: joined up, ".*" would
+            # reach from one "foo" to a "bar" any number of lines on.
+            for i in range(start, end):
+                if i not in self._text_separator_lines:
+                    results.extend(self._find_text_matches_in_block(pattern, i, i + 1))
+            return results
         block_start = start
         # Blocks of consecutive lines between separators, each searched
         # as one string.
@@ -8278,10 +8427,15 @@ class Viewer:
         sys.stdout.write(self.format_status(text) + "\x1b[?25l")
         sys.stdout.flush()
 
-    def draw_search_prompt(self, buf: str, cursor: int, backward: bool = False) -> None:
+    def draw_search_prompt(
+        self, buf: str, cursor: int, backward: bool = False, multiline: bool = False,
+    ) -> None:
         """The search pattern being typed, echoed on the status line
         behind the prompt character it was opened with - "/" forward,
-        "?" backward, the same as less(1) shows them. `cursor` is the
+        "?" backward, the same as less(1) shows them - and "Multi-line"
+        ahead of that while ^T is on (the way less(1) names its own
+        search modifiers there), with a reminder of ^T at the right end
+        while there's room for it. `cursor` is the
         index into `buf` (in Python characters, not columns) the next
         inserted/deleted character applies at - not necessarily
         len(buf), since ^B/^F/LEFT/RIGHT can move it back into the
@@ -8297,7 +8451,7 @@ class Viewer:
         # filled) with the status color first, via \x1b[2K, and the color
         # is left active (not reset) so text typed via IME composition
         # picks it up too; draw_status() resets it on the next full redraw.
-        prefix = "?" if backward else "/"
+        prefix = ("Multi-line " if multiline else "") + ("?" if backward else "/")
         text = truncate_to_width(f"{prefix}{buf}", self.cols)
         # The terminal cursor's column, not buf's: it sits after the
         # prompt character plus every column `buf[:cursor]` occupies -
@@ -8309,8 +8463,18 @@ class Viewer:
         # whole time pdfless owns the screen (see the entry-screen write
         # in main()) - positioned at `col` so it tracks mid-string edits
         # too (draw_status() hides it again once the prompt closes).
+        # A reminder of ^T at the right end, saying what pressing
+        # it would do next - left out once the query itself needs the room.
+        # Drawn before `text`, and the cursor put back after `text` as
+        # always, so it's never where typing (or the IME) goes.
+        hint = "^T single-line" if multiline else "^T multi-line"
+        hint_out = ""
+        if display_width(text) + 2 + display_width(hint) <= self.cols:
+            hint_col = self.cols - display_width(hint) + 1
+            hint_out = f"\x1b[{self.rows};{hint_col}H{hint}"
         sys.stdout.write(
-            f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K{text}"
+            f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K{hint_out}"
+            f"\x1b[{self.rows};1H{text}"
             f"\x1b[{self.rows};{col}H\x1b[?25h"
         )
         sys.stdout.flush()
@@ -8633,15 +8797,19 @@ class Viewer:
         where a real PDF delegate's bbox index should still be used."""
         return self.text_mode and not self.doc_handler.text_mode_is_paginated()
 
-    def start_search(self, query: str, backward: bool = False) -> None:
+    def start_search(self, query: str, backward: bool = False, multiline: bool = False) -> None:
         """Search the whole document for `query` and jump to one match -
         which one depends on where you are now and on `backward`, i.e.
         on whether the prompt was opened with "?" rather than "/" (see
         _match_index_from()). N/P walk every match from there on,
-        regardless of the direction this started in."""
+        regardless of the direction this started in. `multiline` (^T at
+        the prompt) lets a regex match across line breaks, as a literal
+        query always may - see _find_all_text_matches() and
+        PdfDocument.find_search_matches()."""
         if not query:
             return
         self.search_query = query
+        self.search_multiline = multiline
         if self._search_uses_text_lines():
             # No page/bbox structure for a non-paginated document
             # (plain text/RTF, or Markdown currently in text mode) -
@@ -8664,7 +8832,7 @@ class Viewer:
             self.draw_status("building search index...")
             self._search_index = self.doc_handler.build_search_index()
         self.search_matches = (
-            self.doc_handler.find_search_matches(self._search_index, query)
+            self.doc_handler.find_search_matches(self._search_index, query, multiline)
             if self._search_index is not None else []  # nothing to search
         )
         if not self.search_matches:
@@ -9238,13 +9406,16 @@ class _LineEditor:
     END jump it to the start/end, backspace and ^D/DEL delete before/
     under it, and ^U/^K kill from it to the start/end (DEL is the one
     exception to readline, added for the plain Delete key on keyboards
-    without an easy ^D). Enter submits, Esc/^C cancel, and so does
-    backspace on an already-empty line. Every other key is swallowed, so
-    nothing leaks through as a page command while the prompt is up."""
+    without an easy ^D). ^T turns on (or off again) matching a regex
+    across line breaks (see Viewer._find_all_text_matches()). Enter
+    submits, Esc/^C cancel, and so does backspace on an already-empty
+    line. Every other key is swallowed, so nothing leaks through as a
+    page command while the prompt is up."""
 
     def __init__(self) -> None:
         self.text = ""
         self.cursor = 0  # index into text the next edit applies at
+        self.multiline = False  # ^T - see Viewer.start_search()
 
     def handle(self, key: str) -> str | None:
         """Apply `key`: returns "submit", "cancel", "changed" (redraw the
@@ -9273,7 +9444,12 @@ class _LineEditor:
             text, cursor = text[cursor:], 0
         elif key == "\x0b":  # ^K: kill from the cursor to the end
             text = text[:cursor]
-        elif len(key) == 1 and key.isprintable():
+        elif key == "\x14":  # ^T: toggle matching across line breaks
+            self.multiline = not self.multiline
+            return "changed"
+        elif len(key) == 1 and (key.isprintable() or unicodedata.category(key) == "Zs"):
+            # Zs too: str.isprintable() is False for every space but " " -
+            # the full-width "　" a Japanese input method types included.
             text, cursor = text[:cursor] + key + text[cursor:], cursor + 1
         if (text, cursor) == (self.text, self.cursor):
             return None
@@ -9533,10 +9709,11 @@ def run_viewer(
                 outcome = search_editor.handle(key)
                 if outcome == "submit":
                     query = search_editor.text or last_search_query
+                    multiline = search_editor.multiline
                     search_editor = None
                     if query:
                         last_search_query = query
-                        viewer.start_search(query, backward=search_backward)
+                        viewer.start_search(query, backward=search_backward, multiline=multiline)
                     else:
                         viewer.draw_status()
                 elif outcome == "cancel":
@@ -9545,6 +9722,7 @@ def run_viewer(
                 elif outcome == "changed":
                     viewer.draw_search_prompt(
                         search_editor.text, search_editor.cursor, backward=search_backward,
+                        multiline=search_editor.multiline,
                     )
                 continue
 
