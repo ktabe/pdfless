@@ -189,6 +189,9 @@ edit the input. These bindings apply only while the search prompt is active.
 
 Search is case-insensitive and supports
 [Python regular expressions](https://docs.python.org/3/library/re.html).
+It also ignores Unicode width and composition differences (NFKC):
+`第5回` finds `第５回`, `データ` finds half-width `ﾃﾞｰﾀ` or decomposed kana,
+and `file` finds the `ﬁ` ligature.
 An invalid regular expression is treated as literal text. Matches are boxed
 in PDF image mode and highlighted in text mode.
 

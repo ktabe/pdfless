@@ -2246,14 +2246,122 @@ def read_plain_text_lines(path: str, tab_width: int = 8) -> list[str]:
 
 
 def compile_search_pattern(query: str) -> re.Pattern[str]:
-    """Compile `query` as a case-insensitive regex. If it isn't valid
-    regex syntax (e.g. a literal query like "C++" - "+" repeating nothing
-    is a regex error), fall back to matching it literally instead of
-    just failing the search."""
+    """Compile `query` as a case-insensitive regex, NFKC-normalized to
+    match the text it's run against (see normalize_for_search()). If it
+    isn't valid regex syntax (e.g. a literal query like "C++" - "+"
+    repeating nothing is a regex error), fall back to matching it
+    literally instead of just failing the search.
+
+    Only what the user typed as regex syntax counts as such: a part that
+    normalizing changes (full-width "（案）", "＊" from a Japanese input
+    method) is matched literally, not as the "(", "*" it becomes.
+
+    Args:
+        query: the search as typed.
+
+    Returns:
+        The pattern, for search_spans()."""
+    parts = []
+    for seg_start, seg_end in _search_segments(query):
+        segment = query[seg_start:seg_end]
+        normalized = unicodedata.normalize("NFKC", segment)
+        parts.append(segment if normalized == segment else re.escape(normalized))
     try:
-        return re.compile(query, re.IGNORECASE)
+        return re.compile("".join(parts), re.IGNORECASE)
     except re.error:
-        return re.compile(re.escape(query), re.IGNORECASE)
+        return re.compile(re.escape(normalize_for_search(query)[0]), re.IGNORECASE)
+
+
+def _search_segments(text: str) -> Iterator[tuple[int, int]]:
+    """Cut `text` into the pieces normalize_for_search() normalizes one
+    at a time: a character plus any combining marks after it, since NFKC
+    may fuse those into one character.
+
+    Args:
+        text: the text (or query) to cut.
+
+    Returns:
+        (start, end) offsets of each piece, in order, covering all of `text`.
+    """
+    seg_start = 0
+    for i in range(1, len(text)):
+        # A combining mark (or one in disguise: half-width "ﾞ" is U+3099
+        # once normalized) stays with the character before it.
+        if not unicodedata.combining(unicodedata.normalize("NFKC", text[i])[0]):
+            yield seg_start, i
+            seg_start = i
+    if text:
+        yield seg_start, len(text)
+
+
+# One normalize_for_search() result: the normalized text, plus - unless
+# it's the text itself, unchanged - where each of its characters came
+# from (see there).
+NormalizedText = Tuple[str, Union[List[int], None], Union[List[int], None]]
+
+
+def normalize_for_search(text: str) -> NormalizedText:
+    """NFKC-normalize `text` for searching, so that a query typed one way
+    finds text stored another: decomposed kana (NFD "ク" + U+3099, common
+    in PDFs made from macOS file names) or Latin, full-width ASCII
+    ("第５回"), half-width katakana ("ﾃﾞｰﾀ"), circled digits, ligatures
+    ("ﬁle", common in LaTeX PDFs) and the like.
+
+    Normalizing changes the text's length, so it also records where each
+    normalized character came from, for mapping a match back onto the
+    original text (see search_spans()). Each of _search_segments()'s
+    pieces is normalized on its own, so every normalized character
+    belongs to exactly one piece of the original.
+
+    Args:
+        text: the text to search (or a query).
+
+    Returns:
+        (normalized, starts, ends): starts[i]/ends[i] are the original
+        offsets of the segment normalized[i] came from. Both are None when
+        `text` is already NFKC - the common case, checked at C speed - and
+        offsets carry over unchanged.
+    """
+    if text.isascii() or unicodedata.is_normalized("NFKC", text):
+        return text, None, None
+    pieces: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+
+    for seg_start, seg_end in _search_segments(text):
+        piece = unicodedata.normalize("NFKC", text[seg_start:seg_end])
+        pieces.append(piece)
+        starts.extend([seg_start] * len(piece))
+        ends.extend([seg_end] * len(piece))
+    return "".join(pieces), starts, ends
+
+
+def search_spans(
+    pattern: re.Pattern[str], text: str, normalized: NormalizedText | None = None,
+) -> Iterator[tuple[int, int]]:
+    """Every match of `pattern` (from compile_search_pattern()) in `text`,
+    matched against its normalize_for_search() form.
+
+    Args:
+        pattern: the compiled query.
+        text: the text to search.
+        normalized: normalize_for_search(text), if the caller has it
+            cached; computed here otherwise.
+
+    Returns:
+        (start, end) offsets into the original `text`, widened to whole
+        segments - so a highlight never splits a character from its
+        combining marks. Zero-width matches (e.g. a pattern like "x*")
+        are skipped.
+    """
+    norm_text, starts, ends = normalized if normalized is not None else normalize_for_search(text)
+    for m in pattern.finditer(norm_text):
+        if m.start() == m.end():
+            continue
+        if starts is None or ends is None:
+            yield m.start(), m.end()
+        else:
+            yield starts[m.start()], ends[m.end() - 1]
 
 
 
@@ -2645,7 +2753,9 @@ class PdfDocument(DocumentHandler):
         -bbox) for searching. Returns a list, one entry per page, each
         {"width_pt": float, "height_pt": float, "text": str,
         "words": [(start, end, xMin, yMin, xMax, yMax), ...]} (all in points)
-        where (start, end) are offsets into "text" for that word."""
+        where (start, end) are offsets into "text" for that word.
+        find_search_matches() adds each page's normalize_for_search() of
+        "text" as "normalized" the first time it searches it."""
         out = self._poppler_stdout(
             "pdftotext", self.path, self.password, "-bbox", to_stdout=True,
         )
@@ -2867,17 +2977,19 @@ class PdfDocument(DocumentHandler):
     @staticmethod
     def find_search_matches(index: list[dict[str, Any]], query: str) -> list[BBoxMatch]:
         """Return every match of `query` (a case-insensitive regex, or a
-        literal substring if it isn't valid regex syntax) across the whole
+        literal substring if it isn't valid regex syntax, matched through
+        normalize_for_search() - so "第5回" also finds "第５回") across the whole
         document, as a list of (page_number, xMin, yMin, xMax, yMax) bounding
         boxes (in points, the union of every word the match touches), in
         reading order."""
         pattern = compile_search_pattern(query)
         matches = []
         for page_num, page in enumerate(index, start=1):
-            for m in pattern.finditer(page["text"]):
-                pos, match_end = m.start(), m.end()
-                if pos == match_end:
-                    continue  # skip zero-width matches (e.g. a pattern like "x*")
+            # Normalized once per page and kept in the index, which the
+            # Viewer holds on to across searches.
+            if "normalized" not in page:
+                page["normalized"] = normalize_for_search(page["text"])
+            for pos, match_end in search_spans(pattern, page["text"], page["normalized"]):
                 box = None
                 for word_start, word_end, xmin, ymin, xmax, ymax in page["words"]:
                     if word_start < match_end and word_end > pos:
@@ -6909,10 +7021,8 @@ class Viewer:
         for i in range(start, end):
             if i in self._text_separator_lines:
                 continue  # drawn as a rule, not text - see _text_separator_rule()
-            line = self.text_lines[i]
-            for m in pattern.finditer(line):
-                if m.start() != m.end():
-                    results.append((i, m.start(), m.end()))
+            for match_start, match_end in search_spans(pattern, self.text_lines[i]):
+                results.append((i, match_start, match_end))
         return results
 
     def _text_search_highlight(self) -> TextMatch | None:
