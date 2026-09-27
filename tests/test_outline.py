@@ -183,3 +183,18 @@ def test_a_long_outline_scrolls_with_the_selection(sample_pdf, tmp_path, monkeyp
     assert viewer.outline_scroll == 60 - content_h
     viewer.handle_outline_key("g")
     assert (viewer.outline_sel, viewer.outline_scroll) == (0, 0)
+
+
+def test_the_box_blanks_its_cells_before_drawing_over_them(outlined_pdf, monkeypatch, capsys):
+    """Over text mode's lines, a box cell can be the right half of a
+    double-width character, and a wide character of the box's written
+    there shifts the rest of the row in iTerm2 - so every row of the box
+    is blanked with plain spaces first, before any of it is drawn."""
+    viewer = make_viewer(outlined_pdf, monkeypatch)
+    capsys.readouterr()
+    viewer.show_outline()
+    out = capsys.readouterr().out
+    row0, col0, content_h, content_w = viewer._outline_box()
+    first_border = out.index(f"\x1b[{row0};{col0}H┌")
+    for row in range(row0, row0 + content_h + 2):
+        assert out.index(f"\x1b[{row};{col0}H{' ' * (content_w + 4)}") < first_border
