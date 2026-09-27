@@ -186,17 +186,35 @@ edit the input. These bindings apply only while the search prompt is active.
 | `^K` | Delete from the cursor to the end of the input. |
 | `^D`, `Delete` | Delete the character to the right of the cursor. |
 | `^H`, `Backspace` | Delete the character to the left of the cursor. |
+| `^T` | Toggle whether a regular expression may match across line breaks (shown as `Multi-line` in the prompt). |
 
 Search is case-insensitive and supports
 [Python regular expressions](https://docs.python.org/3/library/re.html).
-It also ignores Unicode width and composition differences (NFKC):
+Before matching, it normalizes Unicode width and composition (NFKC):
 `第5回` finds `第５回`, `データ` finds half-width `ﾃﾞｰﾀ` or decomposed kana,
 and `file` finds the `ﬁ` ligature. Spaces next to Japanese or Chinese text
-are ignored, so `Xプロジェクト` also finds the `X プロジェクト` a Word
-document's PDF often reads as; elsewhere, any run of spaces matches one space.
-A match can also run across a line break, as a paragraph's words in a PDF often do.
-An invalid regular expression is treated as literal text. Matches are boxed
-in PDF image mode and highlighted in text mode.
+are ignored, so `プロジェクトX` also finds the `プロジェクト X` a Word
+document's PDF often reads as. Elsewhere, any run of spaces matches one space.
+
+The kind of pattern determines how line breaks are handled:
+
+- A pattern without regular-expression syntax is searched as a literal string
+  and may cross line breaks. An invalid regular expression is also treated as
+  literal text.
+- A valid regular expression matches within one printed line, as in `less`.
+  While entering the pattern, press `^T` to toggle `Multi-line` mode and let
+  it match across line breaks as well.
+
+For example:
+
+| Pattern | Also finds |
+| --- | --- |
+| `第5回` | `第５回` |
+| `プロジェクトX` | `プロジェクト X` |
+| `project plan` | `project` at the end of one line and `plan` at the start of the next |
+| `project.*plan` with `^T` | `project` and `plan` across one or more line breaks |
+
+Matches are boxed in PDF image mode and highlighted in text mode.
 
 Search requires text: it is available for PDFs with extractable text, plain
 text files, and supported formats rendered to PDF. It is unavailable for

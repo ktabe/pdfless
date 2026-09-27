@@ -11,6 +11,7 @@ kind=="text" file (it starts permanently in text mode)."""
 
 import os
 import signal
+import re
 import time
 
 from conftest import requires_office_support, requires_macos
@@ -327,7 +328,10 @@ def test_question_mark_opens_a_backward_search_prompt(pty_session, sample_text):
     session.send(b"?")
     out = session.read_all(0.5).decode(errors="replace")
     assert "q to close help" not in out  # no longer the help key
-    assert "\x1b[2K?" in out  # the prompt, echoed with its own "?" right after clearing the line
+    # The prompt: the line cleared, then its own "?" echoed at column 1
+    # (after the ^T reminder drawn at the right end).
+    assert re.search(r"\x1b\[2K.*\x1b\[\d+;1H\?", out)
+    assert "^T multi-line" in out
     assert out.rstrip().endswith("\x1b[?25h")  # then the real cursor is shown at the prompt
 
     session.send(b"line\r")
