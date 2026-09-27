@@ -37,6 +37,7 @@ import hashlib
 import html
 import io
 import json
+import logging
 import os
 import pathlib
 import plistlib
@@ -59,6 +60,12 @@ from collections import OrderedDict, deque
 from typing import Any, Callable, Iterator, List, NoReturn, Protocol, Sequence, Tuple, Union, cast
 
 from PIL import ExifTags, Image, ImageChops, ImageOps
+
+# pypdf (link/outline extraction) reports a malformed PDF's quirks - e.g.
+# "Ignoring wrong pointing object" - through the logging module, whose
+# last-resort handler prints them on stderr: straight over the page on
+# screen. It recovers from those on its own, so they're only noise here.
+logging.getLogger("pypdf").setLevel(logging.CRITICAL + 1)
 
 # Type aliases for the shapes that travel between functions here. Spelled
 # with typing's generics rather than `X | Y`, since these (unlike the
@@ -209,15 +216,24 @@ FOCUS_OFF = "\x1b[?1004l"
 
 
 def char_width(ch: str) -> int:
-    """Terminal column width of one character: 2 for wide/fullwidth East
-    Asian characters (e.g. most Japanese/Chinese/Korean text), 1 otherwise.
+    """Terminal column width of one character: 0 for a combining mark,
+    2 for wide/fullwidth East Asian characters (e.g. most Japanese/
+    Chinese/Korean text), 1 otherwise.
     Needed because the status line is truncated/padded to fit exactly
     self.cols columns - doing that by Python string length (len()) rather
     than actual terminal column width overshoots whenever the text
     contains such characters, since each one is 1 Python character but 2
     terminal columns; that overshoot pushes the write past the last
     column of the last row, and autowrap then scrolls the whole screen up
-    a line."""
+    a line.
+
+    A combining mark is drawn on top of the character before it, taking
+    no column of its own - and has to be checked first: the combining
+    (han)dakuten U+3099/U+309A of decomposed (NFD) kana, as in a macOS
+    file name, are "W" to east_asian_width(), so "ク" + U+3099 ("グ")
+    would otherwise count as four columns instead of two."""
+    if unicodedata.combining(ch):
+        return 0
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
@@ -282,6 +298,7 @@ MAX_ZOOM = 4.0
 ZOOM_STEP = 1.15
 PAN_STEP_CELLS = 8
 FOLLOW_INTERVAL = 3.0  # seconds between checks, under -f/--follow
+OUTLINE_MIN_W = 30  # the table of contents box is never narrower (in columns)
 
 KEY_TABLE = """\
 Keys:
@@ -328,7 +345,9 @@ Keys:
   mouse wheel             scroll up / down
                                 <LINKS>
   [ ]                     back / forward, through the positions internal
-                          links have jumped from (PDF only)
+                          links (and o below) have jumped from (PDF only)
+  o TAB                   table of contents (the PDF's bookmarks): pick
+                          an entry with j/k and jump to it with ENTER
                                <TOGGLES>
   t                       toggle plain-text view
   T                       toggle plain-text view already cleared for
@@ -347,7 +366,7 @@ Keys:
   r                       toggle the scrollbar
   F                       toggle follow mode (auto-reload on file change)
                         <MISCELLANEOUS COMMANDS>
-  O v                     open the file in its own app (macOS only) and
+  v                       open the file in its own app (macOS only) and
                           switch follow mode on
   ^L                      redraw the screen
   F1 :h                   show this help (q to close it)
@@ -374,7 +393,7 @@ def positive_int(s: str) -> int:
 
 def _open_in_default_app(path: str) -> bool:
     """Hand `path` off to macOS's own default app for it, via `open` -
-    the macOS-only half of "O"/"v" (see run_viewer()). Fire-and-forget:
+    the macOS-only half of "v" (see run_viewer()). Fire-and-forget:
     this only launches `open` itself and doesn't wait for or know
     anything about whatever app ends up handling the file. Returns
     True if that launch succeeded, False if this isn't macOS at all or
@@ -2785,6 +2804,66 @@ class PdfDocument(DocumentHandler):
             result.append({"width_pt": width_pt, "height_pt": height_pt, "links": links})
         return result
 
+    def build_outline(self) -> list[dict[str, Any]]:
+        """Extract the document's outline (its bookmarks, a.k.a. table
+        of contents), via pypdf. Returns a flat list in document order,
+        one dict per entry: {"title": str, "level": int (0 = top level),
+        "page": int | None, "top_pt": float | None} - page/top_pt as
+        _resolve_link_dest() gives them (top_pt bottom-up, in PDF
+        points), or both None for an entry whose destination can't be
+        resolved (kept anyway, so the entries below it keep their
+        place in the hierarchy). An empty list if there's no outline,
+        or pypdf is missing or can't read the file."""
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return []
+
+        try:
+            reader = PdfReader(self.path)
+            if reader.is_encrypted:
+                reader.decrypt(self.password or "")
+            outline = reader.outline
+        except Exception:
+            return []
+
+        page_num_by_ref = {}
+        for i, p in enumerate(reader.pages):
+            ref = p.indirect_reference
+            if ref is not None:
+                page_num_by_ref[(ref.idnum, ref.generation)] = i + 1
+
+        entries: list[dict[str, Any]] = []
+
+        # pypdf's outline is a list of Destinations, where a nested list
+        # right after an entry holds that entry's children - so a list
+        # item means "one level deeper", not an entry of its own.
+        def walk(items: list[Any], level: int) -> None:
+            for item in items:
+                if isinstance(item, list):
+                    walk(item, level + 1)
+                    continue
+                try:
+                    # NFC: a title made from a macOS file name is often
+                    # decomposed (NFD - "グ" as "ク" + a combining
+                    # dakuten), which truncating by width could split.
+                    title = unicodedata.normalize("NFC", str(item.title or ""))
+                    title = re.sub(r"\s+", " ", title).strip()
+                    resolved = self._resolve_link_dest(reader, page_num_by_ref, item.dest_array)
+                except Exception:
+                    continue  # one malformed entry shouldn't lose the rest
+                page_num, top_pt = resolved if resolved is not None else (None, None)
+                entries.append({
+                    "title": title or "(untitled)", "level": level,
+                    "page": page_num, "top_pt": top_pt,
+                })
+
+        try:
+            walk(outline, 0)
+        except Exception:
+            pass  # keep whatever was read before the malformed part
+        return entries
+
     @staticmethod
     def find_search_matches(index: list[dict[str, Any]], query: str) -> list[BBoxMatch]:
         """Return every match of `query` (a case-insensitive regex, or a
@@ -5162,6 +5241,12 @@ class Viewer:
         self._text_max_page_lines = 0  # the -N gutter's width, per page
         self.help_active = False
         self.help_scroll = 0
+        # The table-of-contents box (o/TAB - see show_outline()): whether
+        # it's up, which entry is selected, and the first entry in view.
+        self.outline_active = False
+        self.outline_sel = 0
+        self.outline_scroll = 0
+        self._outline: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_outline()
         self._search_index: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_search_index()
         self._link_index: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_link_index()
         self._history_back: list[tuple[int, int, int]] = []  # [(page, scroll, x_offset), ...]
@@ -5239,7 +5324,9 @@ class Viewer:
         # The help box's size/position and the underlying page raster are
         # both stale after a resize; simplest is to just drop back to the
         # normal view, which always does a full redraw at the new size.
+        # The same goes for the table-of-contents box.
         self.help_active = False
+        self.outline_active = False
 
     def _classify(self, index: int, wait: bool = True, debug: bool | None = None) -> DocumentHandler | None:
         """files[index]'s DocumentHandler - already one (the file about
@@ -5460,6 +5547,7 @@ class Viewer:
         self._search_index = None
         self.clear_search()
         self._link_index = None
+        self._outline = None
         self._history_back = []
         self._history_forward = []
         self.text_mode = self.doc_handler.starts_in_text_mode()
@@ -5859,6 +5947,8 @@ class Viewer:
         self._load_content()
         if self.help_active:
             self._draw_help()
+        elif self.outline_active:
+            self._draw_outline()
         elif self.text_mode:
             self._draw_text()
         else:
@@ -5905,6 +5995,96 @@ class Viewer:
             sys.stdout.write(wrap_for_tmux(osc) + "\r\n")
         sys.stdout.flush()
 
+    def _overlay_box(
+        self, lines: list[tuple[str, str]], min_w: int = 0
+    ) -> tuple[int, int, int, int]:
+        """Where a boxed overlay (the help, the table of contents) goes:
+        centered over the page, above the status bar, wide enough for its
+        longest line but shrunk to fit the terminal - for _draw_box() and
+        for the callers' own scrolling and click hit-testing.
+
+        Args:
+            lines: every line of the box's content, as _draw_box() takes them.
+            min_w: the narrowest the content area may be.
+
+        Returns:
+            (row0, col0, content_h, content_w): the box's top-left corner
+            (1-based terminal cells) and the size of the content area
+            inside its border - content_h < len(lines) means it scrolls.
+        """
+        available_rows = max(1, self.rows - 1)  # bottom row is the status bar
+        # A line with a right part needs a space between its two parts.
+        longest = max(
+            display_width(left) + (1 + display_width(right) if right else 0)
+            for left, right in lines
+        )
+        content_w = min(max(20, self.cols - 4), max(min_w, longest))
+        content_h = min(max(1, available_rows - 2), len(lines))
+        box_w = content_w + 4  # border (2) + padding (2)
+        box_h = content_h + 2  # top/bottom border
+        row0 = max(1, (available_rows - box_h) // 2 + 1)
+        col0 = max(1, (self.cols - box_w) // 2 + 1)
+        return row0, col0, content_h, content_w
+
+    def _draw_box(
+        self, lines: list[tuple[str, str]], scroll: int,
+        selected: int | None = None, min_w: int = 0,
+    ) -> tuple[int, int]:
+        """Draw a boxed overlay (see _overlay_box()) over the page, showing
+        the window of `lines` that starts at `scroll`. We only ever move
+        the cursor and rewrite the exact cells the box covers, instead of
+        clearing the screen, so the page still showing in the rest of the
+        terminal is left untouched.
+
+        Args:
+            lines: every line of the content, each a (left, right) pair:
+                `left` is truncated to fit (by terminal columns - it may be
+                Japanese) and `right` (e.g. a page number, or "") is shown
+                in full, flush right.
+            scroll: the index of the first line in view.
+            selected: the index of the line to show in reverse video -
+                also scrolled into view - or None for no selection.
+            min_w: as for _overlay_box().
+
+        Returns:
+            (scroll, max_scroll): `scroll` clamped to what the box can
+            actually show (e.g. after a resize shrank it), for the caller
+            to store back, and the largest scroll there is (0 = no scrolling).
+        """
+        row0, col0, content_h, content_w = self._overlay_box(lines, min_w)
+        max_scroll = max(0, len(lines) - content_h)
+        # Scroll just enough to keep the selection in view.
+        if selected is not None:
+            if selected < scroll:
+                scroll = selected
+            elif selected >= scroll + content_h:
+                scroll = selected - content_h + 1
+        scroll = max(0, min(max_scroll, scroll))
+
+        box_w = content_w + 4
+        out = [SGR_RESET, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
+        for i in range(content_h):
+            left, right = lines[scroll + i]
+            # `left` gets whatever `right` (and a space before it) leaves.
+            left_w = content_w - display_width(right)
+            left = truncate_to_width(left, max(0, left_w - 1) if right else left_w)
+            line = pad_to_width(left, left_w) + right
+            if scroll + i == selected:
+                line = f"\x1b[7m{line}{SGR_RESET}"
+            out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line} │")
+        out.append(f"\x1b[{row0 + content_h + 1};{col0}H└{'─' * (box_w - 2)}┘")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        return scroll, max_scroll
+
+    def _help_lines(self) -> list[tuple[str, str]]:
+        """The help box's content (KEY_TABLE), as _draw_box() takes it."""
+        return [(line, "") for line in KEY_TABLE.splitlines()]
+
+    def _help_box(self) -> tuple[int, int, int, int]:
+        """_overlay_box() for the help - see there."""
+        return self._overlay_box(self._help_lines())
+
     def show_help(self) -> None:
         self.help_active = True
         self.help_scroll = 0
@@ -5914,8 +6094,7 @@ class Viewer:
         """Scroll the help box by `delta` lines (negative = up), for when
         KEY_TABLE has grown taller than the box can show at once."""
         lines = KEY_TABLE.splitlines()
-        available_rows = max(1, self.rows - 1)
-        content_h = min(max(1, available_rows - 2), len(lines))
+        content_h = self._help_box()[2]
         max_scroll = max(0, len(lines) - content_h)
         new_scroll = max(0, min(max_scroll, self.help_scroll + delta))
         if new_scroll != self.help_scroll:
@@ -5942,6 +6121,141 @@ class Viewer:
             self.scroll_help(max(1, self.rows - 3))
         elif key in BACKWARD_WINDOW_KEYS:
             self.scroll_help(-max(1, self.rows - 3))
+
+    def _ensure_outline(self) -> list[dict[str, Any]]:
+        """self._outline (see PdfDocument.build_outline()), built on
+        first use - an empty list for anything without a real PDF behind
+        it (see _pdf_source())."""
+        if self._outline is None:
+            pdf_source = self._pdf_source()
+            self._outline = pdf_source.build_outline() if pdf_source is not None else []
+        return self._outline
+
+    def show_outline(self) -> None:
+        """o/TAB: put up the table of contents (the PDF's bookmarks) as a
+        box over the page, with the entry for the page on screen already
+        selected - or just say so on the status line if there isn't one."""
+        outline = self._ensure_outline()
+        if not outline:
+            self.draw_status("no table of contents in this file")
+            return
+        # The last entry starting at or before the current page is the
+        # section being read - the same one a PDF viewer's sidebar
+        # highlights. Entries without a page don't count.
+        self.outline_sel = 0
+        for i, entry in enumerate(outline):
+            if entry["page"] is not None and entry["page"] <= self.page:
+                self.outline_sel = i
+        self.outline_active = True
+        self.outline_scroll = 0
+        self._draw_outline()
+
+    def hide_outline(self) -> None:
+        self.outline_active = False
+        self._invalidate_screen()  # the box overlays the page
+        self.refresh()
+
+    def _outline_lines(self) -> list[tuple[str, str]]:
+        """The table-of-contents box's content, as _draw_box() takes it:
+        each entry's title indented by its level, with its page number
+        (if it has one) flush right."""
+        return [
+            ("  " * e["level"] + e["title"], str(e["page"]) if e["page"] is not None else "")
+            for e in self._ensure_outline()
+        ]
+
+    def _outline_box(self) -> tuple[int, int, int, int]:
+        """_overlay_box() for the table of contents - see there."""
+        return self._overlay_box(self._outline_lines(), OUTLINE_MIN_W)
+
+    def _draw_outline(self) -> None:
+        """Draw the table-of-contents box over the page, with the selected
+        entry in reverse video and scrolled into view."""
+        outline = self._ensure_outline()
+        self.outline_sel = max(0, min(len(outline) - 1, self.outline_sel))
+        self.outline_scroll, _max_scroll = self._draw_box(
+            self._outline_lines(), self.outline_scroll, self.outline_sel, OUTLINE_MIN_W
+        )
+        self.draw_status(
+            f"ENTER to jump, q to close - {self.outline_sel + 1}/{len(outline)}"
+        )
+
+    def _move_outline_selection(self, delta: int) -> None:
+        """Move the selection `delta` entries down (negative = up),
+        stopping at either end."""
+        n = len(self._ensure_outline())
+        new_sel = max(0, min(n - 1, self.outline_sel + delta))
+        if new_sel != self.outline_sel:
+            self.outline_sel = new_sel
+            self._draw_outline()
+
+    def jump_to_outline_entry(self, index: int) -> None:
+        """Close the table of contents and go to entry `index`'s place:
+        in image mode, exactly where its destination points (like an
+        internal link, and recorded in the same [/] history); in text
+        mode, the top of its page."""
+        entry = self._ensure_outline()[index]
+        if entry["page"] is None:
+            self.draw_status("this entry doesn't point to a page in this file")
+            return
+        self.outline_active = False
+        self._invalidate_screen()
+        if self.text_mode:
+            self.go_to_page_text(entry["page"], 0)
+        else:
+            self._push_history()
+            self.go_to_link_target(entry["page"], entry["top_pt"])
+        self.refresh()
+
+    def handle_outline_key(self, key: str) -> None:
+        """A key pressed while the table of contents is up: ENTER jumps
+        to the selected entry, q/ESC/o/TAB close it, the usual line/
+        window keys and g/G/</>/HOME/END move the selection. Everything
+        else is swallowed, like handle_help_key()."""
+        n = len(self._ensure_outline())
+        window = max(1, self._outline_box()[2] - 1)
+        # ENTER before the line keys: "\r" is one of FORWARD_LINE_KEYS.
+        if key in ("\r", "\n"):
+            self.jump_to_outline_entry(self.outline_sel)
+        elif key in ("q", "\x1b", "o", "\t"):
+            self.hide_outline()
+        elif key in ("\x0c", "FOCUS_IN"):
+            # ^L (or a focus change - see handle_global_key()): repaint
+            # the page underneath, then the box back over it.
+            self._invalidate_screen()
+            if self.text_mode:
+                self._draw_text()
+            else:
+                self._draw()
+            self._draw_outline()
+        elif key in FORWARD_LINE_KEYS:
+            self._move_outline_selection(1)
+        elif key in BACKWARD_LINE_KEYS:
+            self._move_outline_selection(-1)
+        elif key in FORWARD_WINDOW_KEYS or key in ("d", "\x04"):
+            self._move_outline_selection(window)
+        elif key in BACKWARD_WINDOW_KEYS or key in ("u", "\x15"):
+            self._move_outline_selection(-window)
+        elif key in ("g", "<", "HOME"):
+            self._move_outline_selection(-n)
+        elif key in ("G", ">", "END"):
+            self._move_outline_selection(n)
+
+    def handle_outline_mouse(self, kind: str, col: int, row: int) -> None:
+        """A mouse event while the table of contents is up: the wheel
+        moves the selection, a click on an entry jumps to it, and a
+        click anywhere outside the box closes it."""
+        if kind == "MOUSE_WHEEL_UP":
+            self._move_outline_selection(-1)
+        elif kind == "MOUSE_WHEEL_DOWN":
+            self._move_outline_selection(1)
+        elif kind == "MOUSE_CLICK":
+            row0, col0, content_h, content_w = self._outline_box()
+            inside_cols = col0 <= col < col0 + content_w + 4
+            if inside_cols and row0 < row <= row0 + content_h:
+                self.jump_to_outline_entry(self.outline_scroll + row - row0 - 1)
+            elif not (inside_cols and row0 <= row <= row0 + content_h + 1):
+                self.hide_outline()  # outside the box (its border doesn't count)
 
     def can_enter_text_mode(self) -> bool:
         """Whether this file has any text-mode content to show at all -
@@ -7093,34 +7407,9 @@ class Viewer:
         self._finish_text_frame(out, avail_rows)
 
     def _draw_help(self) -> None:
-        # Overlay the help as a boxed panel centered over the page, instead
-        # of clearing the screen: we only ever move the cursor and rewrite
-        # the exact cells the box covers, so the PDF still showing in the
-        # rest of the terminal is left untouched.
-        available_rows = max(1, self.rows - 1)  # bottom row is the status bar
-        all_lines = KEY_TABLE.splitlines()
-
-        content_w = min(max(20, self.cols - 4), max(len(l) for l in all_lines))
-        all_lines = [l[:content_w] for l in all_lines]
-        content_h = min(max(1, available_rows - 2), len(all_lines))
-        # KEY_TABLE may be taller than the box can show at once; clamp the
-        # scroll position (e.g. after a resize shrank the box) and slice
-        # out just the window of lines currently in view.
-        max_scroll = max(0, len(all_lines) - content_h)
-        self.help_scroll = max(0, min(max_scroll, self.help_scroll))
-        lines = all_lines[self.help_scroll:self.help_scroll + content_h]
-
-        box_w = content_w + 4  # border (2) + padding (2)
-        box_h = content_h + 2  # top/bottom border
-        row0 = max(1, (available_rows - box_h) // 2 + 1)
-        col0 = max(1, (self.cols - box_w) // 2 + 1)
-
-        out = [SGR_RESET, f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐"]
-        for i, line in enumerate(lines):
-            out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line.ljust(content_w)} │")
-        out.append(f"\x1b[{row0 + box_h - 1};{col0}H└{'─' * (box_w - 2)}┘")
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
+        """Overlay the help (KEY_TABLE) as a box over the page, scrolled
+        to self.help_scroll."""
+        self.help_scroll, max_scroll = self._draw_box(self._help_lines(), self.help_scroll)
         if max_scroll:
             pct = round(100 * self.help_scroll / max_scroll)
             self.draw_status(f"q to close help - j/k or wheel to scroll ({pct}%)")
@@ -7824,6 +8113,8 @@ class Viewer:
         self.cache.clear()
         self._search_index = None
         self._text_pages = None  # stale too - re-extracted on demand
+        self._outline = None  # the outline may have changed too
+        self.outline_active = False  # ... and its entries with it
         self.clear_search()
         if self.text_mode:
             self._load_text_page()
@@ -8165,7 +8456,7 @@ class Viewer:
 
     def _start_following(self) -> None:
         """(Re)start follow mode's watch on the current file - whenever
-        follow is turned on (-f, F, O/v) or switches to watching a
+        follow is turned on (-f, F, v) or switches to watching a
         different file (:n/:p). The next periodic check is due
         FOLLOW_INTERVAL seconds from now; what it compares against is
         _displayed_mtime, the version actually on screen."""
@@ -8228,7 +8519,7 @@ class Viewer:
         self.refresh()
 
     def open_in_default_app(self) -> None:
-        """O/v: hand the current file off to macOS's own default app for
+        """v: hand the current file off to macOS's own default app for
         it (Preview/Word/Excel/...), and switch follow mode on (if it
         wasn't already) so an edit made there comes back automatically.
         self.path is always the original file, never a temporary
@@ -8284,7 +8575,7 @@ class Viewer:
             self.toggle_continuous()
         elif key == "F":
             self.toggle_follow()
-        elif key in ("O", "v"):
+        elif key == "v":
             self.open_in_default_app()
         elif key == "F1":
             # less(1) puts its help on "h"/"H", which pdfless can't - both
@@ -8293,6 +8584,8 @@ class Viewer:
             # F1, with ":h" as a second way in for terminals that send
             # something unexpected for F1.
             self.show_help()
+        elif key in ("o", "\t"):
+            self.show_outline()
         elif key in ("t", "T"):
             # T is t and C combined into one press/undo - see
             # toggle_clean_text_mode().
@@ -8352,6 +8645,8 @@ class Viewer:
                 self.scroll_help(-1)
             elif kind == "MOUSE_WHEEL_DOWN":
                 self.scroll_help(1)
+        elif self.outline_active:
+            self.handle_outline_mouse(kind, col, row)
         elif kind == "MOUSE_CLICK":
             self.handle_click(col, row)
         elif kind == "MOUSE_DRAG":
@@ -8795,6 +9090,9 @@ def run_viewer(
 
             if viewer.help_active:
                 viewer.handle_help_key(key)
+                continue
+            if viewer.outline_active:
+                viewer.handle_outline_key(key)
                 continue
 
             if viewer.handle_global_key(key):

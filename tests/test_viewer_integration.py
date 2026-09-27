@@ -269,10 +269,10 @@ def test_quit_if_one_screen_does_not_exit_for_a_long_text_file(pty_session, tmp_
 
 
 @requires_macos
-def test_o_or_v_opens_the_file_externally_and_turns_on_follow_mode(
+def test_v_opens_the_file_externally_and_turns_on_follow_mode(
     pty_session, sample_pdf, tmp_path, monkeypatch,
 ):
-    """"O"/"v" (see run_viewer(), pdfless._open_in_default_app()) hand
+    """"v" (see run_viewer(), pdfless._open_in_default_app()) hand
     the file off to macOS's own `open` command and switch follow mode
     on. A real `open` would launch a real GUI app, so this puts a fake
     one on PATH instead - a script that just records the path it was
@@ -293,7 +293,10 @@ def test_o_or_v_opens_the_file_externally_and_turns_on_follow_mode(
     time.sleep(3)
     assert b" follow " not in session.read_all(0.5)  # off by default (startup paint)
 
-    session.send(b"O", wait=1.0)
+    session.send(b"O", wait=1.0)  # no longer an alias for "v"
+    assert not marker.exists()
+
+    session.send(b"v", wait=1.0)
     assert b" follow " in session.read_all(0.5)
     assert marker.read_text().strip() == sample_pdf
     session.send(b"q")
