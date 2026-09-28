@@ -351,7 +351,7 @@ Keys:
                                 <LINKS>
   [ ]                     back / forward, through the positions internal
                           links (and o below) have jumped from (PDF only)
-  o TAB                   table of contents (the PDF's bookmarks): pick
+  o TAB                   table of contents (bookmarks, headings): pick
                           an entry with j/k and jump to it with ENTER
                                <TOGGLES>
   t                       toggle plain-text view
@@ -2254,9 +2254,10 @@ def compile_search_pattern(query: str) -> re.Pattern[str]:
     """Compile `query` as a case-insensitive regex, normalized the way
     normalize_for_search() normalizes the text it's run against (NFKC,
     and the same whitespace folding). If it isn't valid regex syntax
-    (e.g. a literal query like "C++" - "+" repeating nothing is a regex
-    error), fall back to matching it literally instead of just failing
-    the search.
+    (e.g. "f(x" - an unclosed group is a regex error), fall back to
+    matching it literally instead of just failing the search. ("C++"
+    doesn't qualify: since Python 3.11 it's a valid possessive "C+",
+    matching only the "C".)
 
     Only what the user typed as regex syntax counts as such: a part that
     normalizing changes (full-width "（案）", "＊" from a Japanese input
@@ -6664,14 +6665,19 @@ class Viewer:
     def _ensure_outline(self) -> list[dict[str, Any]]:
         """self._outline (see PdfDocument.build_outline()), built on
         first use - an empty list for anything without a real PDF behind
-        it (see _pdf_source())."""
+        it (see _pdf_source()). A rendered document gets the bookmarks
+        of the PDF it was rendered to: WeasyPrint makes one per Markdown
+        heading, LibreOffice one per Word/OpenDocument heading or
+        PowerPoint slide title; Chrome's --print-to-pdf fallback makes
+        none, and neither does LibreOffice for RTF."""
         if self._outline is None:
             pdf_source = self._pdf_source()
             self._outline = pdf_source.build_outline() if pdf_source is not None else []
         return self._outline
 
     def show_outline(self) -> None:
-        """o/TAB: put up the table of contents (the PDF's bookmarks) as a
+        """o/TAB: put up the table of contents (the PDF's bookmarks - see
+        _ensure_outline() for the other formats that have one) as a
         box over the page, with the entry for the page on screen already
         selected - or just say so on the status line if there isn't one."""
         outline = self._ensure_outline()

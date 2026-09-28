@@ -1,6 +1,9 @@
 """The table of contents (o/TAB): PdfDocument.build_outline() reading a
 PDF's bookmarks, and the Viewer's box listing them - selecting the
-section being read, moving the selection, and jumping to an entry."""
+section being read, moving the selection, and jumping to an entry.
+Also the formats that get their bookmarks from the PDF they're rendered
+to: Markdown's headings (WeasyPrint), and Word's headings or
+PowerPoint's slide titles (LibreOffice)."""
 
 import fcntl
 import pty
@@ -14,6 +17,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import Fit
 
 import pdfless
+from conftest import requires_markdown_rendering, requires_soffice
 
 
 def pages_only(sample_pdf):
@@ -50,12 +54,15 @@ def outlined_pdf(sample_pdf, tmp_path):
     return str(path)
 
 
-def make_viewer(path, monkeypatch):
+def make_viewer(path, monkeypatch, handler=None):
+    """A Viewer on a 100x30 pty showing the PDF at `path` - or, given
+    `handler`, that DocumentHandler instead (`path` is then unused)."""
     monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")
     monkeypatch.delenv("TMUX", raising=False)
     _master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 800, 480))
-    viewer = pdfless.Viewer([pdfless.PdfDocument(path)], 0, 1, tempfile.mkdtemp(), slave, "width")
+    doc = handler if handler is not None else pdfless.PdfDocument(path)
+    viewer = pdfless.Viewer([doc], 0, 1, tempfile.mkdtemp(), slave, "width")
     viewer.refresh()
     return viewer
 
@@ -198,3 +205,55 @@ def test_the_box_blanks_its_cells_before_drawing_over_them(outlined_pdf, monkeyp
     first_border = out.index(f"\x1b[{row0};{col0}H┌")
     for row in range(row0, row0 + content_h + 2):
         assert out.index(f"\x1b[{row};{col0}H{' ' * (content_w + 4)}") < first_border
+
+
+def rendered_handler(path, tmp_path):
+    """The DocumentHandler pdfless would open `path` with (as main()
+    picks one), with its pages already rendered."""
+    for cls in pdfless.HANDLER_CLASSES:
+        handler = cls.sniff(path, str(tmp_path))
+        if handler is not None:
+            handler.build_pages(str(tmp_path))
+            return handler
+    raise AssertionError(f"no handler for {path}")
+
+
+def outline_of(handler):
+    """`handler`'s table of contents, as (level, title, page) triples."""
+    return [(e["level"], e["title"], e["page"]) for e in handler._pdf_delegate.build_outline()]
+
+
+@requires_markdown_rendering
+def test_a_markdown_files_headings_are_its_outline(sample_md, tmp_path, monkeypatch):
+    """WeasyPrint turns every heading into a bookmark, so a Markdown
+    file's table of contents is its headings - # at level 0, ## at 1."""
+    handler = rendered_handler(sample_md, tmp_path)
+    assert isinstance(handler, pdfless.MarkdownDocument)
+    outline = outline_of(handler)
+    assert outline[:2] == [(0, "Lorem Ipsum Sample", 1), (1, "リストの例", 1)]
+    assert (1, "追加セクション2", 2) in outline
+
+    viewer = make_viewer(None, monkeypatch, handler)
+    viewer.show_outline()
+    assert viewer.outline_active
+    viewer.handle_outline_key("G")
+    viewer.handle_outline_key("\r")
+    assert viewer.page == 2
+    assert viewer.scroll > 0  # at the heading, not the page's top
+
+
+@requires_soffice
+def test_word_headings_are_its_outline(sample_headings_docx, tmp_path):
+    """LibreOffice exports Word's heading styles as bookmarks."""
+    handler = rendered_handler(sample_headings_docx, tmp_path)
+    assert isinstance(handler, pdfless.OfficeDocument)
+    assert outline_of(handler) == [
+        (0, "第1章 はじめに", 1), (1, "1.1 背景", 1), (0, "Chapter 2", 2),
+    ]
+
+
+@requires_soffice
+def test_powerpoint_slide_titles_are_its_outline(sample_twoslide_pptx, tmp_path):
+    """LibreOffice exports each slide's title as a bookmark."""
+    handler = rendered_handler(sample_twoslide_pptx, tmp_path)
+    assert outline_of(handler) == [(0, "Lorem Ipsum", 1), (0, "サンプルスライド", 2)]
