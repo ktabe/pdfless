@@ -2570,6 +2570,44 @@ class UnusableFile(Exception):
     the file might be some other kind instead."""
 
 
+def find_title_line(
+    lines: Sequence[str], start: int, end: int, title: str, near: float | None = None,
+) -> int | None:
+    """Where a section `title` (a bookmark's) appears among lines[start:end]
+    - the text mode lines of the page it points to - so the table of
+    contents can jump to it in text mode too. Compared the way search
+    compares (see normalize_for_search()), case-insensitively, so the
+    extra spaces pdftotext -layout puts in a heading ("1.1   背景") or a
+    full-width digit in it don't matter.
+
+    Args:
+        lines: the text mode lines.
+        start, end: the range to look in.
+        title: the section's title.
+        near: where on the page the bookmark points, as a fraction of the
+            way down (0 = top) - picks among several lines with the title
+            on them. None takes the first.
+
+    Returns:
+        The index into `lines` of the line with the title on it, or None
+        if no line in the range has it (e.g. a title too long for one
+        line, or worded differently from the text).
+    """
+    wanted = normalize_for_search(title)[0].strip().casefold()
+    if not wanted:
+        return None
+    found = [
+        i for i in range(start, min(end, len(lines)))
+        if wanted in normalize_for_search(lines[i])[0].casefold()
+    ]
+    if not found:
+        return None
+    if near is None:
+        return found[0]
+    target = start + near * (end - start)
+    return min(found, key=lambda i: abs(i - target))
+
+
 class DocumentHandler:
     """Base class for a file's format-specific behavior. Each subclass
     corresponds to one of main()'s "kind" strings ("pdf"/"image"/
@@ -2655,6 +2693,14 @@ class DocumentHandler:
         RtfDocument's whole file, OfficeDocument's whole document via
         textutil)."""
         return False
+
+    def heading_lines(self) -> list[int] | None:
+        """For a text mode that shows the document's own source (not
+        paginated - see text_mode_is_paginated()), which of its lines are
+        the headings the table of contents lists, in order - or None if
+        this handler can't tell. Lets the table of contents jump to a
+        section's line in text mode (see _Overlays.jump_to_outline_entry())."""
+        return None
 
     def search_resets_on_text_mode_toggle(self) -> bool:
         """Whether an active search should be cleared when `t` crosses
@@ -4741,6 +4787,60 @@ class SvgDocument(RenderedDocument):
             f.write(html)
 
 
+# A fenced code block's opening/closing line (``` or ~~~), an ATX
+# heading ("## Title"), and a setext heading's underline ("===" or
+# "---" under a line of text) - see markdown_heading_lines().
+_MD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_MD_ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+_MD_SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+
+
+def markdown_heading_lines(lines: Sequence[str]) -> list[int]:
+    """The lines of a Markdown source that are headings, in order - the
+    ones WeasyPrint turns into bookmarks, one per heading, so the n-th of
+    these is the n-th entry of a rendered Markdown file's table of
+    contents.
+
+    Args:
+        lines: the source, one line per item.
+
+    Returns:
+        Indices into `lines`: an ATX heading's own line, or a setext
+        heading's text line (the one above its underline). Lines inside a
+        fenced code block don't count (a "# comment" in a shell snippet
+        is no heading), and nor does one indented four spaces or more
+        (an indented code block's).
+    """
+    headings: list[int] = []
+    fence: str | None = None  # the open fence's ``` or ~~~, while inside one
+    paragraph = False  # whether the previous line is paragraph text
+    for i, line in enumerate(lines):
+        m = _MD_FENCE_RE.match(line)
+        if fence is not None:
+            # Only a fence of the same character, at least as long,
+            # closes it.
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
+                fence = None
+            continue
+        if m:
+            fence, paragraph = m.group(1), False
+        elif _MD_ATX_HEADING_RE.match(line):
+            headings.append(i)
+            paragraph = False
+        elif paragraph and _MD_SETEXT_UNDERLINE_RE.match(line):
+            headings.append(i - 1)
+            paragraph = False
+        elif not line.strip():
+            paragraph = False  # a blank line ends a paragraph
+        elif not paragraph and line.startswith("    "):
+            # An indented code block's line (indenting only continues a
+            # paragraph already under way) - no setext underline after it.
+            pass
+        else:
+            paragraph = True
+    return headings
+
+
 class MarkdownDocument(_RawTextView, RenderedDocument):
     """A Markdown file, rendered to a real PDF via the `markdown` +
     `weasyprint` Python libraries (see _render_markdown_pdf() below) - no
@@ -4941,6 +5041,11 @@ img { max-width: 100%; height: auto; }
 
     def search_resets_on_text_mode_toggle(self) -> bool:
         return True
+
+    def heading_lines(self) -> list[int] | None:
+        """Text mode shows the raw source, whose headings are the
+        bookmarks WeasyPrint made - see markdown_heading_lines()."""
+        return markdown_heading_lines(self.extract_text(1))
 
 
 # The order main()'s classification loop tries these in - RtfOfficeDocument
@@ -5644,12 +5749,16 @@ class _Overlays:
         self.outline_sel = 0
         self.outline_scroll = 0
         self._outline: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_outline()
+        # The entry last jumped to, and where that left the view (see
+        # _view_position()) - so reopening before moving on selects it.
+        self._jumped: tuple[int, tuple[bool, int, int]] | None = None
 
     def forget_outline(self) -> None:
         """Drop the table of contents read from the file (it's read again
         on next use) - and close its box if it's up, as its entries
         may be gone. For a reload or a switch to another file."""
         self._outline = None
+        self._jumped = None
         if self.active == "outline":
             self.active = None
 
@@ -5804,14 +5913,94 @@ class _Overlays:
             return
         # The last entry starting at or before the current page is the
         # section being read - the same one a PDF viewer's sidebar
-        # highlights. Entries without a page don't count.
+        # highlights. Entries without a page don't count. A text mode
+        # showing the document's source has no pages to go by, but its
+        # headings are right there: the last one above where reading is.
+        headings = self._source_heading_lines()
         self.outline_sel = 0
-        for i, entry in enumerate(outline):
-            if entry["page"] is not None and entry["page"] <= self.viewer.page:
-                self.outline_sel = i
+        if self._jumped is not None and self._jumped[1] == self._view_position():
+            # Still where the last jump left it: that entry, even when
+            # another one starts on the same page, or (near the end of
+            # the text) on the same screen.
+            self.outline_sel = self._jumped[0]
+        elif headings is not None:
+            reading = self._reading_text_line()
+            for i, line in enumerate(headings):
+                if line <= reading:
+                    self.outline_sel = i
+        else:
+            for i, entry in enumerate(outline):
+                if entry["page"] is not None and entry["page"] <= self.viewer.page:
+                    self.outline_sel = i
         self.active = "outline"
         self.outline_scroll = 0
         self._draw_outline()
+
+    def _source_heading_lines(self) -> list[int] | None:
+        """In a text mode showing the document's own source (Markdown's -
+        see DocumentHandler.heading_lines()), the line each entry's
+        heading is on, entry by entry - or None if text mode isn't such
+        a view, or its headings don't pair up one-to-one with the
+        entries (then _text_line_of_entry() looks for the titles
+        instead)."""
+        viewer = self.viewer
+        if not viewer.text_mode or viewer.doc_handler.text_mode_is_paginated():
+            return None
+        headings = viewer.doc_handler.heading_lines()
+        if headings is None or len(headings) != len(self._ensure_outline()):
+            return None
+        return headings
+
+    def _reading_text_line(self) -> int:
+        """The text mode line being read: the one a quarter of the way
+        down the screen, where a jump to a heading puts it (see
+        Viewer._scroll_text_to_row()) - or, scrolled all the way to the
+        end, the last line on screen, as a heading near the end can't be
+        scrolled up that far."""
+        viewer = self.viewer
+        rows = viewer._text_avail_rows()
+        at_end = viewer.text_scroll >= viewer.text_scroll_max
+        row = max(0, viewer.text_scroll + (rows - 1 if at_end else rows // 4))
+        if not viewer.text_wrap:
+            return min(row, len(viewer.text_lines) - 1)
+        display_rows = viewer._ensure_display_rows()
+        if not display_rows:
+            return 0
+        return display_rows[min(row, len(display_rows) - 1)][0]
+
+    def _text_line_of_entry(self, index: int) -> int | None:
+        """The text mode line entry `index`'s heading is on, for a jump
+        to it: the matching heading of the source (see
+        _source_heading_lines()), or else a line with its title on it
+        (see find_title_line()) - on its own page, or anywhere in a text
+        mode that isn't split into pages, nearest to where the bookmark
+        points. None if there's no such line."""
+        viewer = self.viewer
+        headings = self._source_heading_lines()
+        if headings is not None:
+            return headings[index]
+        entry = self._ensure_outline()[index]
+        down = self._fraction_down_page(entry)
+        if viewer.doc_handler.text_mode_is_paginated():
+            start, end = viewer._text_page_range(entry["page"])
+            near = down
+        else:
+            # The whole document at once: its pages' share of it.
+            start, end = 0, len(viewer.text_lines)
+            near = (entry["page"] - 1 + (down or 0.0)) / max(1, viewer.npages)
+        return find_title_line(viewer.text_lines, start, end, entry["title"], near)
+
+    def _fraction_down_page(self, entry: dict[str, Any]) -> float | None:
+        """How far down its page entry's destination is (0 = the top),
+        or None if the bookmark gives no position."""
+        pdf_source = self.viewer._pdf_source()
+        if entry["top_pt"] is None or pdf_source is None:
+            return None
+        height_pt = pdf_source.page_size_pt(entry["page"])[1]
+        if not height_pt:
+            return None
+        # top_pt is PDF-style, measured up from the bottom.
+        return max(0.0, min(1.0, (height_pt - entry["top_pt"]) / height_pt))
 
     def _outline_lines(self) -> list[tuple[str, str]]:
         """The table-of-contents box's content, as draw_box() takes it:
@@ -5851,7 +6040,9 @@ class _Overlays:
         """Close the table of contents and go to entry `index`'s place:
         in image mode, exactly where its destination points (like an
         internal link, and recorded in the same [/] history); in text
-        mode, the top of its page."""
+        mode, the line its heading is on (see _text_line_of_entry()),
+        placed where a search match would be - or the top of its page
+        if that line can't be found."""
         entry = self._ensure_outline()[index]
         if entry["page"] is None:
             self.viewer.draw_status("this entry doesn't point to a page in this file")
@@ -5860,10 +6051,20 @@ class _Overlays:
         self.viewer._invalidate_screen()
         if self.viewer.text_mode:
             self.viewer.go_to_page_text(entry["page"], 0)
+            line = self._text_line_of_entry(index)
+            if line is not None:
+                self.viewer._scroll_text_to_row(self.viewer._text_row_for_line(line))
         else:
             self.viewer.links.push_history()
             self.viewer.go_to_link_target(entry["page"], entry["top_pt"])
+        self._jumped = (index, self._view_position())
         self.viewer.refresh()
+
+    def _view_position(self) -> tuple[bool, int, int]:
+        """Where the view is: the mode, the page, and how far it's
+        scrolled - for telling whether it has moved since a jump."""
+        viewer = self.viewer
+        return viewer.text_mode, viewer.page, viewer.text_scroll if viewer.text_mode else viewer.scroll
 
     # What each overlay (see self.active) is, as the calls the shared
     # code below makes on it - everything else about the two boxes is
