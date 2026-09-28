@@ -237,7 +237,7 @@ def feed(dispatcher, keys):
 def test_the_search_prompt_takes_every_key_until_enter(sample_pdf, monkeypatch):
     viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
     searches, clicks = [], []
-    monkeypatch.setattr(viewer, "start_search", lambda q, backward, multiline: searches.append((q, backward)))
+    monkeypatch.setattr(viewer.search, "start", lambda q, backward, multiline: searches.append((q, backward)))
     monkeypatch.setattr(viewer, "handle_mouse", lambda *a: clicks.append(a))
     d = dispatcher_for(viewer)
     # "q" and "n" are typed into the query, not quitting or repeating;
@@ -270,9 +270,9 @@ def test_ctrl_c_quits_but_q_first_closes_what_is_up(sample_pdf):
     d = dispatcher_for(viewer)
     assert d.handle("F1") and viewer.overlays.active == "help"
     assert d.handle("q") and viewer.overlays.active is None  # closes the help
-    viewer.start_search("lorem")
-    assert viewer.search_query is not None
-    assert d.handle("q") and viewer.search_query is None  # clears the search
+    viewer.search.start("lorem")
+    assert viewer.search.query is not None
+    assert d.handle("q") and viewer.search.query is None  # clears the search
     assert d.handle("q") is False
     assert dispatcher_for(viewer).handle("\x03") is False
 

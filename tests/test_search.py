@@ -32,8 +32,8 @@ def make_viewer(handler):
     tmpdir = tempfile.mkdtemp()
     viewer = pdfless.Viewer([handler], 0, 1, tmpdir, slave, None)
     viewer._load_page = lambda: None
-    viewer._scroll_image_to_match = lambda match: None
-    viewer._scroll_text_to_match = lambda match: None
+    viewer.search.scroll_image_to_match = lambda match: None
+    viewer.search.scroll_text_to_match = lambda match: None
     viewer._draw = lambda: None
     viewer._draw_text = lambda: None
     viewer.refresh()
@@ -58,19 +58,19 @@ def test_docx_search_uses_pdf_bbox_index_in_both_modes(sample_docx):
     assert viewer.doc_handler._pdf_delegate is not None
     assert viewer.doc_handler.supports_search() is True
 
-    viewer.start_search("Hello")
-    assert viewer.search_matches
-    assert len(viewer.search_matches[0]) == 5  # (page, xmin, ymin, xmax, ymax)
+    viewer.search.start("Hello")
+    assert viewer.search.matches
+    assert len(viewer.search.matches[0]) == 5  # (page, xmin, ymin, xmax, ymax)
 
-    viewer.start_search("ThisTextDoesNotAppearAnywhere")
-    assert viewer.search_matches == []
+    viewer.search.start("ThisTextDoesNotAppearAnywhere")
+    assert viewer.search.matches == []
 
     assert viewer.enter_text_mode() is True
     assert viewer.text_mode is True
 
-    viewer.start_search("Hello")
-    assert viewer.search_matches
-    assert len(viewer.search_matches[0]) == 5
+    viewer.search.start("Hello")
+    assert viewer.search.matches
+    assert len(viewer.search.matches[0]) == 5
 
 
 @requires_markdown_rendering
@@ -85,14 +85,14 @@ def test_markdown_image_search_uses_pdf_bbox_index(sample_md, tmp_path):
     assert viewer.text_mode is False
     assert viewer.doc_handler.text_mode_is_paginated() is False
 
-    viewer.start_search("追加セクション2")
-    assert viewer.search_matches
-    assert len(viewer.search_matches[0]) == 5  # (page, xmin, ymin, xmax, ymax)
+    viewer.search.start("追加セクション2")
+    assert viewer.search.matches
+    assert len(viewer.search.matches[0]) == 5  # (page, xmin, ymin, xmax, ymax)
 
     assert viewer.enter_text_mode() is True
-    viewer.start_search("## リスト")
-    assert viewer.search_matches
-    assert len(viewer.search_matches[0]) == 3  # (line_idx, start, end)
+    viewer.search.start("## リスト")
+    assert viewer.search.matches
+    assert len(viewer.search.matches[0]) == 3  # (line_idx, start, end)
 
 
 def test_plain_text_file_search_works(sample_text):
@@ -100,8 +100,8 @@ def test_plain_text_file_search_works(sample_text):
     assert viewer.text_mode is True  # permanently, for kind=="text"
     assert viewer.text_lines == ["line one", "line two", "line three"]
 
-    viewer.start_search("line two")
-    assert viewer.search_matches == [(1, 0, 8)]
+    viewer.search.start("line two")
+    assert viewer.search.matches == [(1, 0, 8)]
 
 
 def test_pdf_search_uses_bbox_index_in_both_modes(sample_pdf):
@@ -112,14 +112,14 @@ def test_pdf_search_uses_bbox_index_in_both_modes(sample_pdf):
     keep working the same way after it)."""
     viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
 
-    viewer.start_search("Lorem")
-    assert viewer.search_matches
-    assert len(viewer.search_matches[0]) == 5  # (page, xmin, ymin, xmax, ymax)
+    viewer.search.start("Lorem")
+    assert viewer.search.matches
+    assert len(viewer.search.matches[0]) == 5  # (page, xmin, ymin, xmax, ymax)
 
     viewer.text_mode = True
-    viewer.start_search("Lorem")
-    assert viewer.search_matches
-    assert len(viewer.search_matches[0]) == 5
+    viewer.search.start("Lorem")
+    assert viewer.search.matches
+    assert len(viewer.search.matches[0]) == 5
 
 
 def test_image_document_never_supports_search(sample_image):
@@ -149,9 +149,9 @@ def test_neither_text_mode_nor_search_blocks_the_slash_key(sample_image):
 def test_match_index_from_picks_the_nearest_one_in_each_direction():
     """"/" takes the first match from here on, "?" the last one before
     here - the whole difference between the two prompts (see
-    Viewer.start_search())."""
+    _Search.start())."""
     positions = [2, 5, 5, 9]  # e.g. page numbers, two matches on page 5
-    pick = pdfless.Viewer._match_index_from
+    pick = pdfless._Search._match_index_from
 
     assert pick(positions, 5, False) == 1  # first match on page 5...
     assert pick(positions, 5, True) == 0  # ...vs. the last one before it
@@ -161,7 +161,7 @@ def test_match_index_from_picks_the_nearest_one_in_each_direction():
 
 def test_match_index_from_wraps_around_the_ends():
     positions = [2, 5, 9]
-    pick = pdfless.Viewer._match_index_from
+    pick = pdfless._Search._match_index_from
 
     assert pick(positions, 10, False) == 0  # past the last match -> the first
     assert pick(positions, 1, True) == 2  # before the first -> the last
@@ -175,13 +175,13 @@ def test_backward_search_lands_on_the_match_above_you(tmp_path):
     viewer = make_viewer(pdfless.TextDocument(str(path)))
     viewer.text_scroll = 30
 
-    viewer.start_search("hit", backward=True)
-    assert viewer.search_matches[viewer.search_pos][0] == 17
+    viewer.search.start("hit", backward=True)
+    assert viewer.search.matches[viewer.search.pos][0] == 17
     # ...where a forward search from the same spot goes the other way
     # (that first search scrolled us, so put us back first).
     viewer.text_scroll = 30
-    viewer.start_search("hit")
-    assert viewer.search_matches[viewer.search_pos][0] == 40
+    viewer.search.start("hit")
+    assert viewer.search.matches[viewer.search.pos][0] == 40
 
 
 def test_repeat_search_does_not_wrap_around(sample_text):
@@ -189,35 +189,35 @@ def test_repeat_search_does_not_wrap_around(sample_text):
     stay put and report there's nothing further - unlike the initial
     "/"/"?" jump (_match_index_from()), which does wrap."""
     viewer = make_viewer(pdfless.TextDocument(sample_text))
-    viewer.start_search("line")
-    assert len(viewer.search_matches) == 3
+    viewer.search.start("line")
+    assert len(viewer.search.matches) == 3
 
-    viewer.repeat_search(forward=True)
-    assert viewer.search_pos == 1
-    viewer.repeat_search(forward=True)
-    assert viewer.search_pos == 2
+    viewer.search.repeat(forward=True)
+    assert viewer.search.pos == 1
+    viewer.search.repeat(forward=True)
+    assert viewer.search.pos == 2
 
-    viewer.repeat_search(forward=True)  # past the last match - no wrap
-    assert viewer.search_pos == 2
+    viewer.search.repeat(forward=True)  # past the last match - no wrap
+    assert viewer.search.pos == 2
 
-    viewer.repeat_search(forward=False)
-    assert viewer.search_pos == 1
-    viewer.repeat_search(forward=False)
-    assert viewer.search_pos == 0
+    viewer.search.repeat(forward=False)
+    assert viewer.search.pos == 1
+    viewer.search.repeat(forward=False)
+    assert viewer.search.pos == 0
 
-    viewer.repeat_search(forward=False)  # before the first match - no wrap
-    assert viewer.search_pos == 0
+    viewer.search.repeat(forward=False)  # before the first match - no wrap
+    assert viewer.search.pos == 0
 
 
 def test_backward_search_in_a_pdf_works_by_page(sample_pdf):
     viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
-    viewer.start_search("Lorem")  # from page 1: the first match forward
-    first = viewer.search_pos
-    pages = [m[0] for m in viewer.search_matches]
+    viewer.search.start("Lorem")  # from page 1: the first match forward
+    first = viewer.search.pos
+    pages = [m[0] for m in viewer.search.matches]
     assert len(set(pages)) > 1  # matches on more than one page, or this
     # says nothing
 
     viewer.page = pages[-1]
-    viewer.start_search("Lorem", backward=True)
-    assert viewer.search_pos != first
-    assert pages[viewer.search_pos] < viewer.npages
+    viewer.search.start("Lorem", backward=True)
+    assert viewer.search.pos != first
+    assert pages[viewer.search.pos] < viewer.npages

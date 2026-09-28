@@ -153,21 +153,21 @@ def test_search_marker_on_a_lower_page_on_screen(sample_pdf, monkeypatch):
     """A match on page 2 is boxed while page 2 is on screen below page
     1's bottom - positioned relative to page 2's own top in the layout."""
     viewer = make_viewer(pdfless.PdfDocument(sample_pdf), monkeypatch)
-    viewer._search_index = viewer.doc_handler.build_search_index()
-    matches = viewer.doc_handler.find_search_matches(viewer._search_index, "Chapter")
+    viewer.search.index = viewer.doc_handler.build_search_index()
+    matches = viewer.doc_handler.find_search_matches(viewer.search.index, "Chapter")
     page2_match = next(i for i, m in enumerate(matches) if m[0] == 2)
-    viewer.search_query = "Chapter"
-    viewer.search_matches = matches
-    viewer.search_pos = page2_match
+    viewer.search.query = "Chapter"
+    viewer.search.matches = matches
+    viewer.search.pos = page2_match
     viewer.scroll = viewer.img.height - viewer.avail_height_px // 2
     viewer.refresh()
     assert viewer.page == 1
-    match = viewer._visible_search_match()
+    match = viewer.search.visible_match()
     assert match is not None and match[0] == 2
-    assert viewer._active_search_page_match() is None  # not the top page
-    _, px_top, _, _ = viewer._match_bbox_px(match)
+    assert viewer.search.active_page_match() is None  # not the top page
+    _, px_top, _, _ = viewer.search.match_bbox_px(match)
     bounds = viewer._match_marker_bounds(
-        *viewer._match_bbox_px(match), page_top=viewer._visible_page_top(2)
+        *viewer.search.match_bbox_px(match), page_top=viewer._visible_page_top(2)
     )
     top2 = viewer._visible_page_top(2)
     assert bounds is not None
@@ -269,11 +269,11 @@ def test_text_G_stays_on_the_current_page(sample_pdf, monkeypatch):
 
 def test_text_highlight_for_a_match_on_another_page(sample_pdf, monkeypatch):
     viewer = make_viewer(pdfless.PdfDocument(sample_pdf), monkeypatch, text=True)
-    viewer.start_search("Chapter")
-    assert viewer.search_matches
-    target = next(i for i, m in enumerate(viewer.search_matches) if m[0] == 3)
-    viewer._goto_search_match(target)
-    highlight = viewer._text_search_highlight()
+    viewer.search.start("Chapter")
+    assert viewer.search.matches
+    target = next(i for i, m in enumerate(viewer.search.matches) if m[0] == 3)
+    viewer.search.go_to_match(target)
+    highlight = viewer.search.text_highlight()
     assert highlight is not None
     start, end = viewer._text_page_range(3)
     assert start <= highlight[0] < end
