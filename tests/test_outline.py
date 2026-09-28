@@ -1,6 +1,8 @@
 """The table of contents (o/TAB): PdfDocument.build_outline() reading a
 PDF's bookmarks, and the Viewer's box listing them - selecting the
 section being read, moving the selection, and jumping to an entry.
+The help box (F1) is the other overlay, taking the same keys and mouse
+events (see Viewer.handle_overlay_key()).
 Also the formats that get their bookmarks from the PDF they're rendered
 to: Markdown's headings (WeasyPrint), and Word's headings or
 PowerPoint's slide titles (LibreOffice)."""
@@ -110,36 +112,36 @@ def test_no_outline_is_just_a_status_message(unoutlined_pdf, monkeypatch):
     assert pdfless.PdfDocument(unoutlined_pdf).build_outline() == []
     viewer = make_viewer(unoutlined_pdf, monkeypatch)
     assert viewer.handle_global_key("o")
-    assert not viewer.outline_active
+    assert viewer.overlay is None
 
 
 def test_opening_selects_the_section_being_read(outlined_pdf, monkeypatch):
     viewer = make_viewer(outlined_pdf, monkeypatch)
     viewer.go_page(3, 0)
     assert viewer.handle_global_key("\t")
-    assert viewer.outline_active
+    assert viewer.overlay == "outline"
     assert viewer.outline_sel == 1  # "1.1 背景" starts on page 2
-    viewer.handle_outline_key("q")
-    assert not viewer.outline_active
+    viewer.handle_overlay_key("q")
+    assert viewer.overlay is None
     assert viewer.page == 3
 
 
 def test_enter_jumps_to_the_entry_and_back_returns(outlined_pdf, monkeypatch):
     viewer = make_viewer(outlined_pdf, monkeypatch)
     viewer.show_outline()
-    viewer.handle_outline_key("j")
-    viewer.handle_outline_key("p")  # swallowed: no page turn underneath
+    viewer.handle_overlay_key("j")
+    viewer.handle_overlay_key("p")  # swallowed: no page turn underneath
     assert viewer.page == 1
-    viewer.handle_outline_key("\r")
-    assert not viewer.outline_active
+    viewer.handle_overlay_key("\r")
+    assert viewer.overlay is None
     assert viewer.page == 2
     assert viewer.scroll > 0  # halfway down page 2, not its top
 
     viewer.show_outline()
-    viewer.handle_outline_key("G")
+    viewer.handle_overlay_key("G")
     assert viewer.outline_sel == 3
-    viewer.handle_outline_key("k")
-    viewer.handle_outline_key("\r")
+    viewer.handle_overlay_key("k")
+    viewer.handle_overlay_key("\r")
     assert (viewer.page, viewer.scroll) == (4, 0)  # /Fit: the page's top
 
     viewer.go_back()
@@ -150,8 +152,8 @@ def test_text_mode_jumps_to_the_top_of_the_page(outlined_pdf, monkeypatch):
     viewer = make_viewer(outlined_pdf, monkeypatch)
     assert viewer.enter_text_mode()
     viewer.show_outline()
-    viewer.handle_outline_key("G")
-    viewer.handle_outline_key("\r")
+    viewer.handle_overlay_key("G")
+    viewer.handle_overlay_key("\r")
     assert viewer.text_mode
     assert viewer.page == 6
 
@@ -162,14 +164,14 @@ def test_clicking_an_entry_jumps_and_clicking_outside_closes(outlined_pdf, monke
     row0, col0, content_h, _content_w = viewer._outline_box()
     assert content_h == 4
     viewer.handle_mouse("MOUSE_CLICK", col0 + 2, row0 + 3)  # the third entry
-    assert not viewer.outline_active
+    assert viewer.overlay is None
     assert viewer.page == 4
 
     viewer.show_outline()
     viewer.handle_mouse("MOUSE_WHEEL_DOWN", 1, 1)
     assert viewer.outline_sel == 3
     viewer.handle_mouse("MOUSE_CLICK", 1, 1)  # outside the box
-    assert not viewer.outline_active
+    assert viewer.overlay is None
     assert viewer.page == 4
 
 
@@ -185,10 +187,10 @@ def test_a_long_outline_scrolls_with_the_selection(sample_pdf, tmp_path, monkeyp
     viewer.show_outline()
     content_h = viewer._outline_box()[2]
     assert content_h < 60
-    viewer.handle_outline_key("G")
+    viewer.handle_overlay_key("G")
     assert viewer.outline_sel == 59
     assert viewer.outline_scroll == 60 - content_h
-    viewer.handle_outline_key("g")
+    viewer.handle_overlay_key("g")
     assert (viewer.outline_sel, viewer.outline_scroll) == (0, 0)
 
 
@@ -235,9 +237,9 @@ def test_a_markdown_files_headings_are_its_outline(sample_md, tmp_path, monkeypa
 
     viewer = make_viewer(None, monkeypatch, handler)
     viewer.show_outline()
-    assert viewer.outline_active
-    viewer.handle_outline_key("G")
-    viewer.handle_outline_key("\r")
+    assert viewer.overlay == "outline"
+    viewer.handle_overlay_key("G")
+    viewer.handle_overlay_key("\r")
     assert viewer.page == 2
     assert viewer.scroll > 0  # at the heading, not the page's top
 
@@ -257,3 +259,69 @@ def test_powerpoint_slide_titles_are_its_outline(sample_twoslide_pptx, tmp_path)
     """LibreOffice exports each slide's title as a bookmark."""
     handler = rendered_handler(sample_twoslide_pptx, tmp_path)
     assert outline_of(handler) == [(0, "Lorem Ipsum", 1), (0, "サンプルスライド", 2)]
+
+
+def open_overlay(viewer, which):
+    """Put up the help or the table of contents, by its own key."""
+    viewer.handle_global_key("F1" if which == "help" else "o")
+    assert viewer.overlay == which
+
+
+@pytest.mark.parametrize("which, key", [
+    ("help", "q"), ("help", "\x1b"), ("help", "F1"),
+    ("outline", "q"), ("outline", "\x1b"), ("outline", "o"), ("outline", "\t"),
+])
+def test_q_esc_or_its_own_key_closes_either_overlay(outlined_pdf, monkeypatch, which, key):
+    viewer = make_viewer(outlined_pdf, monkeypatch)
+    open_overlay(viewer, which)
+    viewer.handle_overlay_key(key)
+    assert viewer.overlay is None
+
+
+def test_the_help_scrolls_with_the_same_keys_as_the_outline(outlined_pdf, monkeypatch):
+    viewer = make_viewer(outlined_pdf, monkeypatch)
+    open_overlay(viewer, "help")
+    content_h = viewer._help_box()[2]
+    max_scroll = len(pdfless.KEY_TABLE.splitlines()) - content_h
+    assert max_scroll > 0  # KEY_TABLE is taller than a 30-row terminal
+    viewer.handle_overlay_key("G")
+    assert viewer.help_scroll == max_scroll
+    viewer.handle_overlay_key("u")
+    assert viewer.help_scroll == max_scroll - (content_h - 1)
+    viewer.handle_overlay_key("g")
+    assert viewer.help_scroll == 0
+    viewer.handle_overlay_key("p")  # swallowed: no page turn underneath
+    assert (viewer.overlay, viewer.page) == ("help", 1)
+
+
+def test_the_wheel_scrolls_the_help_and_a_click_outside_closes_it(outlined_pdf, monkeypatch):
+    viewer = make_viewer(outlined_pdf, monkeypatch)
+    open_overlay(viewer, "help")
+    viewer.handle_mouse("MOUSE_WHEEL_DOWN", 1, 1)
+    assert viewer.help_scroll == 1
+    row0, col0, _content_h, _content_w = viewer._help_box()
+    viewer.handle_mouse("MOUSE_CLICK", col0 + 2, row0 + 1)  # inside: nothing to click
+    assert viewer.overlay == "help"
+    viewer.handle_mouse("MOUSE_CLICK", 1, 1)
+    assert viewer.overlay is None
+
+
+@pytest.mark.parametrize("which", ["help", "outline"])
+def test_ctrl_l_repaints_the_page_then_the_box(outlined_pdf, monkeypatch, which):
+    viewer = make_viewer(outlined_pdf, monkeypatch)
+    open_overlay(viewer, which)
+    drawn = []
+    monkeypatch.setattr(viewer, "_draw", lambda: drawn.append("page"))
+    monkeypatch.setattr(viewer, "_draw_box", lambda *a, **k: drawn.append("box") or (0, 0))
+    viewer.handle_overlay_key("\x0c")
+    assert drawn == ["page", "box"]
+    assert viewer.overlay == which
+
+
+@pytest.mark.parametrize("which", ["help", "outline"])
+def test_the_next_page_is_still_prefetched_under_either_overlay(outlined_pdf, monkeypatch, which):
+    viewer = make_viewer(outlined_pdf, monkeypatch)
+    open_overlay(viewer, which)
+    viewer._schedule_page_prefetch()
+    assert viewer._page_prefetch_thread.name == "pdfless-page-prefetch-2"
+    viewer._page_prefetch_thread.join(10)
