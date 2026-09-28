@@ -32,6 +32,7 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import fcntl
+import functools
 import getpass
 import hashlib
 import html
@@ -218,6 +219,25 @@ FOCUS_ON = "\x1b[?1004h"
 FOCUS_OFF = "\x1b[?1004l"
 
 
+# Characters drawn with no column of their own, by general category
+# (see char_width()): nonspacing and enclosing marks - the combining
+# marks without a combining class too, such as Thai vowel signs,
+# variation selectors (U+FE00-FE0F, and U+E0100- for the ideographic
+# variants in Japanese names, "葛󠄀") and enclosing circles - and format
+# characters, such as the zero width joiner. The soft hyphen (U+00AD,
+# also a format character) is below char_width()'s Latin-1 cutoff, so
+# it keeps the column terminals draw it in.
+_ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Cf"})
+# The vowels and final consonants of Hangul's conjoining jamo: in a
+# decomposed (NFD, e.g. a macOS file name) syllable they follow its
+# initial consonant, which takes the syllable's two columns alone.
+_HANGUL_JAMO_JOINING = ((0x1160, 0x11FF), (0xD7B0, 0xD7FF))
+
+
+# Cached: text mode asks for every character it lays out, and the
+# checks below take several lookups apiece, while any text has only so
+# many different characters in it.
+@functools.lru_cache(maxsize=None)
 def char_width(ch: str) -> int:
     """Terminal column width of one character: 0 for a combining mark,
     2 for wide/fullwidth East Asian characters (e.g. most Japanese/
@@ -234,8 +254,30 @@ def char_width(ch: str) -> int:
     no column of its own - and has to be checked first: the combining
     (han)dakuten U+3099/U+309A of decomposed (NFD) kana, as in a macOS
     file name, are "W" to east_asian_width(), so "ク" + U+3099 ("グ")
-    would otherwise count as four columns instead of two."""
-    if unicodedata.combining(ch):
+    would otherwise count as four columns instead of two. Not every such
+    mark has a combining class, though, so it goes by the general
+    category too (see _ZERO_WIDTH_CATEGORIES), and a decomposed Hangul
+    syllable's vowel and final consonant join its initial consonant's
+    two columns (see _HANGUL_JAMO_JOINING).
+
+    Args:
+        ch: one character.
+
+    Returns:
+        Its width: 0, 1 or 2."""
+    code = ord(ch)
+    if code < 0x300:  # ASCII and Latin-1: no marks or wide characters there
+        return 1
+    if code == 0xFE0F:
+        # VARIATION SELECTOR-16 asks for the emoji form of the character
+        # before it - two columns, where that one (❤, ☺, ...) alone
+        # takes one - so it's the extra column itself.
+        return 1
+    if (
+        unicodedata.combining(ch)
+        or unicodedata.category(ch) in _ZERO_WIDTH_CATEGORIES
+        or any(lo <= code <= hi for lo, hi in _HANGUL_JAMO_JOINING)
+    ):
         return 0
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
