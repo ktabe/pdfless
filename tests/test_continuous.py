@@ -179,19 +179,19 @@ def test_a_click_maps_to_the_page_under_it(sample_pdf, monkeypatch):
     viewer.scroll = viewer.img.height - viewer.avail_height_px // 2
     viewer.refresh()
     seen = []
-    viewer._link_index = [
+    viewer.links.index = [
         {"width_pt": 595.0, "height_pt": 842.0, "links": []} for _ in range(viewer.npages)
     ]
     # Give page 2 one link covering its whole page, so any click landing
     # on page 2 (and only there) activates it.
-    viewer._link_index[1]["links"] = [{
+    viewer.links.index[1]["links"] = [{
         "kind": "uri", "uri": "x", "xmin": 0, "ymin": 0, "xmax": 595, "ymax": 842,
     }]
-    viewer._activate_link = seen.append
+    viewer.links.activate = seen.append
     _, top2, _ = viewer._layout[1]
-    viewer.handle_click(5, top2 // viewer.cell_h_px - 1)  # still page 1
+    viewer.mouse.click(5, top2 // viewer.cell_h_px - 1)  # still page 1
     assert seen == []
-    viewer.handle_click(5, top2 // viewer.cell_h_px + 3)  # page 2
+    viewer.mouse.click(5, top2 // viewer.cell_h_px + 3)  # page 2
     assert len(seen) == 1
 
 

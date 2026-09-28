@@ -202,26 +202,26 @@ def test_scrollbar_click_jumps_to_that_position_in_the_document(sample_pdf):
     assert viewer.npages == 7
     avail_rows = viewer.rows - 1  # 21, the status line isn't part of the track
 
-    viewer.handle_click(viewer.cols, avail_rows)  # the very bottom
+    viewer.mouse.click(viewer.cols, avail_rows)  # the very bottom
     assert viewer.page == viewer.npages
 
-    viewer.handle_click(viewer.cols, 1)  # the very top
+    viewer.mouse.click(viewer.cols, 1)  # the very top
     assert viewer.page == 1
     assert viewer.scroll == 0
 
-    viewer.handle_click(viewer.cols, 11)  # 10/21 of the way in -> page 4 of 7
+    viewer.mouse.click(viewer.cols, 11)  # 10/21 of the way in -> page 4 of 7
     assert viewer.page == 4
 
 
 def test_scrollbar_click_is_ignored_when_the_scrollbar_is_off(sample_pdf):
     viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), scrollbar=False)
-    viewer.handle_click(viewer.cols, viewer.rows - 1)
+    viewer.mouse.click(viewer.cols, viewer.rows - 1)
     assert viewer.page == 1  # the click fell through to link handling, not a jump
 
 
 def test_a_click_outside_the_scrollbar_column_does_not_jump(sample_pdf):
     viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf))
-    viewer.handle_click(viewer.cols - 1, viewer.rows - 1)
+    viewer.mouse.click(viewer.cols - 1, viewer.rows - 1)
     assert viewer.page == 1
 
 
@@ -232,12 +232,12 @@ def test_scrollbar_click_lands_within_the_clicked_page(sample_pdf):
     viewer.set_zoom(4.0)  # tall enough that one page no longer fits
     assert viewer.scroll_max > 0
     # Rows 1-3 are page 1's own slice (21 rows / 7 pages).
-    viewer.handle_click(viewer.cols, 1)
+    viewer.mouse.click(viewer.cols, 1)
     assert (viewer.page, viewer.scroll) == (1, 0)
-    viewer.handle_click(viewer.cols, 3)
+    viewer.mouse.click(viewer.cols, 3)
     assert viewer.page == 1
     assert viewer.scroll > 0  # further down the same page
-    viewer.handle_click(viewer.cols, 4)
+    viewer.mouse.click(viewer.cols, 4)
     assert viewer.page == 2  # the next page's slice starts here
 
 
@@ -258,13 +258,13 @@ def test_drag_only_follows_a_press_that_started_on_the_scrollbar(sample_pdf):
 
     # A press on the page image, then a drag across it: left alone, so
     # it can't send the view jumping.
-    viewer.handle_click(5, 5)
-    assert viewer.handle_drag(20) is False
+    viewer.mouse.click(5, 5)
+    assert viewer.mouse.drag(20) is False
     assert viewer.page == 1
 
     # A press on the scrollbar starts following the pointer.
-    viewer.handle_click(viewer.cols, 1)
-    assert viewer.handle_drag(20) is True
+    viewer.mouse.click(viewer.cols, 1)
+    assert viewer.mouse.drag(20) is True
 
 
 def test_drag_acts_only_on_where_the_pointer_ended_up(sample_pdf):
@@ -272,29 +272,29 @@ def test_drag_acts_only_on_where_the_pointer_ended_up(sample_pdf):
     of motion events is flushed, so a drag doesn't rasterize every page
     it passes over."""
     viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), rows=22, cols=40)
-    viewer.handle_click(viewer.cols, 1)
+    viewer.mouse.click(viewer.cols, 1)
     assert viewer.page == 1
 
     for row in range(2, 20):  # a burst, as a real drag arrives
-        assert viewer.handle_drag(row) is True
+        assert viewer.mouse.drag(row) is True
     assert viewer.page == 1  # nothing acted on yet
 
-    viewer.flush_scrollbar_drag()
+    viewer.mouse.flush_drag()
     assert viewer.page == 7  # row 19 of 21 -> the last page of seven
 
 
 def test_release_flushes_the_drag_and_ends_it(sample_pdf):
     viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), rows=22, cols=40)
-    viewer.handle_click(viewer.cols, 1)
-    viewer.handle_drag(11)
-    viewer.end_scrollbar_drag()
+    viewer.mouse.click(viewer.cols, 1)
+    viewer.mouse.drag(11)
+    viewer.mouse.end_drag()
     assert viewer.page == 4  # the position it was let go at
-    assert viewer.handle_drag(20) is False  # no longer following
+    assert viewer.mouse.drag(20) is False  # no longer following
 
 
 def test_flush_without_a_drag_is_a_no_op(sample_pdf):
     viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf))
-    viewer.flush_scrollbar_drag()
+    viewer.mouse.flush_drag()
     assert viewer.page == 1
 
 

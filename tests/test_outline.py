@@ -144,7 +144,7 @@ def test_enter_jumps_to_the_entry_and_back_returns(outlined_pdf, monkeypatch):
     viewer.overlays.handle_key("\r")
     assert (viewer.page, viewer.scroll) == (4, 0)  # /Fit: the page's top
 
-    viewer.go_back()
+    viewer.links.go_back()
     assert viewer.page == 2
 
 
@@ -163,14 +163,14 @@ def test_clicking_an_entry_jumps_and_clicking_outside_closes(outlined_pdf, monke
     viewer.overlays.show_outline()
     row0, col0, content_h, _content_w = viewer.overlays.outline_box()
     assert content_h == 4
-    viewer.handle_mouse("MOUSE_CLICK", col0 + 2, row0 + 3)  # the third entry
+    viewer.mouse.handle("MOUSE_CLICK", col0 + 2, row0 + 3)  # the third entry
     assert viewer.overlays.active is None
     assert viewer.page == 4
 
     viewer.overlays.show_outline()
-    viewer.handle_mouse("MOUSE_WHEEL_DOWN", 1, 1)
+    viewer.mouse.handle("MOUSE_WHEEL_DOWN", 1, 1)
     assert viewer.overlays.outline_sel == 3
-    viewer.handle_mouse("MOUSE_CLICK", 1, 1)  # outside the box
+    viewer.mouse.handle("MOUSE_CLICK", 1, 1)  # outside the box
     assert viewer.overlays.active is None
     assert viewer.page == 4
 
@@ -297,12 +297,12 @@ def test_the_help_scrolls_with_the_same_keys_as_the_outline(outlined_pdf, monkey
 def test_the_wheel_scrolls_the_help_and_a_click_outside_closes_it(outlined_pdf, monkeypatch):
     viewer = make_viewer(outlined_pdf, monkeypatch)
     open_overlay(viewer, "help")
-    viewer.handle_mouse("MOUSE_WHEEL_DOWN", 1, 1)
+    viewer.mouse.handle("MOUSE_WHEEL_DOWN", 1, 1)
     assert viewer.overlays.help_scroll == 1
     row0, col0, _content_h, _content_w = viewer.overlays.help_box()
-    viewer.handle_mouse("MOUSE_CLICK", col0 + 2, row0 + 1)  # inside: nothing to click
+    viewer.mouse.handle("MOUSE_CLICK", col0 + 2, row0 + 1)  # inside: nothing to click
     assert viewer.overlays.active == "help"
-    viewer.handle_mouse("MOUSE_CLICK", 1, 1)
+    viewer.mouse.handle("MOUSE_CLICK", 1, 1)
     assert viewer.overlays.active is None
 
 

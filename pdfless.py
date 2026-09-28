@@ -1446,7 +1446,7 @@ def _capture_html_pdf(
     screenshot. Confirmed by hand that Chrome's print engine happily
     paginates content taller than one `height`-tall page into further
     real PDF pages, and that a plain `<a href>` survives as a real PDF
-    link annotation (see Viewer._ensure_link_index()).
+    link annotation (see _Links.ensure_index()).
 
     The page size is set via an injected `@page` CSS rule, in a scratch
     copy of html_path that's never written back (same idea as
@@ -5227,7 +5227,7 @@ def decode_sgr_mouse(seq: str) -> tuple[str, int, int] | None:
     if (cb & 3) != 0:
         return None  # a button other than the left one
     if final == "m":
-        # A release ends a drag (see Viewer.end_scrollbar_drag()); the
+        # A release ends a drag (see _Mouse.end_drag()); the
         # motion bit may or may not still be set on it, so don't look.
         return "MOUSE_RELEASE", cx, cy
     if cb & 0x20:
@@ -5623,7 +5623,7 @@ class _Overlays:
     """The boxes drawn over the page: the help (F1 - see show_help()) and
     the table of contents (o/TAB - see show_outline()). While one is up
     it takes every key and mouse event (see handle_key() and
-    handle_mouse()); both take the same keys, and only ENTER and a click
+    _Mouse.handle()); both take the same keys, and only ENTER and a click
     on an entry are the table of contents' own.
 
     Attributes:
@@ -5861,7 +5861,7 @@ class _Overlays:
         if self.viewer.text_mode:
             self.viewer.go_to_page_text(entry["page"], 0)
         else:
-            self.viewer._push_history()
+            self.viewer.links.push_history()
             self.viewer.go_to_link_target(entry["page"], entry["top_pt"])
         self.viewer.refresh()
 
@@ -6366,6 +6366,307 @@ class _Search:
         )
 
 
+class _Links:
+    """A PDF's hyperlinks, and the back/forward history of the jumps
+    internal links and the table of contents make: a click on a link
+    opens a URL in the browser or jumps to the link's target, and `[`/`]`
+    (or a mouse's back/forward buttons) walk back and forth through the
+    positions jumped from - the same "back stack, forward stack, a fresh
+    jump clears forward" model a web browser uses. Image mode only.
+
+    Attributes:
+        viewer: the Viewer the links are clicked in.
+        index: every page's links (see PdfDocument.build_link_index()),
+            built on first use - or None.
+        back: the positions to go back to, latest last, each
+            (page, scroll, x_offset).
+        forward: the positions gone back from, to go forward to again.
+    """
+
+    def __init__(self, viewer: Viewer) -> None:
+        """Args:
+            viewer: the Viewer the links are clicked in.
+        """
+        self.viewer = viewer
+        self.index: list[dict[str, Any]] | None = None
+        self.back: list[tuple[int, int, int]] = []
+        self.forward: list[tuple[int, int, int]] = []
+
+    def reset(self) -> None:
+        """Drop the links and the history, for a switch to another file."""
+        self.index = None
+        self.back = []
+        self.forward = []
+
+    def at(self, col: int, row: int) -> dict[str, Any] | None:
+        """The link under a click at 1-based terminal cell (col, row) of
+        the page image, if any - the smallest one, where links overlap.
+
+        Args:
+            col, row: the clicked cell.
+
+        Returns:
+            The link, as PdfDocument.build_link_index() gives it, or None."""
+        viewer = self.viewer
+        link_index = self.ensure_index()
+        # Which page the click landed on, and how far down it the top
+        # of the viewport is - always the current page normally; under
+        # -c/--continuous, whichever page in the layout covers the
+        # clicked row (none, if it's in a gap between pages).
+        page, img, origin = viewer.page, viewer.img, viewer.scroll
+        if viewer.continuous:
+            click_y = (row - 1) * viewer.cell_h_px
+            for p, top, p_img in viewer._layout:
+                if top <= click_y < top + p_img.height:
+                    page, img, origin = p, p_img, -top
+                    break
+            else:
+                return None  # a gap between pages
+        page_info = link_index[page - 1]
+        if not page_info["links"] or not page_info["width_pt"] or not page_info["height_pt"]:
+            return None
+
+        # The clicked cell -> the pixel rectangle it covers on the full
+        # page raster (undoing the current pan/scroll) -> a PDF-point
+        # rectangle, in the same coordinate system build_link_index()
+        # stored link rects in. A whole-cell rectangle, not just its
+        # center point, matters here: a citation-style link (e.g. just
+        # "5.7" in "figure 5.7") is often tightly boxed around the
+        # digits by whatever generated the PDF, so its rect can be
+        # thinner than one terminal row is tall - a single sampled point
+        # would frequently land just outside it and miss the click.
+        scale_x = page_info["width_pt"] / img.width
+        scale_y = page_info["height_pt"] / img.height
+        cell_xmin = (viewer.x_offset + (col - 1) * viewer.cell_w_px) * scale_x
+        cell_xmax = cell_xmin + viewer.cell_w_px * scale_x
+        cell_ymin = (origin + (row - 1) * viewer.cell_h_px) * scale_y
+        cell_ymax = cell_ymin + viewer.cell_h_px * scale_y
+
+        best = None
+        best_area = None
+        for link in page_info["links"]:
+            if (
+                link["xmax"] < cell_xmin or link["xmin"] > cell_xmax
+                or link["ymax"] < cell_ymin or link["ymin"] > cell_ymax
+            ):
+                continue  # no overlap between the link and the clicked cell
+            area = (link["xmax"] - link["xmin"]) * (link["ymax"] - link["ymin"])
+            if best is None or area < best_area:
+                best, best_area = link, area
+        return best
+
+    def ensure_index(self) -> list[dict[str, Any]]:
+        """self.index (see PdfDocument.build_link_index()), built on
+        first use - and returned, for the caller to use directly."""
+        viewer = self.viewer
+        if self.index is None:
+            pdf_source = viewer._pdf_source()
+            if pdf_source is not None:
+                self.index = pdf_source.build_link_index(viewer.npages)
+            else:
+                # No hyperlinks outside a PDF, but a multi-page "office"
+                # preview (or, in principle, a multi-page "image") still
+                # needs one empty entry per page - _Mouse.click() indexes
+                # this by viewer.page, which can be > 1 for those kinds.
+                self.index = [
+                    {"width_pt": 0.0, "height_pt": 0.0, "links": []}
+                    for _ in range(viewer.npages)
+                ]
+        return self.index
+
+    def activate(self, link: dict[str, Any]) -> None:
+        """Follow `link` (from at()): open a URL in the system browser,
+        or jump to an internal link's target, recording where the jump
+        left from (see push_history())."""
+        viewer = self.viewer
+        if link["kind"] == "uri":
+            try:
+                opened = webbrowser.open(link["uri"])
+            except webbrowser.Error:
+                opened = False
+            viewer.draw_status(
+                f"opened {link['uri']}" if opened else f"couldn't open {link['uri']}"
+            )
+        else:
+            self.push_history()
+            viewer.go_to_link_target(link["page"], link["top_pt"])
+            viewer.refresh()
+
+    def push_history(self) -> None:
+        """Record the position an internal-link jump is about to leave,
+        so `[`/`]` (or a mouse back/forward button) can return to it -
+        the same "back stack, forward stack, a fresh jump clears
+        forward" model a web browser uses."""
+        viewer = self.viewer
+        self.back.append((viewer.page, viewer.scroll, viewer.x_offset))
+        self.forward.clear()
+
+    def go_back(self) -> None:
+        """`[` (or a mouse's back button): return to where the last jump left."""
+        self._go_history(self.back, self.forward, "earlier")
+
+    def go_forward(self) -> None:
+        """`]` (or a mouse's forward button): redo a jump undone by go_back()."""
+        self._go_history(self.forward, self.back, "later")
+
+    def _go_history(
+        self, from_stack: list[tuple[int, int, int]], to_stack: list[tuple[int, int, int]],
+        label: str,
+    ) -> None:
+        viewer = self.viewer
+        if viewer.text_mode or viewer.overlays.active is not None:
+            return
+        if not from_stack:
+            viewer.draw_status(f"no {label} position")
+            return
+        to_stack.append((viewer.page, viewer.scroll, viewer.x_offset))
+        page, scroll, x_offset = from_stack.pop()
+        viewer._restore_position(page, scroll, x_offset)
+        viewer.refresh()
+
+
+class _Mouse:
+    """What mouse events do (image mode only - text mode leaves mouse
+    reporting off so the terminal's own text selection works): a click
+    on the scrollbar jumps there and dragging it follows the pointer, a
+    click on a link follows it (see _Links), the wheel scrolls, and the
+    back/forward buttons walk the jump history. While the help or the
+    table of contents is up, it takes every event instead.
+
+    Attributes:
+        viewer: the Viewer the events act on.
+        dragging: whether a press landed on the scrollbar and the button
+            hasn't come back up yet (see drag()).
+        drag_row: the drag's latest position, not acted on until
+            flush_drag() - or None.
+    """
+
+    def __init__(self, viewer: Viewer) -> None:
+        """Args:
+            viewer: the Viewer the events act on.
+        """
+        self.viewer = viewer
+        self.dragging = False
+        self.drag_row: int | None = None
+
+    def handle(self, kind: str, col: int, row: int) -> None:
+        """One decoded mouse event (see decode_sgr_mouse()): the help or
+        the table of contents takes it while one is up (see
+        _Overlays.handle_mouse()), and otherwise clicks/drags/the wheel/
+        the back and forward buttons act on the page."""
+        viewer = self.viewer
+        if viewer.overlays.active is not None:
+            viewer.overlays.handle_mouse(kind, col, row)
+        elif kind == "MOUSE_CLICK":
+            self.click(col, row)
+        elif kind == "MOUSE_DRAG":
+            if self.drag(row):
+                # A drag arrives as a burst of motion events, and acting
+                # on one costs a page rasterize - so let the burst drain
+                # first and only act on where the pointer actually ended up.
+                ready, _, _ = select.select([viewer.fd], [], [], 0)
+                if not ready:
+                    self.flush_drag()
+        elif kind == "MOUSE_RELEASE":
+            self.end_drag()
+        elif kind == "MOUSE_WHEEL_UP":
+            self.wheel(-1)
+        elif kind == "MOUSE_WHEEL_DOWN":
+            self.wheel(1)
+        elif kind == "MOUSE_BACK":
+            viewer.links.go_back()
+        elif kind == "MOUSE_FORWARD":
+            viewer.links.go_forward()
+
+    def click(self, col: int, row: int) -> None:
+        """A left-click at 1-based terminal cell (col, row): on the
+        scrollbar, jump to the position it points at; otherwise, if it
+        landed on a PDF hyperlink in the currently displayed crop,
+        follow it - open a URL in the system browser, or jump to an
+        internal link's target page/position."""
+        viewer = self.viewer
+        if viewer.text_mode or viewer.overlays.active is not None or row >= viewer.rows:
+            return  # row == viewer.rows is the status bar
+        # Any press starts a fresh gesture: one that lands on the
+        # scrollbar keeps following the pointer until the button comes
+        # back up (see drag()), one anywhere else doesn't.
+        self.dragging = bool(viewer.scrollbar and col == viewer.cols)
+        if self.dragging:
+            self._jump_to_scrollbar_row(row)
+            return
+        link = viewer.links.at(col, row)
+        if link is not None:
+            viewer.links.activate(link)
+
+    def drag(self, row: int) -> bool:
+        """Left-button motion, while a scrollbar drag is in progress -
+        i.e. the press that started it landed on the scrollbar (see
+        click()); dragging anywhere else is left alone, so a
+        stray drag across the page image doesn't send it jumping.
+
+        Only records where the pointer is: acting on it costs a page
+        rasterize, and a drag arrives as a burst of motion events, so
+        flush_drag() applies the last one once the burst lets
+        up rather than walking every page in between. Returns whether
+        the drag was taken."""
+        if not self.dragging or self.viewer.text_mode or self.viewer.overlays.active is not None:
+            return False
+        self.drag_row = row
+        return True
+
+    def flush_drag(self) -> None:
+        """Act on the position drag() last recorded, if any."""
+        if self.drag_row is None:
+            return
+        row = self.drag_row
+        self.drag_row = None
+        self._jump_to_scrollbar_row(row)
+
+    def end_drag(self) -> None:
+        """The button came back up - act on wherever it was let go."""
+        self.flush_drag()
+        self.dragging = False
+
+    def _jump_to_scrollbar_row(self, row: int) -> None:
+        """Jump to wherever a click at `row` points on the scrollbar -
+        the clicked cell's own place in the track is read as where the
+        visible window should start, undoing what Viewer._scrollbar_fractions()
+        did to put the thumb there. Image mode only: mouse reporting
+        stays off in text mode so the terminal's own click-drag text
+        selection keeps working (see Viewer.enter_text_mode())."""
+        viewer = self.viewer
+        avail_rows = max(1, viewer.rows - 1)
+        start_frac = max(0.0, min(1.0, (row - 1) / avail_rows))
+        # In "page units" - e.g. 3.5 is halfway down page 4 - so the
+        # page and the position within it fall out of the same number.
+        doc_pos = start_frac * max(1, viewer.npages)
+        page = max(1, min(viewer.npages, int(doc_pos) + 1))
+        within_frac = max(0.0, min(1.0, doc_pos - (page - 1)))
+        if page != viewer.page:
+            # Skipped when it's the page already showing, so a click
+            # that only scrolls within it doesn't reload and rescale
+            # the very same image for nothing.
+            viewer.go_page(page, 0)
+        viewer.scroll = viewer._clamp_image_scroll(round(within_frac * viewer.img.height))
+        viewer.refresh()
+
+    def wheel(self, direction: int) -> None:
+        """A scroll-wheel step: direction -1 (up) or +1 (down), the
+        viewer's wheel_scroll_step lines each (--wheel-scroll-step) - the
+        same page-boundary roll-over as e/y. Only meaningful in the page
+        image (mouse reporting is off in text mode, so this shouldn't
+        normally fire there, but the guard is cheap insurance)."""
+        viewer = self.viewer
+        if viewer.text_mode or viewer.overlays.active is not None:
+            return
+        step = viewer.cell_h_px * viewer.wheel_scroll_step
+        if direction < 0:
+            viewer.scroll_up(step)
+        else:
+            viewer.scroll_down(step)
+        viewer.refresh()
+
+
 class Viewer:
     def __init__(
         self, files: list[DocumentHandler | str], file_index: int, page: int, tmpdir: str, fd: int,
@@ -6513,9 +6814,7 @@ class Viewer:
         self._text_separator_lines: frozenset[int] = frozenset()
         self._text_max_page_lines = 0  # the -N gutter's width, per page
         self.overlays: _Overlays = _Overlays(self)  # the help and the table of contents
-        self._link_index: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_link_index()
-        self._history_back: list[tuple[int, int, int]] = []  # [(page, scroll, x_offset), ...]
-        self._history_forward: list[tuple[int, int, int]] = []
+        self.links: _Links = _Links(self)  # hyperlinks, and the [/] jump history
         self.search: _Search = _Search(self)  # "/" and "?"
         # A plain text file has no image view at all - it's permanently
         # "in text mode", the same rendering PDF's `t` key switches to.
@@ -6546,10 +6845,7 @@ class Viewer:
         # make sense for
         self._copy_mode_saved: tuple[bool, bool, bool, bool] | None = None  # while "C" has the decorations
         # off, what to put back on the next press - see toggle_copy_mode()
-        self._scrollbar_drag = False  # a press landed on the scrollbar
-        # and the button hasn't come back up yet - see handle_drag()
-        self._scrollbar_drag_row: int | None = None  # its latest position, not acted
-        # on until flush_scrollbar_drag()
+        self.mouse: _Mouse = _Mouse(self)
         self.scrollbar = options.scrollbar  # --no-scrollbar: a column on the
         # terminal's right edge showing scroll position - in both image
         # mode (_draw()) and text mode (_draw_text_wrapped()/
@@ -6807,10 +7103,8 @@ class Viewer:
         self._set_current_file()
         self.encode_cache.clear()
         self.search.reset()
-        self._link_index = None
+        self.links.reset()
         self.overlays.forget_outline()
-        self._history_back = []
-        self._history_forward = []
         self.text_mode = self.doc_handler.starts_in_text_mode()
         self.text_border = self._default_text_border()
         self.text_wrap = self._default_text_wrap()
@@ -8735,195 +9029,6 @@ class Viewer:
             return self.doc_handler
         return getattr(self.doc_handler, "_pdf_delegate", None)
 
-    def _ensure_link_index(self) -> list[dict[str, Any]]:
-        """self._link_index (see PdfDocument.build_link_index()), built on
-        first use - and returned, for the caller to use directly."""
-        if self._link_index is None:
-            pdf_source = self._pdf_source()
-            if pdf_source is not None:
-                self._link_index = pdf_source.build_link_index(self.npages)
-            else:
-                # No hyperlinks outside a PDF, but a multi-page "office"
-                # preview (or, in principle, a multi-page "image") still
-                # needs one empty entry per page - handle_click() indexes
-                # this by self.page, which can be > 1 for those kinds.
-                self._link_index = [
-                    {"width_pt": 0.0, "height_pt": 0.0, "links": []}
-                    for _ in range(self.npages)
-                ]
-        return self._link_index
-
-    def handle_click(self, col: int, row: int) -> None:
-        """A left-click at 1-based terminal cell (col, row): on the
-        scrollbar, jump to the position it points at; otherwise, if it
-        landed on a PDF hyperlink in the currently displayed crop,
-        follow it - open a URL in the system browser, or jump to an
-        internal link's target page/position."""
-        if self.text_mode or self.overlays.active is not None or row >= self.rows:
-            return  # row == self.rows is the status bar
-        # Any press starts a fresh gesture: one that lands on the
-        # scrollbar keeps following the pointer until the button comes
-        # back up (see handle_drag()), one anywhere else doesn't.
-        self._scrollbar_drag = bool(self.scrollbar and col == self.cols)
-        if self._scrollbar_drag:
-            self._jump_to_scrollbar_row(row)
-            return
-        link_index = self._ensure_link_index()
-        # Which page the click landed on, and how far down it the top
-        # of the viewport is - always the current page normally; under
-        # -c/--continuous, whichever page in the layout covers the
-        # clicked row (none, if it's in a gap between pages).
-        page, img, origin = self.page, self.img, self.scroll
-        if self.continuous:
-            click_y = (row - 1) * self.cell_h_px
-            for p, top, p_img in self._layout:
-                if top <= click_y < top + p_img.height:
-                    page, img, origin = p, p_img, -top
-                    break
-            else:
-                return
-        page_info = link_index[page - 1]
-        if not page_info["links"] or not page_info["width_pt"] or not page_info["height_pt"]:
-            return
-
-        # The clicked cell -> the pixel rectangle it covers on the full
-        # page raster (undoing the current pan/scroll) -> a PDF-point
-        # rectangle, in the same coordinate system build_link_index()
-        # stored link rects in. A whole-cell rectangle, not just its
-        # center point, matters here: a citation-style link (e.g. just
-        # "5.7" in "figure 5.7") is often tightly boxed around the
-        # digits by whatever generated the PDF, so its rect can be
-        # thinner than one terminal row is tall - a single sampled point
-        # would frequently land just outside it and miss the click.
-        scale_x = page_info["width_pt"] / img.width
-        scale_y = page_info["height_pt"] / img.height
-        cell_xmin = (self.x_offset + (col - 1) * self.cell_w_px) * scale_x
-        cell_xmax = cell_xmin + self.cell_w_px * scale_x
-        cell_ymin = (origin + (row - 1) * self.cell_h_px) * scale_y
-        cell_ymax = cell_ymin + self.cell_h_px * scale_y
-
-        best = None
-        best_area = None
-        for link in page_info["links"]:
-            if (
-                link["xmax"] < cell_xmin or link["xmin"] > cell_xmax
-                or link["ymax"] < cell_ymin or link["ymin"] > cell_ymax
-            ):
-                continue  # no overlap between the link and the clicked cell
-            area = (link["xmax"] - link["xmin"]) * (link["ymax"] - link["ymin"])
-            if best is None or area < best_area:
-                best, best_area = link, area
-        if best is not None:
-            self._activate_link(best)
-
-    def handle_drag(self, row: int) -> bool:
-        """Left-button motion, while a scrollbar drag is in progress -
-        i.e. the press that started it landed on the scrollbar (see
-        handle_click()); dragging anywhere else is left alone, so a
-        stray drag across the page image doesn't send it jumping.
-
-        Only records where the pointer is: acting on it costs a page
-        rasterize, and a drag arrives as a burst of motion events, so
-        flush_scrollbar_drag() applies the last one once the burst lets
-        up rather than walking every page in between. Returns whether
-        the drag was taken."""
-        if not self._scrollbar_drag or self.text_mode or self.overlays.active is not None:
-            return False
-        self._scrollbar_drag_row = row
-        return True
-
-    def flush_scrollbar_drag(self) -> None:
-        """Act on the position handle_drag() last recorded, if any."""
-        if self._scrollbar_drag_row is None:
-            return
-        row = self._scrollbar_drag_row
-        self._scrollbar_drag_row = None
-        self._jump_to_scrollbar_row(row)
-
-    def end_scrollbar_drag(self) -> None:
-        """The button came back up - act on wherever it was let go."""
-        self.flush_scrollbar_drag()
-        self._scrollbar_drag = False
-
-    def _jump_to_scrollbar_row(self, row: int) -> None:
-        """Jump to wherever a click at `row` points on the scrollbar -
-        the clicked cell's own place in the track is read as where the
-        visible window should start, undoing what _scrollbar_fractions()
-        did to put the thumb there. Image mode only: mouse reporting
-        stays off in text mode so the terminal's own click-drag text
-        selection keeps working (see enter_text_mode())."""
-        avail_rows = max(1, self.rows - 1)
-        start_frac = max(0.0, min(1.0, (row - 1) / avail_rows))
-        # In "page units" - e.g. 3.5 is halfway down page 4 - so the
-        # page and the position within it fall out of the same number.
-        doc_pos = start_frac * max(1, self.npages)
-        page = max(1, min(self.npages, int(doc_pos) + 1))
-        within_frac = max(0.0, min(1.0, doc_pos - (page - 1)))
-        if page != self.page:
-            # Skipped when it's the page already showing, so a click
-            # that only scrolls within it doesn't reload and rescale
-            # the very same image for nothing.
-            self.go_page(page, 0)
-        self.scroll = self._clamp_image_scroll(round(within_frac * self.img.height))
-        self.refresh()
-
-    def handle_wheel(self, direction: int) -> None:
-        """A scroll-wheel step: direction -1 (up) or +1 (down),
-        self.wheel_scroll_step lines each (--wheel-scroll-step) - the
-        same page-boundary roll-over as e/y. Only meaningful in the page
-        image (mouse reporting is off in text mode, so this shouldn't
-        normally fire there, but the guard is cheap insurance)."""
-        if self.text_mode or self.overlays.active is not None:
-            return
-        step = self.cell_h_px * self.wheel_scroll_step
-        if direction < 0:
-            self.scroll_up(step)
-        else:
-            self.scroll_down(step)
-        self.refresh()
-
-    def _activate_link(self, link: dict[str, Any]) -> None:
-        if link["kind"] == "uri":
-            try:
-                opened = webbrowser.open(link["uri"])
-            except webbrowser.Error:
-                opened = False
-            self.draw_status(
-                f"opened {link['uri']}" if opened else f"couldn't open {link['uri']}"
-            )
-        else:
-            self._push_history()
-            self.go_to_link_target(link["page"], link["top_pt"])
-            self.refresh()
-
-    def _push_history(self) -> None:
-        """Record the position an internal-link jump is about to leave,
-        so `[`/`]` (or a mouse back/forward button) can return to it -
-        the same "back stack, forward stack, a fresh jump clears
-        forward" model a web browser uses."""
-        self._history_back.append((self.page, self.scroll, self.x_offset))
-        self._history_forward.clear()
-
-    def go_back(self) -> None:
-        self._go_history(self._history_back, self._history_forward, "earlier")
-
-    def go_forward(self) -> None:
-        self._go_history(self._history_forward, self._history_back, "later")
-
-    def _go_history(
-        self, from_stack: list[tuple[int, int, int]], to_stack: list[tuple[int, int, int]],
-        label: str,
-    ) -> None:
-        if self.text_mode or self.overlays.active is not None:
-            return
-        if not from_stack:
-            self.draw_status(f"no {label} position")
-            return
-        to_stack.append((self.page, self.scroll, self.x_offset))
-        page, scroll, x_offset = from_stack.pop()
-        self._restore_position(page, scroll, x_offset)
-        self.refresh()
-
     def _restore_position(self, page: int, scroll: int, x_offset: int) -> None:
         self.page = max(1, min(self.npages, page))
         self._load_page()  # loads the image and recomputes scroll_max
@@ -9356,34 +9461,6 @@ class Viewer:
             return False
         return True
 
-    def handle_mouse(self, kind: str, col: int, row: int) -> None:
-        """One decoded mouse event (see decode_sgr_mouse()): the help or
-        the table of contents takes it while one is up (see
-        _Overlays.handle_mouse()), and otherwise clicks/drags/the wheel/
-        the back and forward buttons act on the page."""
-        if self.overlays.active is not None:
-            self.overlays.handle_mouse(kind, col, row)
-        elif kind == "MOUSE_CLICK":
-            self.handle_click(col, row)
-        elif kind == "MOUSE_DRAG":
-            if self.handle_drag(row):
-                # A drag arrives as a burst of motion events, and acting
-                # on one costs a page rasterize - so let the burst drain
-                # first and only act on where the pointer actually ended up.
-                ready, _, _ = select.select([self.fd], [], [], 0)
-                if not ready:
-                    self.flush_scrollbar_drag()
-        elif kind == "MOUSE_RELEASE":
-            self.end_scrollbar_drag()
-        elif kind == "MOUSE_WHEEL_UP":
-            self.handle_wheel(-1)
-        elif kind == "MOUSE_WHEEL_DOWN":
-            self.handle_wheel(1)
-        elif kind == "MOUSE_BACK":
-            self.go_back()
-        elif kind == "MOUSE_FORWARD":
-            self.go_forward()
-
     def _view_state(self) -> tuple:
         """Everything handle_key()/handle_key_text() can change that
         affects what's on screen - run_viewer() compares it before and
@@ -9438,9 +9515,9 @@ class Viewer:
             if self.page > 1:
                 self.go_page(self.page - 1, 0)
         elif key == "[":
-            self.go_back()
+            self.links.go_back()
         elif key == "]":
-            self.go_forward()
+            self.links.go_forward()
         elif key == "q":
             return False
         return True
@@ -9771,7 +9848,7 @@ class _KeyDispatcher:
         viewer = self.viewer
         if isinstance(key, tuple):  # ("MOUSE", kind, col, row)
             if self.search_editor is None:
-                viewer.handle_mouse(*key[1:])
+                viewer.mouse.handle(*key[1:])
             return True
         if key == "\x1a":
             _suspend(self._fd, self._old_termios, self._keep, viewer)
@@ -9981,8 +10058,8 @@ def run_viewer(
         if not r:
             # Nothing waiting - a good moment to act on a scrollbar drag
             # whose motion events stopped without a release arriving
-            # (see Viewer.handle_mouse()); a no-op otherwise.
-            viewer.flush_scrollbar_drag()
+            # (see _Mouse.handle()); a no-op otherwise.
+            viewer.mouse.flush_drag()
             continue
         key = read_key(fd)
         if key is None:
