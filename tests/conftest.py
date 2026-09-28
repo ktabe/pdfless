@@ -117,6 +117,14 @@ def sample_twopage_docx():
 
 
 @pytest.fixture
+def sample_headings_docx():
+    """A 2-page Word document with real Heading 1/Heading 2 styles -
+    "第1章 はじめに" and "1.1 背景" on page 1, "Chapter 2" on page 2 -
+    built via python-docx."""
+    return os.path.join(FIXTURES_DIR, "sample_headings.docx")
+
+
+@pytest.fixture
 def sample_docx_with_link():
     """A Word document with one real external hyperlink ("click me" ->
     https://example.com/hello) - built via python-docx (its w:hyperlink

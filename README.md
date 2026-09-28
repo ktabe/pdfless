@@ -18,7 +18,8 @@ It has been tested with [iTerm2](https://iterm2.com) and
 - Scroll, zoom, and pan with the keyboard or mouse.
 - View paginated documents continuously, with adjacent pages on screen together.
 - Search PDF text and follow external and internal PDF links.
-- Jump to a section from the PDF's table of contents (bookmarks).
+- Jump to a section from the table of contents: a PDF's bookmarks, Markdown
+  headings, and Word headings or PowerPoint slide titles (with LibreOffice).
 - Switch to text mode to read or copy extracted text.
 - Show a clickable and draggable scrollbar.
 - Open multiple files and switch between them.
@@ -237,7 +238,7 @@ plain images and previews without extractable text. While a search is active,
 | `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-f`/`--follow` is specified. |
 | Click a PDF link | Open a URL in the system browser or follow an internal link. |
 | `[` / `]` | Go back / forward through the positions internal links and the table of contents (`o`) jumped from. |
-| `o`, `TAB` | Show the PDF's table of contents (bookmarks), with the current section selected. Move with `j`/`k` or the mouse wheel, then press `ENTER` or click an entry to jump there. Press `q` to close it. |
+| `o`, `TAB` | Show the table of contents (a PDF's bookmarks, or a document's headings), with the current section selected. Move with `j`/`k` or the mouse wheel, then press `ENTER` or click an entry to jump there. Press `q` to close it. |
 | Click or drag the scrollbar | Jump to a document position in image mode. In text mode, the scrollbar is display-only. |
 | Mouse wheel | Scroll by two lines in image mode (configurable) or one line in text mode. |
 | `v` | Open the file in its default app (macOS only) and switch follow mode on, so an edit made there is picked up automatically. |
