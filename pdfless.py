@@ -121,13 +121,21 @@ STATUS_COLOR_FOLLOW = "\x1b[41;97m"  # white on red - stands out, since it
 STATUS_COLOR_HELP = "\x1b[100;37m"  # light grey on dark grey
 
 # Text-mode search match: no image to draw a box marker over there, so
-# the matched substring itself is highlighted with a background color.
-TEXT_HIGHLIGHT_COLOR = "\x1b[43;30m"  # black on yellow
+# the matched substring itself is highlighted with a background color -
+# the amber of the image-mode box's line (see SEARCH_MARKER_COLOR, whose
+# pale cream would hardly show on a light theme's background), in 24-bit
+# color so no theme's palette changes it.
+TEXT_HIGHLIGHT_COLOR = "\x1b[38;2;0;0;0;48;2;238;160;45m"  # black on amber
 
-# PDF (image) mode search match: same yellow, as a foreground color for
-# the box-drawing border characters (there's no text to paint a
-# background behind, just the underlying page image).
-SEARCH_MARKER_COLOR = "\x1b[93m"  # bright yellow
+# PDF (image) mode search match: the box-drawing border's color. Each
+# border character replaces a cell of the page image with a text cell,
+# whose background would otherwise be the terminal's own - black on a
+# dark theme, a heavy black frame around the match - so it's given a
+# pale cream of its own, which sits well on a page (usually white),
+# with the line itself in amber. 24-bit colors, which iTerm2 and
+# WezTerm (the terminals image mode needs) both take, so no theme's
+# palette changes them.
+SEARCH_MARKER_COLOR = "\x1b[38;2;238;160;45;48;2;255;249;228m"  # amber on cream
 
 # Wrap mode (_draw_text_wrapped()): marks a real newline (the last
 # display row of a raw line) with U+21B5 (↵), distinct from a row that's
@@ -154,13 +162,12 @@ PAGE_SEPARATOR_COLOR = "\x1b[90m"  # gray
 PAGE_NUMBER_COLOR = "\x1b[1;32m"  # bold green
 
 # The scrollbar's two kinds of cell, ready to write (see
-# Viewer._scrollbar_column()). The thumb is a reverse-video space
-# rather than a block in some fixed color: reverse video swaps whatever
-# foreground and background the terminal's theme is already using, so
-# it stands out against any of them - a fixed color eventually lands on
-# a theme that paints the background nearly the same shade.
-SCROLLBAR_TRACK = "\x1b[90m│\x1b[0m"  # a thin gray line
-SCROLLBAR_THUMB = "\x1b[7m \x1b[0m"  # a solid block
+# Viewer._scrollbar_column()), in 24-bit colors of pdfless's own rather
+# than the theme's: the whole column filled - a mid-gray track, the
+# thumb a light teal block in it - so it reads as one bar on a dark
+# theme's background and a light one's alike.
+SCROLLBAR_TRACK = "\x1b[48;2;122;124;125m \x1b[0m"  # #7a7c7d, mid gray
+SCROLLBAR_THUMB = "\x1b[48;2;131;204;210m \x1b[0m"  # #83ccd2, light teal
 CACHE_SIZE = 6
 # PageCache's memory budget, on top of CACHE_SIZE: a whole spreadsheet
 # sheet on one page (see _SOFFICE_SPREADSHEET_PDF_FILTER) can rasterize
