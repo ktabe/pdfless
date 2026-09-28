@@ -1,7 +1,8 @@
 """The pieces run_viewer()'s input loop is built from, tested without a
 pty-driven subprocess: read_key() (escape-sequence decoding),
 _LineEditor (the search prompt's line editing), _PREFIX_BINDINGS (":"
-and "-" prefixes), and the Viewer's own key/count handlers."""
+and "-" prefixes), the Viewer's own key/count handlers, and
+_KeyDispatcher, which decides which of them a key goes to."""
 
 import fcntl
 import os
@@ -220,3 +221,72 @@ def test_report_unreadable_file_reraises_if_the_file_is_still_there(sample_pdf):
         assert str(e) == "some other failure"
     else:
         raise AssertionError("should have re-raised")
+
+
+def dispatcher_for(viewer):
+    """A _KeyDispatcher on `viewer` - ^Z's suspend isn't exercised here,
+    so it gets no real terminal to give back."""
+    return pdfless._KeyDispatcher(viewer, -1, [], keep=False)
+
+
+def feed(dispatcher, keys):
+    """handle() each of `keys` in turn - what each returned."""
+    return [dispatcher.handle(k) for k in keys]
+
+
+def test_the_search_prompt_takes_every_key_until_enter(sample_pdf, monkeypatch):
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    searches, clicks = [], []
+    monkeypatch.setattr(viewer, "start_search", lambda q, backward, multiline: searches.append((q, backward)))
+    monkeypatch.setattr(viewer, "handle_mouse", lambda *a: clicks.append(a))
+    d = dispatcher_for(viewer)
+    # "q" and "n" are typed into the query, not quitting or repeating;
+    # a click while typing is dropped.
+    assert feed(d, ["/", "q", "n", ("MOUSE", "MOUSE_CLICK", 1, 1)]) == [True] * 4
+    assert d.search_editor.text == "qn"
+    assert clicks == []
+    d.handle("\r")
+    assert d.search_editor is None
+    # An empty query repeats the last one; "?" searches backward.
+    feed(d, ["?", "\r"])
+    assert searches == [("qn", False), ("qn", True)]
+    feed(d, ["/", "x", "\x03"])  # ^C cancels the prompt, not pdfless
+    assert d.search_editor is None
+    assert len(searches) == 2
+
+
+def test_prefixes_take_the_next_key(sample_pdf):
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    d = dispatcher_for(viewer)
+    assert feed(d, [":", "x"]) == [True, True]  # an unbound key just cancels
+    assert d.pending_prefix is None
+    d.handle("-")  # zoom out in image mode - not a prefix
+    assert d.pending_prefix is None
+    assert feed(d, [":", "q"]) == [True, False]
+
+
+def test_ctrl_c_quits_but_q_first_closes_what_is_up(sample_pdf):
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    d = dispatcher_for(viewer)
+    assert d.handle("F1") and viewer.overlay == "help"
+    assert d.handle("q") and viewer.overlay is None  # closes the help
+    viewer.start_search("lorem")
+    assert viewer.search_query is not None
+    assert d.handle("q") and viewer.search_query is None  # clears the search
+    assert d.handle("q") is False
+    assert dispatcher_for(viewer).handle("\x03") is False
+
+
+def test_a_count_goes_to_the_key_after_it(sample_pdf, monkeypatch):
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    d = dispatcher_for(viewer)
+    feed(d, ["3", "<"])
+    assert viewer.page == 3
+    feed(d, ["5", "x"])  # any other key drops the count
+    assert d.num_buf == ""
+
+    assert viewer.enter_text_mode()
+    lines = []
+    monkeypatch.setattr(viewer, "go_to_text_line", lines.append)
+    feed(d, ["1", "2", "g"])
+    assert lines == [12]
