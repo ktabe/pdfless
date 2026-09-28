@@ -32,6 +32,7 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import fcntl
+import functools
 import getpass
 import hashlib
 import html
@@ -225,6 +226,25 @@ FOCUS_ON = "\x1b[?1004h"
 FOCUS_OFF = "\x1b[?1004l"
 
 
+# Characters drawn with no column of their own, by general category
+# (see char_width()): nonspacing and enclosing marks - the combining
+# marks without a combining class too, such as Thai vowel signs,
+# variation selectors (U+FE00-FE0F, and U+E0100- for the ideographic
+# variants in Japanese names, "葛󠄀") and enclosing circles - and format
+# characters, such as the zero width joiner. The soft hyphen (U+00AD,
+# also a format character) is below char_width()'s Latin-1 cutoff, so
+# it keeps the column terminals draw it in.
+_ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Cf"})
+# The vowels and final consonants of Hangul's conjoining jamo: in a
+# decomposed (NFD, e.g. a macOS file name) syllable they follow its
+# initial consonant, which takes the syllable's two columns alone.
+_HANGUL_JAMO_JOINING = ((0x1160, 0x11FF), (0xD7B0, 0xD7FF))
+
+
+# Cached: text mode asks for every character it lays out, and the
+# checks below take several lookups apiece, while any text has only so
+# many different characters in it.
+@functools.lru_cache(maxsize=None)
 def char_width(ch: str) -> int:
     """Terminal column width of one character: 0 for a combining mark,
     2 for wide/fullwidth East Asian characters (e.g. most Japanese/
@@ -241,8 +261,30 @@ def char_width(ch: str) -> int:
     no column of its own - and has to be checked first: the combining
     (han)dakuten U+3099/U+309A of decomposed (NFD) kana, as in a macOS
     file name, are "W" to east_asian_width(), so "ク" + U+3099 ("グ")
-    would otherwise count as four columns instead of two."""
-    if unicodedata.combining(ch):
+    would otherwise count as four columns instead of two. Not every such
+    mark has a combining class, though, so it goes by the general
+    category too (see _ZERO_WIDTH_CATEGORIES), and a decomposed Hangul
+    syllable's vowel and final consonant join its initial consonant's
+    two columns (see _HANGUL_JAMO_JOINING).
+
+    Args:
+        ch: one character.
+
+    Returns:
+        Its width: 0, 1 or 2."""
+    code = ord(ch)
+    if code < 0x300:  # ASCII and Latin-1: no marks or wide characters there
+        return 1
+    if code == 0xFE0F:
+        # VARIATION SELECTOR-16 asks for the emoji form of the character
+        # before it - two columns, where that one (❤, ☺, ...) alone
+        # takes one - so it's the extra column itself.
+        return 1
+    if (
+        unicodedata.combining(ch)
+        or unicodedata.category(ch) in _ZERO_WIDTH_CATEGORIES
+        or any(lo <= code <= hi for lo, hi in _HANGUL_JAMO_JOINING)
+    ):
         return 0
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
@@ -262,6 +304,40 @@ def truncate_to_width(s: str, width: int) -> str:
         out.append(ch)
         total += w
     return "".join(out)
+
+
+def truncate_start_to_width(s: str, width: int) -> str:
+    """Fit `s` into `width` terminal columns by cutting its start rather
+    than its end, marking the cut with "…" - for a path, whose end (the
+    file's own name) is the part worth seeing.
+
+    Args:
+        s: the text.
+        width: the columns it may take.
+
+    Returns:
+        `s` itself if it fits, otherwise "…" and as much of its end as
+        fits after it.
+    """
+    if display_width(s) <= width:
+        return s
+    if width < 1:
+        return ""
+    tail: list[str] = []
+    total = 1  # the "…"
+    # From the end backwards: a combining mark (width 0) comes after its
+    # base character, so it's taken first and stays with it.
+    for ch in reversed(s):
+        w = char_width(ch)
+        if total + w > width:
+            break
+        tail.append(ch)
+        total += w
+    # Marks whose base character didn't fit go too, rather than hang
+    # off the "…".
+    while tail and char_width(tail[-1]) == 0:
+        tail.pop()
+    return "…" + "".join(reversed(tail))
 
 
 def pad_to_width(s: str, width: int) -> str:
@@ -346,6 +422,8 @@ Keys:
                           given on the command line
   x X                     jump to the first / last file in the list
   <N> x                   jump straight to file N
+  O                       list the files: pick one with j/k and open it
+                          with ENTER
                                <ZOOMING>
   + -                     zoom in / out
   0                       reset zoom and pan
@@ -5812,18 +5890,21 @@ class ViewerOptions:
 
 
 class _Overlays:
-    """The boxes drawn over the page: the help (F1 - see show_help()) and
-    the table of contents (o/TAB - see show_outline()). While one is up
-    it takes every key and mouse event (see handle_key() and
-    _Mouse.handle()); both take the same keys, and only ENTER and a click
-    on an entry are the table of contents' own.
+    """The boxes drawn over the page: the help (F1 - see show_help()),
+    the table of contents (o/TAB - see show_outline()) and the file list
+    (O - see show_files()). While one is up it takes every key and mouse
+    event (see handle_key() and handle_mouse()); all take the same keys,
+    and only ENTER and a click on an entry are the table of contents'
+    and the file list's own.
 
     Attributes:
         viewer: the Viewer the boxes are drawn over.
-        active: which box is up - "help", "outline" or None.
+        active: which box is up - "help", "outline", "files" or None.
         help_scroll: the first help line in view.
         outline_sel: the table of contents' selected entry.
         outline_scroll: its first entry in view.
+        files_sel: the file list's selected file.
+        files_scroll: its first file in view.
     """
 
     def __init__(self, viewer: Viewer) -> None:
@@ -5831,10 +5912,12 @@ class _Overlays:
             viewer: the Viewer the boxes are drawn over.
         """
         self.viewer = viewer
-        self.active: Literal["help", "outline"] | None = None
+        self.active: Literal["help", "outline", "files"] | None = None
         self.help_scroll = 0
         self.outline_sel = 0
         self.outline_scroll = 0
+        self.files_sel = 0
+        self.files_scroll = 0
         self._outline: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_outline()
         # The entry last jumped to, and where that left the view (see
         # _view_position()) - so reopening before moving on selects it.
@@ -6174,54 +6257,144 @@ class _Overlays:
         viewer = self.viewer
         return viewer.text_mode, viewer.page, viewer.text_scroll if viewer.text_mode else viewer.scroll
 
+    def show_files(self) -> None:
+        """O: put up the files given on the command line as a box over
+        the page, the one being viewed selected - or just say so on the
+        status line if there's only the one."""
+        viewer = self.viewer
+        if len(viewer.files) < 2:
+            viewer.draw_status("only one file")
+            return
+        self.files_sel = viewer.file_index
+        self.active = "files"
+        self.files_scroll = 0
+        self._draw_files()
+
+    def _files_lines(self) -> list[tuple[str, str]]:
+        """The file list's content, as draw_box() takes it: each file's
+        path relative to where pdfless was started ("(stdin)" for piped
+        input), the one being viewed marked, with its number flush
+        right (the N of <N>x). A path too long for the box loses its
+        start rather than its end (see truncate_start_to_width()), so
+        the file's own name stays in view - draw_box() would cut the
+        end."""
+        viewer = self.viewer
+        rows = []
+        for i, entry in enumerate(viewer.files):
+            path = entry if isinstance(entry, str) else entry.path
+            if os.path.dirname(path) == viewer.tmpdir:
+                name = "(stdin)"  # see _capture_stdin()
+            else:
+                name = os.path.relpath(path)
+            rows.append(("* " if i == viewer.file_index else "  ", name, str(i + 1)))
+        # How wide the box gets for the whole paths (capped by the
+        # terminal's width) - then each path cut to fit in it beside
+        # its mark and number, and a space before the number.
+        content_w = self._box([(mark + name, number) for mark, name, number in rows], OUTLINE_MIN_W)[3]
+        return [
+            (mark + truncate_start_to_width(name, content_w - len(mark) - 1 - len(number)), number)
+            for mark, name, number in rows
+        ]
+
+    def files_box(self) -> tuple[int, int, int, int]:
+        """_box() for the file list - see there."""
+        return self._box(self._files_lines(), OUTLINE_MIN_W)
+
+    def _draw_files(self) -> None:
+        """Draw the file list over the page, with the selected file in
+        reverse video and scrolled into view."""
+        n = len(self.viewer.files)
+        self.files_sel = max(0, min(n - 1, self.files_sel))
+        self.files_scroll, _max_scroll = self.draw_box(
+            self._files_lines(), self.files_scroll, self.files_sel, OUTLINE_MIN_W
+        )
+        self.viewer.draw_status(f"ENTER to open, q to close - {self.files_sel + 1}/{n}")
+
+    def _move_files_selection(self, delta: int) -> None:
+        """Move the file list's selection `delta` files down (negative =
+        up), stopping at either end."""
+        new_sel = max(0, min(len(self.viewer.files) - 1, self.files_sel + delta))
+        if new_sel != self.files_sel:
+            self.files_sel = new_sel
+            self._draw_files()
+
+    def open_file(self, index: int) -> None:
+        """Close the file list and switch to file `index` - see
+        Viewer.go_to_file(), which says so on the status line if it
+        can't be opened."""
+        self.active = None
+        self.viewer._invalidate_screen()
+        # Take the box away first: go_to_file() only redraws once it has
+        # switched, not when it just reports that it couldn't.
+        self.viewer.refresh()
+        if index != self.viewer.file_index:
+            self.viewer.go_to_file(index)
+
     # What each overlay (see self.active) is, as the calls the shared
-    # code below makes on it - everything else about the two boxes is
+    # code below makes on it - everything else about the boxes is
     # handled the same way.
     def _box_now(self) -> tuple[int, int, int, int]:
         """_box() for the overlay that's up."""
-        return self.help_box() if self.active == "help" else self.outline_box()
+        if self.active == "help":
+            return self.help_box()
+        return self.outline_box() if self.active == "outline" else self.files_box()
 
     def draw(self) -> None:
         """Draw the overlay that's up over the page, and its status line."""
         if self.active == "help":
             self._draw_help()
-        else:
+        elif self.active == "outline":
             self._draw_outline()
+        else:
+            self._draw_files()
 
     def _move(self, delta: int) -> None:
         """j/k and the like on the overlay that's up: scroll the help by
-        `delta` lines, or move the table of contents' selection by
-        `delta` entries (negative = up) - either way stopping at the ends."""
+        `delta` lines, or move the table of contents' or the file list's
+        selection by `delta` entries (negative = up) - either way
+        stopping at the ends."""
         if self.active == "help":
             self.scroll_help(delta)
-        else:
+        elif self.active == "outline":
             self._move_outline_selection(delta)
+        else:
+            self._move_files_selection(delta)
+
+    def _choose(self, index: int) -> None:
+        """ENTER (or a click) on entry `index` of the table of contents
+        or the file list: jump to it, or open it."""
+        if self.active == "outline":
+            self.jump_to_outline_entry(index)
+        elif self.active == "files":
+            self.open_file(index)
 
     def hide(self) -> None:
-        """Close the help or the table of contents, redrawing what it covered."""
+        """Close the box that's up, redrawing what it covered."""
         self.active = None
         self.viewer._invalidate_screen()  # the box overlays the page
         self.viewer.refresh()
 
     def handle_key(self, key: str) -> None:
-        """A key pressed while the help or the table of contents is up.
-        Both take the same keys:
+        """A key pressed while the help, the table of contents or the
+        file list is up. All take the same keys:
 
-        - q, ESC, or the key that opened it (F1, or o/TAB) closes it;
+        - q, ESC, or the key that opened it (F1, o/TAB, or O) closes it;
         - ^L (or a focus change - see Viewer.handle_global_key()) repaints the
           page underneath, then the box back over it;
         - the usual line/window keys, d/u and g/G/</>/HOME/END scroll the
-          help or move the table of contents' selection;
-        - ENTER (table of contents only) jumps to the selected entry.
+          help or move the selection;
+        - ENTER (not the help) jumps to the selected entry, or opens the
+          selected file.
 
         Everything else is swallowed, so page keys can't act on the page
         hidden underneath."""
         window = max(1, self._box_now()[2] - 1)
-        far = len(KEY_TABLE.splitlines()) + len(self._ensure_outline())  # past either end
-        closing = ("F1",) if self.active == "help" else ("o", "\t")
+        # Past either end, whichever box it is.
+        far = len(KEY_TABLE.splitlines()) + len(self._ensure_outline()) + len(self.viewer.files)
+        closing = {"help": ("F1",), "outline": ("o", "\t"), "files": ("O",)}[self.active or "help"]
         # ENTER before the line keys: "\r" is one of FORWARD_LINE_KEYS.
-        if key in ("\r", "\n") and self.active == "outline":
-            self.jump_to_outline_entry(self.outline_sel)
+        if key in ("\r", "\n") and self.active != "help":
+            self._choose(self.outline_sel if self.active == "outline" else self.files_sel)
         elif key in ("q", "\x1b") or key in closing:
             self.hide()
         elif key in ("\x0c", "FOCUS_IN"):
@@ -6245,10 +6418,10 @@ class _Overlays:
             self._move(far)
 
     def handle_mouse(self, kind: str, col: int, row: int) -> None:
-        """A mouse event while the help or the table of contents is up:
-        the wheel scrolls it (moves the selection, for the table of
-        contents), a click anywhere outside the box closes it, and a
-        click on a table-of-contents entry jumps to it."""
+        """A mouse event while a box is up: the wheel scrolls it (moves
+        the selection, but for the help), a click anywhere outside the
+        box closes it, and a click on an entry of the table of contents
+        or the file list jumps to it or opens it."""
         if kind == "MOUSE_WHEEL_UP":
             self._move(-1)
         elif kind == "MOUSE_WHEEL_DOWN":
@@ -6257,8 +6430,8 @@ class _Overlays:
             row0, col0, content_h, content_w = self._box_now()
             inside_cols = col0 <= col < col0 + content_w + 4
             if inside_cols and row0 < row <= row0 + content_h:
-                if self.active == "outline":
-                    self.jump_to_outline_entry(self.outline_scroll + row - row0 - 1)
+                scroll = self.outline_scroll if self.active == "outline" else self.files_scroll
+                self._choose(scroll + row - row0 - 1)
             elif not (inside_cols and row0 <= row <= row0 + content_h + 1):
                 self.hide()  # outside the box (its border doesn't count)
 
@@ -9925,6 +10098,8 @@ class Viewer:
             self.overlays.show_help()
         elif key in ("o", "\t"):
             self.overlays.show_outline()
+        elif key == "O":
+            self.overlays.show_files()
         elif key in ("t", "T"):
             # T is t and C combined into one press/undo - see
             # toggle_clean_text_mode().
