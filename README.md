@@ -226,7 +226,7 @@ plain images and previews without extractable text. While a search is active,
 
 | Keys or gesture | Action |
 | --- | --- |
-| `t` | Toggle text mode: extracted text for supported documents, raw source for Markdown, or image information and metadata for image files. |
+| `t` | Toggle text mode: extracted text for supported documents, raw source for Markdown, or image information and metadata for image files. The view stays at the same place in the document. |
 | `T` | Toggle text mode with a clean display for copying, combining the functions of `t` and `C`. |
 | `B` | Toggle page borders in text mode (on by default, except for plain text files, which never show one). Borders are hidden while lines wrap. |
 | `s`, `-S` | Toggle line wrapping in text mode. Plain text wraps by default; other formats do not. |

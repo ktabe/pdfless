@@ -2608,6 +2608,57 @@ def find_title_line(
     return min(found, key=lambda i: abs(i - target))
 
 
+def _interpolate(points: Sequence[tuple[float, float]], x: float) -> float:
+    """Piecewise-linear interpolation: the y at `x` on the line through
+    `points`, (x, y) pairs in increasing x - held at the ends outside it.
+
+    Args:
+        points: the (x, y) pairs, at least one.
+        x: where to read it.
+
+    Returns:
+        y at x.
+    """
+    i = bisect.bisect_right([p[0] for p in points], x)
+    if i == 0:
+        return points[0][1]
+    if i == len(points):
+        return points[-1][1]
+    (x0, y0), (x1, y1) = points[i - 1], points[i]
+    return y0 if x1 == x0 else y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+
+
+def _screen_line_for_text(
+    lines: list[tuple[float, float, str]], text: str, near_pt: float,
+) -> float | None:
+    """Where on the page a text mode line is: the top of the printed line
+    (from PdfDocument.screen_lines()) with the same text - compared as
+    search compares - or, as pdftotext -layout can put a line and the
+    next one's start together, one wholly inside it. The nearest to
+    `near_pt` wins among several.
+
+    Args:
+        lines: the page's printed lines, as (yMin, yMax, text).
+        text: the text mode line.
+        near_pt: roughly where it should be, in points from the top.
+
+    Returns:
+        The printed line's yMin, or None if none matches.
+    """
+    wanted = normalize_for_search(text)[0].strip().casefold()
+    if not wanted:
+        return None
+    same, inside = [], []
+    for top, _bottom, line_text in lines:
+        printed = normalize_for_search(line_text)[0].strip().casefold()
+        if printed == wanted:
+            same.append(top)
+        elif printed and (printed in wanted or wanted in printed):
+            inside.append(top)
+    found = same or inside
+    return min(found, key=lambda top: abs(top - near_pt)) if found else None
+
+
 class DocumentHandler:
     """Base class for a file's format-specific behavior. Each subclass
     corresponds to one of main()'s "kind" strings ("pdf"/"image"/
@@ -3057,6 +3108,35 @@ class PdfDocument(DocumentHandler):
             "width_pt": width_pt, "height_pt": height_pt,
             "text": text, "words": words, "lines": lines, "rows": rows,
         }
+
+    @staticmethod
+    def screen_lines(page_info: dict[str, Any]) -> list[tuple[float, float, str]]:
+        """The printed lines of one build_search_index() page, top to
+        bottom, with where each is on the page - for lining text mode's
+        lines up with the page image (see Viewer._image_point_for_text()).
+
+        Args:
+            page_info: the page's entry in build_search_index().
+
+        Returns:
+            (yMin, yMax, text) for each line, in points from the page's
+            top - a line being a row as it appears on screen (see
+            _screen_rows()), so a two-column page's row has both columns.
+        """
+        view = page_info["rows"] or page_info
+        words, text = view["words"], view["text"]
+        out = []
+        w = 0  # words are in "text" order, and so are the lines
+        for a, b in view["lines"]:
+            while w < len(words) and words[w][0] < a:
+                w += 1
+            ys = []
+            while w < len(words) and words[w][0] < b:
+                ys.append((words[w][3], words[w][5]))
+                w += 1
+            if ys:
+                out.append((min(y[0] for y in ys), max(y[1] for y in ys), text[a:b]))
+        return sorted(out, key=lambda line: line[0])
 
     @staticmethod
     def _stream_line_starts(found: list[tuple[str, float, float, float, float]]) -> list[int]:
@@ -5958,15 +6038,36 @@ class _Overlays:
         end, the last line on screen, as a heading near the end can't be
         scrolled up that far."""
         viewer = self.viewer
-        rows = viewer._text_avail_rows()
-        at_end = viewer.text_scroll >= viewer.text_scroll_max
-        row = max(0, viewer.text_scroll + (rows - 1 if at_end else rows // 4))
-        if not viewer.text_wrap:
-            return min(row, len(viewer.text_lines) - 1)
-        display_rows = viewer._ensure_display_rows()
-        if not display_rows:
-            return 0
-        return display_rows[min(row, len(display_rows) - 1)][0]
+        if viewer.text_scroll < viewer.text_scroll_max:
+            return viewer._text_reading_line()
+        return viewer._text_line_at_row(viewer.text_scroll + viewer._text_avail_rows() - 1)
+
+    def source_anchors(self) -> list[tuple[int, float]] | None:
+        """In a text mode showing the document's source (see
+        _source_heading_lines()), the points where the source and the
+        rendered pages are known to line up: each heading's line and
+        where its bookmark points, plus the two ends - for mapping a
+        place in one onto the other in between (see
+        Viewer._image_point_for_text()).
+
+        Returns:
+            (line, position) pairs in order, position in pages from the
+            document's start (2.5 is halfway down page 3) - or None if
+            text mode isn't such a view.
+        """
+        headings = self._source_heading_lines()
+        if headings is None:
+            return None
+        viewer = self.viewer
+        anchors = [(0, 0.0)]
+        for line, entry in zip(headings, self._ensure_outline()):
+            page = entry["page"] or 1
+            height_pt = viewer._page_height_pt(page) if entry["top_pt"] is not None else None
+            down = (height_pt - entry["top_pt"]) / height_pt if height_pt else 0.0
+            # Never backwards, whatever a bookmark says.
+            anchors.append((max(line, anchors[-1][0]), max(page - 1 + down, anchors[-1][1])))
+        anchors.append((max(len(viewer.text_lines), anchors[-1][0]), max(float(viewer.npages), anchors[-1][1])))
+        return anchors
 
     def _text_line_of_entry(self, index: int) -> int | None:
         """The text mode line entry `index`'s heading is on, for a jump
@@ -6196,6 +6297,15 @@ class _Search:
         self.index = None
         self.clear()
 
+    def ensure_index(self) -> list[dict[str, Any]] | None:
+        """self.index, built on first use (saying so on the status line,
+        as it takes a moment on a long document) - None if the document
+        has none to build (see DocumentHandler.build_search_index())."""
+        if self.index is None:
+            self.viewer.draw_status("building search index...")
+            self.index = self.viewer.doc_handler.build_search_index()
+        return self.index
+
     def start(self, query: str, backward: bool = False, multiline: bool = False) -> None:
         """Search the whole document for `query` and jump to one match -
         which one depends on where you are now and on `backward`, i.e.
@@ -6227,9 +6337,7 @@ class _Search:
             ))
             return
 
-        if self.index is None:
-            self.viewer.draw_status("building search index...")
-            self.index = self.viewer.doc_handler.build_search_index()
+        self.ensure_index()
         self.matches = (
             self.viewer.doc_handler.find_search_matches(self.index, query, multiline)
             if self.index is not None else []  # nothing to search
@@ -7017,6 +7125,11 @@ class Viewer:
         self.overlays: _Overlays = _Overlays(self)  # the help and the table of contents
         self.links: _Links = _Links(self)  # hyperlinks, and the [/] jump history
         self.search: _Search = _Search(self)  # "/" and "?"
+        # The last `t`/`T`: where it left the view in the mode it
+        # switched to (see _view_spot()), and the (page, scroll) of the
+        # mode it came from - so switching straight back returns there
+        # exactly (see _switch_back_spot()).
+        self._mode_switch: tuple[tuple[bool, int, int], tuple[int, int]] | None = None
         # A plain text file has no image view at all - it's permanently
         # "in text mode", the same rendering PDF's `t` key switches to.
         self.text_mode = self.doc_handler.starts_in_text_mode()
@@ -7304,6 +7417,7 @@ class Viewer:
         self._set_current_file()
         self.encode_cache.clear()
         self.search.reset()
+        self._mode_switch = None
         self.links.reset()
         self.overlays.forget_outline()
         self.text_mode = self.doc_handler.starts_in_text_mode()
@@ -7650,6 +7764,111 @@ class Viewer:
         else:
             self._load_page()
 
+    def _text_line_at_row(self, row: int) -> int:
+        """The raw text_lines index showing at scroll position `row` (see
+        _text_row_for_line() for the unit)."""
+        row = max(0, row)
+        if not self.text_wrap:
+            return min(row, max(0, len(self.text_lines) - 1))
+        display_rows = self._ensure_display_rows()
+        if not display_rows:
+            return 0
+        return display_rows[min(row, len(display_rows) - 1)][0]
+
+    def _text_reading_line(self) -> int:
+        """The text mode line being read: the one a quarter of the way
+        down the screen, where a jump puts its target (see
+        _scroll_text_to_row())."""
+        return self._text_line_at_row(self.text_scroll + self._text_avail_rows() // 4)
+
+    def _image_point_for_text(self) -> tuple[int, float | None] | None:
+        """Where on the page image text mode's reading line (see
+        _text_reading_line()) is, for `t` back to image mode to show the
+        same place. In a text mode split into pages, it's the printed
+        line with the same text on the same page, found through the
+        search index (see PdfDocument.screen_lines()) - or, failing that,
+        as far down the page as the line is down its text. In one
+        showing the document's source (Markdown), it's as far between
+        the bookmarks of the headings before and after it as the line is
+        between those headings (see _Overlays.source_anchors()).
+
+        Returns:
+            (page, y_pt) - y_pt in PDF points from the page's top, None
+            for its top - or None if there's no telling.
+        """
+        line = self._text_reading_line()
+        if not self.doc_handler.text_mode_is_paginated():
+            anchors = self.overlays.source_anchors()
+            if anchors is None:
+                return None
+            return self._page_point(_interpolate(anchors, line))
+        page = self._text_page_of_line(line)
+        start, end = self._text_page_range(page)
+        line = max(line, start)
+        # A blank line (or a separator) says nothing about where it is:
+        # the next one with text on it does.
+        text_line = next((i for i in range(line, end) if self.text_lines[i].strip()), line)
+        height_pt = self._page_height_pt(page)
+        if not height_pt:
+            return page, None
+        y_pt = (text_line - start) / max(1, end - start) * height_pt
+        if text_line < end and self.doc_handler.supports_search():
+            index = self.search.ensure_index()
+            if index and page <= len(index):
+                matched = _screen_line_for_text(
+                    PdfDocument.screen_lines(index[page - 1]), self.text_lines[text_line], y_pt,
+                )
+                if matched is not None:
+                    y_pt = matched
+        return page, y_pt
+
+    def _page_point(self, position: float) -> tuple[int, float | None]:
+        """A position in pages from the document's start (2.5 is halfway
+        down page 3) as (page, y_pt) - y_pt in PDF points from its top."""
+        page = max(1, min(self.npages, int(position) + 1))
+        height_pt = self._page_height_pt(page)
+        return page, (max(0.0, min(1.0, position - (page - 1))) * height_pt if height_pt else None)
+
+    def _text_line_for_image_point(self, page: int, y_pt: float | None) -> int | None:
+        """The text mode line for a point of the page image (see
+        _image_reading_point()) - the inverse of _image_point_for_text(),
+        for `t` into text mode to show the same place. Moves text mode
+        to `page` first if it shows one page at a time.
+
+        Args:
+            page: the point's page.
+            y_pt: its position on it in PDF points from the top, or None.
+
+        Returns:
+            The line, or None if there's no telling.
+        """
+        height_pt = self._page_height_pt(page)
+        down = max(0.0, min(1.0, y_pt / height_pt)) if y_pt is not None and height_pt else 0.0
+        if not self.doc_handler.text_mode_is_paginated():
+            anchors = self.overlays.source_anchors()
+            if anchors is None:
+                return None
+            inverse = [(position, float(line)) for line, position in anchors]
+            return min(len(self.text_lines) - 1, round(_interpolate(inverse, page - 1 + down)))
+        if y_pt is None or not height_pt:
+            return None
+        if page != self.page and self._text_page_starts is None:
+            self.go_to_page_text(page, 0)
+        start, end = self._text_page_range(page)
+        if start >= end:
+            return None
+        if self.doc_handler.supports_search():
+            index = self.search.ensure_index()
+            if index and page <= len(index):
+                # The first printed line reaching down to the point.
+                lines = PdfDocument.screen_lines(index[page - 1])
+                below = next((text for _top, bottom, text in lines if bottom >= y_pt), None)
+                if below is not None:
+                    found = find_title_line(self.text_lines, start, end, below, down)
+                    if found is not None:
+                        return found
+        return start + min(end - start - 1, round(down * (end - start)))
+
     def _top_text_line(self) -> int:
         """The raw text_lines index showing at the top of the screen:
         text_scroll itself when text is unwrapped, and the line the top
@@ -7769,6 +7988,9 @@ class Viewer:
         spreadsheet or slide deck - see extract_office_text())."""
         if not self.can_enter_text_mode():
             return False
+        back = self._switch_back_spot()
+        left = self._view_spot()
+        reading = self._image_reading_point()
         self.text_mode = True
         # Mouse reporting is only useful (and only turned on) for
         # clicking hyperlinks in the page image; leave it off here so
@@ -7794,10 +8016,28 @@ class Viewer:
             match = self.search.active_page_match()
             if match:
                 self.search.scroll_text_to_match(match)
+            elif back is not None:
+                # Straight back from image mode: where text mode was.
+                page, scroll = back
+                if page != self.page and self._text_page_starts is None:
+                    self.go_to_page_text(page, 0)
+                self._set_text_scroll(scroll)
+                self._sync_text_page()
+            else:
+                # Otherwise, the same place image mode was showing.
+                line = self._text_line_for_image_point(*reading)
+                if line is not None:
+                    self._scroll_text_to_row(self._text_row_for_line(line))
         self.refresh()
+        self._mode_switch = (self._view_spot(), (left[1], left[2]))
         return True
 
     def exit_text_mode(self) -> None:
+        # Where text mode is - taken before copy mode (below) changes
+        # what's on which row.
+        back = self._switch_back_spot()
+        left = self._view_spot()
+        reading = self._image_point_for_text() if back is None else None
         if self._copy_mode_saved is not None:
             # Copy mode (however it was turned on - "C" inside text
             # mode, or "T"'s own combined enter) only makes sense while
@@ -7838,7 +8078,34 @@ class Viewer:
             match = self.search.active_page_match()
             if match:
                 self.search.scroll_image_to_match(match)
+            elif back is not None:
+                # Straight back from text mode: where image mode was.
+                page, scroll = back
+                if page != self.page:
+                    self.page = page
+                    self._load_page()
+                self.scroll = self._clamp_image_scroll(scroll)
+            elif reading is not None:
+                # Otherwise, the same place text mode was showing.
+                self._show_image_at(*reading)
         self.refresh()
+        self._mode_switch = (self._view_spot(), (left[1], left[2]))
+
+    def _view_spot(self) -> tuple[bool, int, int]:
+        """Where the view is: the mode, the page, and how far it's
+        scrolled (text_scroll in text mode, scroll in image mode)."""
+        return self.text_mode, self.page, self.text_scroll if self.text_mode else self.scroll
+
+    def _switch_back_spot(self) -> tuple[int, int] | None:
+        """If the view hasn't moved since the last `t`/`T` switched to the
+        mode showing now, the (page, scroll) the other mode was at - for
+        switching back to exactly where it was, rather than to what
+        the view's position maps onto there, which can differ (e.g. a
+        page whose text fits the screen can't scroll to match at all).
+        None otherwise."""
+        if self._mode_switch is not None and self._mode_switch[0] == self._view_spot():
+            return self._mode_switch[1]
+        return None
 
     def toggle_text_mode(self) -> bool:
         """Returns False if switching (specifically *into* text mode)
@@ -9241,20 +9508,58 @@ class Viewer:
         (`top_pt`, in PDF points, bottom-up - or None if the link didn't
         specify one) lands a little below the top of the window, the
         same placement _Search.scroll_image_to_match() uses for search matches."""
+        page = max(1, min(self.npages, page))
+        height_pt = self._page_height_pt(page) if top_pt is not None else None
+        # bottom-up -> top-down
+        self._show_image_at(page, height_pt - top_pt if height_pt and top_pt is not None else None)
+
+    def _show_image_at(self, page: int, y_pt: float | None) -> None:
+        """Show `page` in image mode, scrolled so `y_pt` (in PDF points,
+        down from the page's top) lands a quarter of the way down the
+        window - or at its top, for None.
+
+        Args:
+            page: the page to show.
+            y_pt: the position on it, or None.
+        """
         self.page = max(1, min(self.npages, page))
         self._load_page()
-        if top_pt is None:
+        height_pt = self._page_height_pt(self.page)
+        if y_pt is None or not height_pt or self.img is None:
             self.scroll = 0
             return
+        px_top = y_pt * self.img.height / height_pt
+        self.scroll = self._clamp_image_scroll(round(px_top) - self.avail_height_px // 4)
+
+    def _page_height_pt(self, page: int) -> float | None:
+        """`page`'s height in PDF points, or None without a real PDF
+        behind the view (see _pdf_source())."""
         pdf_source = self._pdf_source()
-        height_pt = pdf_source.page_size_pt(self.page)[1] if pdf_source else None
-        if not height_pt:
-            self.scroll = 0
-            return
-        scale_y = self.img.height / height_pt
-        px_top = (height_pt - top_pt) * scale_y  # bottom-up -> top-down
-        margin = self.avail_height_px // 4
-        self.scroll = self._clamp_image_scroll(round(px_top) - margin)
+        return (pdf_source.page_size_pt(page)[1] or None) if pdf_source else None
+
+    def _image_reading_point(self) -> tuple[int, float | None]:
+        """Where image mode is being read: the point a quarter of the way
+        down the window, where a jump puts its target (see
+        _show_image_at()) - on whichever page is there under
+        -c/--continuous.
+
+        Returns:
+            (page, y_pt): the page, and the point's position on it in PDF
+            points from its top - None without a real PDF behind it.
+        """
+        if self.img is None:  # no page shown yet
+            return self.page, None
+        reading = self.avail_height_px // 4
+        page, img, y_px = self.page, self.img, self.scroll + reading
+        if self.continuous and self._layout:
+            for p, top, p_img in self._layout:
+                if top + p_img.height > reading:  # the first page reaching down that far
+                    page, img, y_px = p, p_img, max(0, reading - top)
+                    break
+        height_pt = self._page_height_pt(page)
+        if not height_pt or not img.height:
+            return page, None
+        return page, min(y_px, img.height) * height_pt / img.height
 
     def reload(self) -> None:
         """Re-read the PDF from disk (e.g. -f/--follow noticed it changed
@@ -9287,6 +9592,7 @@ class Viewer:
                 self.page = max(1, min(self.npages, self.page))
         self.cache.clear()
         self.search.reset()
+        self._mode_switch = None
         self._text_pages = None  # stale too - re-extracted on demand
         self.overlays.forget_outline()  # the outline may have changed too
         if self.text_mode:
