@@ -149,6 +149,8 @@ def test_enter_jumps_to_the_entry_and_back_returns(outlined_pdf, monkeypatch):
 
 
 def test_text_mode_jumps_to_the_top_of_the_page(outlined_pdf, monkeypatch):
+    """None of outlined_pdf's titles is in its (lorem ipsum) text, so
+    there's no line to jump to: the top of the entry's page it is."""
     viewer = make_viewer(outlined_pdf, monkeypatch)
     assert viewer.enter_text_mode()
     viewer.overlays.show_outline()
@@ -325,3 +327,112 @@ def test_the_next_page_is_still_prefetched_under_either_overlay(outlined_pdf, mo
     viewer._schedule_page_prefetch()
     assert viewer._page_prefetch_thread.name == "pdfless-page-prefetch-2"
     viewer._page_prefetch_thread.join(10)
+
+
+def test_a_title_is_found_however_its_spacing_and_width_differ():
+    lines = ["1.1   背景", "Ｃｈａｐｔｅｒ　２ Details", "chapter 2"]
+    assert pdfless.find_title_line(lines, 0, 3, "1.1 背景") == 0
+    assert pdfless.find_title_line(lines, 0, 3, "Chapter 2") == 1
+    assert pdfless.find_title_line(lines, 2, 3, "Chapter 2") == 2  # only within the range
+    assert pdfless.find_title_line(lines, 0, 3, "Chapter 3") is None
+
+
+def test_the_line_nearest_the_bookmark_wins():
+    lines = ["Summary"] + ["text"] * 8 + ["Summary"]
+    assert pdfless.find_title_line(lines, 0, 10, "Summary") == 0
+    assert pdfless.find_title_line(lines, 0, 10, "Summary", near=0.9) == 9
+
+
+def test_markdown_headings_skip_code_blocks():
+    source = [
+        "# Title",           # 0
+        "",
+        "```sh",
+        "# not a heading",
+        "```",
+        "Setext",            # 5
+        "======",
+        "",
+        "    # indented code",
+        "",
+        "text",
+        "",
+        "---",               # a rule after a blank line, not a heading
+        "~~~~",
+        "## still code",
+        "~~~",               # too short to close a ~~~~ fence
+        "~~~~",
+        "Another",           # 17
+        "-------",
+        "###### Six",        # 19
+    ]
+    assert pdfless.markdown_heading_lines(source) == [0, 5, 17, 19]
+
+
+def outlined_at_a_phrase(sample_pdf, tmp_path):
+    """sample_pdf's pages with an outline entry whose title is a phrase
+    from the middle of page 2's text, pointing at where it is."""
+    phrase = "Reprehenderit amet nostrud"
+    lines = pdfless.PdfDocument(sample_pdf).extract_text(2)
+    [line] = [i for i, text in enumerate(lines) if phrase in text]
+    writer = pages_only(sample_pdf)
+    height = float(writer.pages[1].mediabox.height)
+    writer.add_outline_item("Start", 0)
+    writer.add_outline_item(phrase, 1, fit=Fit.xyz(top=height * (1 - line / len(lines))))
+    path = tmp_path / "phrase.pdf"
+    writer.write(str(path))
+    return str(path), phrase
+
+
+def test_text_mode_jumps_to_the_line_the_title_is_on(sample_pdf, tmp_path, monkeypatch):
+    path, phrase = outlined_at_a_phrase(sample_pdf, tmp_path)
+    viewer = make_viewer(path, monkeypatch)
+    assert viewer.enter_text_mode()
+    viewer.overlays.show_outline()
+    viewer.overlays.handle_key("G")
+    viewer.overlays.handle_key("\r")
+    assert viewer.page == 2
+    [line] = [i for i, text in enumerate(viewer.text_lines) if phrase in text]
+    assert viewer.text_scroll > 0  # not the top of the page ...
+    assert viewer.text_scroll <= line < viewer.text_scroll + viewer._text_avail_rows()  # ... but its line
+
+
+def test_reopening_selects_the_entry_just_jumped_to(sample_pdf, tmp_path, monkeypatch):
+    """Two entries on one page: going by the page alone would select the
+    later one, whichever was jumped to."""
+    writer = pages_only(sample_pdf)
+    writer.add_outline_item("Top", 1, fit=Fit.xyz(top=800))
+    writer.add_outline_item("Middle", 1, fit=Fit.xyz(top=400))
+    path = tmp_path / "two.pdf"
+    writer.write(str(path))
+    viewer = make_viewer(str(path), monkeypatch)
+    viewer.overlays.show_outline()
+    viewer.overlays.handle_key("\r")  # "Top"
+    viewer.overlays.show_outline()
+    assert viewer.overlays.outline_sel == 0
+    viewer.overlays.hide()
+    viewer.handle_key("j")  # moved on: back to going by the page
+    viewer.overlays.show_outline()
+    assert viewer.overlays.outline_sel == 1
+
+
+@requires_markdown_rendering
+def test_markdown_text_mode_jumps_to_the_heading_line(sample_md, tmp_path, monkeypatch):
+    """Text mode shows the raw source, one page: the n-th heading line
+    is the n-th entry's, and the one above where you're reading is the
+    section selected."""
+    handler = rendered_handler(sample_md, tmp_path)
+    viewer = make_viewer(None, monkeypatch, handler)
+    assert viewer.enter_text_mode()
+    viewer.overlays.show_outline()
+    for _ in range(6):
+        viewer.overlays.handle_key("j")
+    viewer.overlays.handle_key("\r")
+    assert viewer.text_lines[viewer.overlays._reading_text_line()] == "## 追加セクション1"
+    viewer.overlays.show_outline()
+    assert viewer.overlays.outline_sel == 6
+
+    viewer.overlays.hide()
+    viewer.handle_key_text("k")  # a line up: still in the section before
+    viewer.overlays.show_outline()
+    assert viewer.overlays.outline_sel == 5
