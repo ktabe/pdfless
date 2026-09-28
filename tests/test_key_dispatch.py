@@ -268,8 +268,8 @@ def test_prefixes_take_the_next_key(sample_pdf):
 def test_ctrl_c_quits_but_q_first_closes_what_is_up(sample_pdf):
     viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
     d = dispatcher_for(viewer)
-    assert d.handle("F1") and viewer.overlay == "help"
-    assert d.handle("q") and viewer.overlay is None  # closes the help
+    assert d.handle("F1") and viewer.overlays.active == "help"
+    assert d.handle("q") and viewer.overlays.active is None  # closes the help
     viewer.start_search("lorem")
     assert viewer.search_query is not None
     assert d.handle("q") and viewer.search_query is None  # clears the search
