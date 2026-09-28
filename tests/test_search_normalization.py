@@ -136,8 +136,8 @@ def test_a_match_in_decomposed_text_is_boxed_to_its_word(variants_pdf):
 def test_text_mode_highlights_the_decomposed_text(variants_pdf):
     viewer = make_viewer(pdfless.PdfDocument(variants_pdf))
     viewer.text_mode = True
-    viewer.start_search("グループ")
-    line_idx, start, end = viewer._text_search_highlight()
+    viewer.search.start("グループ")
+    line_idx, start, end = viewer.search.text_highlight()
     assert viewer.text_lines[line_idx][start:end] == NFD("グループ")
 
 
@@ -145,12 +145,12 @@ def test_plain_text_file_search_is_normalized_too(tmp_path):
     path = tmp_path / "variants.txt"
     path.write_text("第５回\n" + NFD("グループ") + "\nﾃﾞｰﾀ\n", encoding="utf-8")
     viewer = make_viewer(pdfless.TextDocument(str(path)))
-    viewer.start_search("第5回")
-    assert viewer.search_matches == [(0, 0, 3)]
-    viewer.start_search("グループ")
-    assert viewer.search_matches == [(1, 0, 6)]
-    viewer.start_search("データ")
-    assert viewer.search_matches == [(2, 0, 4)]
+    viewer.search.start("第5回")
+    assert viewer.search.matches == [(0, 0, 3)]
+    viewer.search.start("グループ")
+    assert viewer.search.matches == [(1, 0, 6)]
+    viewer.search.start("データ")
+    assert viewer.search.matches == [(2, 0, 4)]
 
 
 @requires_soffice
@@ -163,8 +163,8 @@ def test_a_word_documents_mixed_script_text_is_found(tmp_path):
     page_text = " ".join(p["text"] for p in handler.build_search_index())
     assert "これは pdfless の" in page_text  # the gap is really there
     for query in ("これはpdflessの", "日本語とEnglishが"):
-        viewer.start_search(query)
-        assert viewer.search_matches, query
+        viewer.search.start(query)
+        assert viewer.search.matches, query
 
 
 def page_of(*words):
@@ -228,26 +228,26 @@ def test_text_mode_search_runs_across_line_breaks(tmp_path):
     searched joined, the break dropped next to Japanese and read as a
     space between Latin words."""
     viewer = text_viewer(tmp_path, ["誠にありがとうござ", "います。Supports text mode and", "search here."])
-    viewer.start_search("ございます")
-    assert viewer.search_matches == [(0, 7, 9 + 1 + 3)]  # `end` counts on into line 1
-    assert viewer._text_highlight_segments(viewer.search_matches[0]) == {0: (7, 9), 1: (0, 3)}
+    viewer.search.start("ございます")
+    assert viewer.search.matches == [(0, 7, 9 + 1 + 3)]  # `end` counts on into line 1
+    assert viewer._text_highlight_segments(viewer.search.matches[0]) == {0: (7, 9), 1: (0, 3)}
 
-    viewer.start_search("and search")
-    [(line_idx, start, end)] = viewer.search_matches
+    viewer.search.start("and search")
+    [(line_idx, start, end)] = viewer.search.matches
     and_at = viewer.text_lines[1].index("and")
     assert (line_idx, start, end) == (1, and_at, len(viewer.text_lines[1]) + 1 + len("search"))
     assert viewer._text_highlight_segments((line_idx, start, end)) == {
         1: (and_at, and_at + 3), 2: (0, 6),
     }
-    viewer.start_search("andsearch")
-    assert viewer.search_matches == []  # a line break between Latin words is still a space
+    viewer.search.start("andsearch")
+    assert viewer.search.matches == []  # a line break between Latin words is still a space
 
 
 def test_a_page_separator_is_never_searched_across(tmp_path):
     viewer = text_viewer(tmp_path, ["ありがとうござ", "(separator)", "います"])
     viewer._text_separator_lines = frozenset({1})
-    viewer.search_query = "ございます"
-    assert viewer._find_all_text_matches() == []
+    viewer.search.query = "ございます"
+    assert viewer.search.find_all_text_matches() == []
 
 
 @pytest.mark.parametrize("wrap", [False, True])
@@ -255,7 +255,7 @@ def test_a_highlight_across_lines_is_drawn_on_each(tmp_path, capsys, wrap):
     viewer = text_viewer(tmp_path, ["誠にありがとうござ", "います。"])
     viewer.text_wrap = wrap
     viewer._display_rows = None
-    viewer.start_search("ございます")
+    viewer.search.start("ございます")
     capsys.readouterr()
     if wrap:
         pdfless.Viewer._draw_text_wrapped(viewer)
@@ -274,8 +274,8 @@ def test_a_word_split_across_a_pdfs_lines_is_found_in_both_modes(variants_pdf, q
 
     viewer = make_viewer(pdfless.PdfDocument(variants_pdf))
     viewer.text_mode = True
-    viewer.start_search(query)
-    segments = viewer._text_highlight_segments(viewer._text_search_highlight())
+    viewer.search.start(query)
+    segments = viewer._text_highlight_segments(viewer.search.text_highlight())
     assert len(segments) == 2, query  # the highlight is on both lines
     highlighted = "\n".join(viewer.text_lines[i][a:b] for i, (a, b) in sorted(segments.items()))
     assert highlighted.replace("\n", "" if query == "ございます" else " ") == query
@@ -293,16 +293,16 @@ def test_a_regex_stays_within_a_line_unless_asked(tmp_path):
     number of lines on - so a regex is matched line by line, as in
     less(1), unless ^T at the prompt turned multi-line matching on."""
     viewer = text_viewer(tmp_path, ["foo is here", "(far away)", "and bar there", "foo bar"])
-    viewer.start_search("foo.*bar")
-    assert viewer.search_matches == [(3, 0, 7)]
-    viewer.start_search("foo.*bar", multiline=True)
-    assert viewer.search_matches[0][:2] == (0, 0)  # from line 0 on...
-    assert viewer._text_highlight_segments(viewer.search_matches[0]).keys() == {0, 1, 2, 3}
-    viewer.start_search("ござ(い|り)ます")
-    assert viewer.search_matches == []
+    viewer.search.start("foo.*bar")
+    assert viewer.search.matches == [(3, 0, 7)]
+    viewer.search.start("foo.*bar", multiline=True)
+    assert viewer.search.matches[0][:2] == (0, 0)  # from line 0 on...
+    assert viewer._text_highlight_segments(viewer.search.matches[0]).keys() == {0, 1, 2, 3}
+    viewer.search.start("ござ(い|り)ます")
+    assert viewer.search.matches == []
     viewer = text_viewer(tmp_path, ["ありがとうござ", "います"])
-    viewer.start_search("ござ(い|り)ます", multiline=True)
-    assert viewer.search_matches == [(0, 5, 7 + 1 + 3)]
+    viewer.search.start("ござ(い|り)ます", multiline=True)
+    assert viewer.search.matches == [(0, 5, 7 + 1 + 3)]
 
 
 def test_ctrl_t_at_the_prompt_toggles_multi_line(tmp_path, capsys):

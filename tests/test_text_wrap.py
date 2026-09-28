@@ -194,8 +194,8 @@ def test_search_match_scrolls_to_correct_display_row_when_wrapped(tmp_path):
     assert viewer.text_scroll_max > 10  # the document doesn't fit on
     # screen at once, so a wrong vs. right scroll target can actually differ
 
-    viewer.start_search("needle")
-    assert viewer.search_matches == [(match_line_idx, 0, 6)]
+    viewer.search.start("needle")
+    assert viewer.search.matches == [(match_line_idx, 0, 6)]
 
     expected_row = viewer._row_for_line(match_line_idx)
     margin = viewer._text_avail_rows() // 4

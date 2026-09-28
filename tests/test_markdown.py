@@ -71,26 +71,26 @@ def test_markdown_text_mode_toggle_carries_active_search(sample_md, tmp_path):
     handler = classify(sample_md, tmp_path)
     handler.build_pages(str(tmp_path))
     viewer = make_viewer(handler)
-    viewer.start_search("追加セクション2")
-    assert viewer.search_query == "追加セクション2"
+    viewer.search.start("追加セクション2")
+    assert viewer.search.query == "追加セクション2"
 
     assert viewer.enter_text_mode() is True
     assert viewer.text_mode is True
-    assert viewer.search_query == "追加セクション2"
+    assert viewer.search.query == "追加セクション2"
     # The heading text itself (unlike its "##" markup) appears in both
     # extractions, so re-running the query here finds it again.
-    assert viewer.search_pos is not None
+    assert viewer.search.pos is not None
     viewer._draw_text_unwrapped()  # must not raise
 
-    viewer.start_search("## リスト")
-    assert viewer.search_query == "## リスト"
+    viewer.search.start("## リスト")
+    assert viewer.search.query == "## リスト"
 
     assert viewer.toggle_text_mode() is True
     assert viewer.text_mode is False
     # The query string still carries over, even though the rendered
     # PDF's text has no "##" markup for it to match.
-    assert viewer.search_query == "## リスト"
-    assert viewer.search_pos is None
+    assert viewer.search.query == "## リスト"
+    assert viewer.search.pos is None
 
 
 @requires_markdown_rendering

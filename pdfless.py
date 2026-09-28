@@ -79,10 +79,10 @@ RenderResult = Union[Tuple[str, str, int], List[str]]
 # (page, xMin, yMin, xMax, yMax) in PDF points from a page/bbox index.
 # A text match can run on past the end of its line into the next ones:
 # `end` then counts on through them, one character for each line break (see
-# Viewer._find_all_text_matches() and _text_highlight_segments()).
+# _Search.find_all_text_matches() and _text_highlight_segments()).
 TextMatch = Tuple[int, int, int]
 BBoxMatch = Tuple[int, float, float, float, float]
-SearchMatch = Union[TextMatch, BBoxMatch]  # Viewer.search_matches holds one kind
+SearchMatch = Union[TextMatch, BBoxMatch]  # _Search.matches holds one kind
 # A page image as PageCache.get() is asked for it: (page, target_px, fit).
 PageRequest = Tuple[int, int, str]
 
@@ -2346,7 +2346,7 @@ def search_query_is_literal(query: str) -> bool:
     see compile_search_pattern()), or none that's valid, since an invalid
     regex is searched for literally. Such a query can't reach further
     than itself, so text mode lets it match across line breaks by
-    default (see Viewer._find_all_text_matches()).
+    default (see _Search.find_all_text_matches()).
 
     Args:
         query: the search as typed.
@@ -2422,7 +2422,7 @@ def normalize_for_search(text: str) -> NormalizedText:
 def normalize_lines_for_search(lines: list[str]) -> NormalizedText:
     """normalize_for_search() of `lines` joined by single spaces - how
     text mode searches its lines as one, across line breaks (see
-    Viewer._find_text_matches_in_block()) - without paying for the
+    _Search._find_text_matches_in_block()) - without paying for the
     joined text as a whole: each line already in NFKC (all of a long
     document's plain-English ones, say) is copied over as it is.
 
@@ -4761,7 +4761,7 @@ class MarkdownDocument(_RawTextView, RenderedDocument):
     image mode. text_mode_is_paginated() is False because that source
     is one continuous blob in text mode; image-mode / search still
     uses the PDF delegate's own per-page bbox index (see
-    Viewer._search_uses_text_lines())."""
+    _Search.uses_text_lines())."""
 
     _MARKDOWN_EXTENSIONS = (".md", ".markdown")
 
@@ -5619,6 +5619,753 @@ class ViewerOptions:
         )
 
 
+class _Overlays:
+    """The boxes drawn over the page: the help (F1 - see show_help()) and
+    the table of contents (o/TAB - see show_outline()). While one is up
+    it takes every key and mouse event (see handle_key() and
+    handle_mouse()); both take the same keys, and only ENTER and a click
+    on an entry are the table of contents' own.
+
+    Attributes:
+        viewer: the Viewer the boxes are drawn over.
+        active: which box is up - "help", "outline" or None.
+        help_scroll: the first help line in view.
+        outline_sel: the table of contents' selected entry.
+        outline_scroll: its first entry in view.
+    """
+
+    def __init__(self, viewer: Viewer) -> None:
+        """Args:
+            viewer: the Viewer the boxes are drawn over.
+        """
+        self.viewer = viewer
+        self.active: Literal["help", "outline"] | None = None
+        self.help_scroll = 0
+        self.outline_sel = 0
+        self.outline_scroll = 0
+        self._outline: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_outline()
+
+    def forget_outline(self) -> None:
+        """Drop the table of contents read from the file (it's read again
+        on next use) - and close its box if it's up, as its entries
+        may be gone. For a reload or a switch to another file."""
+        self._outline = None
+        if self.active == "outline":
+            self.active = None
+
+    def _box(
+        self, lines: list[tuple[str, str]], min_w: int = 0
+    ) -> tuple[int, int, int, int]:
+        """Where a boxed overlay (the help, the table of contents) goes:
+        centered over the page, above the status bar, wide enough for its
+        longest line but shrunk to fit the terminal - for draw_box() and
+        for the callers' own scrolling and click hit-testing.
+
+        Args:
+            lines: every line of the box's content, as draw_box() takes them.
+            min_w: the narrowest the content area may be.
+
+        Returns:
+            (row0, col0, content_h, content_w): the box's top-left corner
+            (1-based terminal cells) and the size of the content area
+            inside its border - content_h < len(lines) means it scrolls.
+        """
+        available_rows = max(1, self.viewer.rows - 1)  # bottom row is the status bar
+        # A line with a right part needs a space between its two parts.
+        longest = max(
+            display_width(left) + (1 + display_width(right) if right else 0)
+            for left, right in lines
+        )
+        content_w = min(max(20, self.viewer.cols - 4), max(min_w, longest))
+        content_h = min(max(1, available_rows - 2), len(lines))
+        box_w = content_w + 4  # border (2) + padding (2)
+        box_h = content_h + 2  # top/bottom border
+        row0 = max(1, (available_rows - box_h) // 2 + 1)
+        col0 = max(1, (self.viewer.cols - box_w) // 2 + 1)
+        return row0, col0, content_h, content_w
+
+    def draw_box(
+        self, lines: list[tuple[str, str]], scroll: int,
+        selected: int | None = None, min_w: int = 0,
+    ) -> tuple[int, int]:
+        """Draw a boxed overlay (see _box()) over the page, showing
+        the window of `lines` that starts at `scroll`. We only ever move
+        the cursor and rewrite the exact cells the box covers, instead of
+        clearing the screen, so the page still showing in the rest of the
+        terminal is left untouched.
+
+        Args:
+            lines: every line of the content, each a (left, right) pair:
+                `left` is truncated to fit (by terminal columns - it may be
+                Japanese) and `right` (e.g. a page number, or "") is shown
+                in full, flush right.
+            scroll: the index of the first line in view.
+            selected: the index of the line to show in reverse video -
+                also scrolled into view - or None for no selection.
+            min_w: as for _box().
+
+        Returns:
+            (scroll, max_scroll): `scroll` clamped to what the box can
+            actually show (e.g. after a resize shrank it), for the caller
+            to store back, and the largest scroll there is (0 = no scrolling).
+        """
+        row0, col0, content_h, content_w = self._box(lines, min_w)
+        max_scroll = max(0, len(lines) - content_h)
+        # Scroll just enough to keep the selection in view.
+        if selected is not None:
+            if selected < scroll:
+                scroll = selected
+            elif selected >= scroll + content_h:
+                scroll = selected - content_h + 1
+        scroll = max(0, min(max_scroll, scroll))
+
+        box_w = content_w + 4
+        out = [SGR_RESET]
+        # Blank the box's cells first. Over text mode's lines, a cell can
+        # be the right half of a double-width character; a wide character
+        # of the box's written there makes the terminal (iTerm2, at least)
+        # drop the old one and move over a column, shifting the rest of
+        # the row (redrawing the box put it right, as its own cells were
+        # all that was left underneath by then). Plain spaces split such a
+        # character cleanly, leaving nothing for the box to trip on.
+        for row in range(row0, row0 + content_h + 2):
+            out.append(f"\x1b[{row};{col0}H{' ' * box_w}")
+        out.append(f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐")
+        for i in range(content_h):
+            left, right = lines[scroll + i]
+            # `left` gets whatever `right` (and a space before it) leaves.
+            left_w = content_w - display_width(right)
+            left = truncate_to_width(left, max(0, left_w - 1) if right else left_w)
+            line = pad_to_width(left, left_w) + right
+            if scroll + i == selected:
+                line = f"\x1b[7m{line}{SGR_RESET}"
+            out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line} │")
+        out.append(f"\x1b[{row0 + content_h + 1};{col0}H└{'─' * (box_w - 2)}┘")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        return scroll, max_scroll
+
+    def _help_lines(self) -> list[tuple[str, str]]:
+        """The help box's content (KEY_TABLE), as draw_box() takes it."""
+        return [(line, "") for line in KEY_TABLE.splitlines()]
+
+    def help_box(self) -> tuple[int, int, int, int]:
+        """_box() for the help - see there."""
+        return self._box(self._help_lines())
+
+    def show_help(self) -> None:
+        """F1/:h: put up the help (KEY_TABLE) as a box over the page."""
+        self.active = "help"
+        self.help_scroll = 0
+        self._draw_help()
+
+    def scroll_help(self, delta: int) -> None:
+        """Scroll the help box by `delta` lines (negative = up), for when
+        KEY_TABLE has grown taller than the box can show at once."""
+        lines = KEY_TABLE.splitlines()
+        content_h = self.help_box()[2]
+        max_scroll = max(0, len(lines) - content_h)
+        new_scroll = max(0, min(max_scroll, self.help_scroll + delta))
+        if new_scroll != self.help_scroll:
+            self.help_scroll = new_scroll
+            self._draw_help()
+
+    def _draw_help(self) -> None:
+        """Overlay the help (KEY_TABLE) as a box over the page, scrolled
+        to self.help_scroll."""
+        self.help_scroll, max_scroll = self.draw_box(self._help_lines(), self.help_scroll)
+        if max_scroll:
+            pct = round(100 * self.help_scroll / max_scroll)
+            self.viewer.draw_status(f"q to close help - j/k or wheel to scroll ({pct}%)")
+        else:
+            self.viewer.draw_status("q to close help")
+
+    def _ensure_outline(self) -> list[dict[str, Any]]:
+        """self._outline (see PdfDocument.build_outline()), built on
+        first use - an empty list for anything without a real PDF behind
+        it (see Viewer._pdf_source()). A rendered document gets the bookmarks
+        of the PDF it was rendered to: WeasyPrint makes one per Markdown
+        heading, LibreOffice one per Word/OpenDocument heading or
+        PowerPoint slide title; Chrome's --print-to-pdf fallback makes
+        none, and neither does LibreOffice for RTF."""
+        if self._outline is None:
+            pdf_source = self.viewer._pdf_source()
+            self._outline = pdf_source.build_outline() if pdf_source is not None else []
+        return self._outline
+
+    def show_outline(self) -> None:
+        """o/TAB: put up the table of contents (the PDF's bookmarks - see
+        _ensure_outline() for the other formats that have one) as a
+        box over the page, with the entry for the page on screen already
+        selected - or just say so on the status line if there isn't one."""
+        outline = self._ensure_outline()
+        if not outline:
+            self.viewer.draw_status("no table of contents in this file")
+            return
+        # The last entry starting at or before the current page is the
+        # section being read - the same one a PDF viewer's sidebar
+        # highlights. Entries without a page don't count.
+        self.outline_sel = 0
+        for i, entry in enumerate(outline):
+            if entry["page"] is not None and entry["page"] <= self.viewer.page:
+                self.outline_sel = i
+        self.active = "outline"
+        self.outline_scroll = 0
+        self._draw_outline()
+
+    def _outline_lines(self) -> list[tuple[str, str]]:
+        """The table-of-contents box's content, as draw_box() takes it:
+        each entry's title indented by its level, with its page number
+        (if it has one) flush right."""
+        return [
+            ("  " * e["level"] + e["title"], str(e["page"]) if e["page"] is not None else "")
+            for e in self._ensure_outline()
+        ]
+
+    def outline_box(self) -> tuple[int, int, int, int]:
+        """_box() for the table of contents - see there."""
+        return self._box(self._outline_lines(), OUTLINE_MIN_W)
+
+    def _draw_outline(self) -> None:
+        """Draw the table-of-contents box over the page, with the selected
+        entry in reverse video and scrolled into view."""
+        outline = self._ensure_outline()
+        self.outline_sel = max(0, min(len(outline) - 1, self.outline_sel))
+        self.outline_scroll, _max_scroll = self.draw_box(
+            self._outline_lines(), self.outline_scroll, self.outline_sel, OUTLINE_MIN_W
+        )
+        self.viewer.draw_status(
+            f"ENTER to jump, q to close - {self.outline_sel + 1}/{len(outline)}"
+        )
+
+    def _move_outline_selection(self, delta: int) -> None:
+        """Move the selection `delta` entries down (negative = up),
+        stopping at either end."""
+        n = len(self._ensure_outline())
+        new_sel = max(0, min(n - 1, self.outline_sel + delta))
+        if new_sel != self.outline_sel:
+            self.outline_sel = new_sel
+            self._draw_outline()
+
+    def jump_to_outline_entry(self, index: int) -> None:
+        """Close the table of contents and go to entry `index`'s place:
+        in image mode, exactly where its destination points (like an
+        internal link, and recorded in the same [/] history); in text
+        mode, the top of its page."""
+        entry = self._ensure_outline()[index]
+        if entry["page"] is None:
+            self.viewer.draw_status("this entry doesn't point to a page in this file")
+            return
+        self.active = None
+        self.viewer._invalidate_screen()
+        if self.viewer.text_mode:
+            self.viewer.go_to_page_text(entry["page"], 0)
+        else:
+            self.viewer._push_history()
+            self.viewer.go_to_link_target(entry["page"], entry["top_pt"])
+        self.viewer.refresh()
+
+    # What each overlay (see self.active) is, as the calls the shared
+    # code below makes on it - everything else about the two boxes is
+    # handled the same way.
+    def _box_now(self) -> tuple[int, int, int, int]:
+        """_box() for the overlay that's up."""
+        return self.help_box() if self.active == "help" else self.outline_box()
+
+    def draw(self) -> None:
+        """Draw the overlay that's up over the page, and its status line."""
+        if self.active == "help":
+            self._draw_help()
+        else:
+            self._draw_outline()
+
+    def _move(self, delta: int) -> None:
+        """j/k and the like on the overlay that's up: scroll the help by
+        `delta` lines, or move the table of contents' selection by
+        `delta` entries (negative = up) - either way stopping at the ends."""
+        if self.active == "help":
+            self.scroll_help(delta)
+        else:
+            self._move_outline_selection(delta)
+
+    def hide(self) -> None:
+        """Close the help or the table of contents, redrawing what it covered."""
+        self.active = None
+        self.viewer._invalidate_screen()  # the box overlays the page
+        self.viewer.refresh()
+
+    def handle_key(self, key: str) -> None:
+        """A key pressed while the help or the table of contents is up.
+        Both take the same keys:
+
+        - q, ESC, or the key that opened it (F1, or o/TAB) closes it;
+        - ^L (or a focus change - see Viewer.handle_global_key()) repaints the
+          page underneath, then the box back over it;
+        - the usual line/window keys, d/u and g/G/</>/HOME/END scroll the
+          help or move the table of contents' selection;
+        - ENTER (table of contents only) jumps to the selected entry.
+
+        Everything else is swallowed, so page keys can't act on the page
+        hidden underneath."""
+        window = max(1, self._box_now()[2] - 1)
+        far = len(KEY_TABLE.splitlines()) + len(self._ensure_outline())  # past either end
+        closing = ("F1",) if self.active == "help" else ("o", "\t")
+        # ENTER before the line keys: "\r" is one of FORWARD_LINE_KEYS.
+        if key in ("\r", "\n") and self.active == "outline":
+            self.jump_to_outline_entry(self.outline_sel)
+        elif key in ("q", "\x1b") or key in closing:
+            self.hide()
+        elif key in ("\x0c", "FOCUS_IN"):
+            self.viewer._invalidate_screen()
+            if self.viewer.text_mode:
+                self.viewer._draw_text()
+            else:
+                self.viewer._draw()
+            self.draw()
+        elif key in FORWARD_LINE_KEYS:
+            self._move(1)
+        elif key in BACKWARD_LINE_KEYS:
+            self._move(-1)
+        elif key in FORWARD_WINDOW_KEYS or key in ("d", "\x04"):
+            self._move(window)
+        elif key in BACKWARD_WINDOW_KEYS or key in ("u", "\x15"):
+            self._move(-window)
+        elif key in ("g", "<", "HOME"):
+            self._move(-far)
+        elif key in ("G", ">", "END"):
+            self._move(far)
+
+    def handle_mouse(self, kind: str, col: int, row: int) -> None:
+        """A mouse event while the help or the table of contents is up:
+        the wheel scrolls it (moves the selection, for the table of
+        contents), a click anywhere outside the box closes it, and a
+        click on a table-of-contents entry jumps to it."""
+        if kind == "MOUSE_WHEEL_UP":
+            self._move(-1)
+        elif kind == "MOUSE_WHEEL_DOWN":
+            self._move(1)
+        elif kind == "MOUSE_CLICK":
+            row0, col0, content_h, content_w = self._box_now()
+            inside_cols = col0 <= col < col0 + content_w + 4
+            if inside_cols and row0 < row <= row0 + content_h:
+                if self.active == "outline":
+                    self.jump_to_outline_entry(self.outline_scroll + row - row0 - 1)
+            elif not (inside_cols and row0 <= row <= row0 + content_h + 1):
+                self.hide()  # outside the box (its border doesn't count)
+
+
+class _Search:
+    """"/" and "?" search: the query, every match it found, which one is
+    selected, and the PDF search index they came from - and moving the
+    view to a match. The view draws the selected match itself (a box in
+    image mode, a highlight in text mode) from visible_match() and
+    text_highlight(), recomputed on every draw.
+
+    A match is (page, xMin, yMin, xMax, yMax) from a paginated
+    document's bbox index, or (line_idx, start, end) into the viewer's
+    text_lines when the text is searched directly (see
+    uses_text_lines()).
+
+    Attributes:
+        viewer: the Viewer searched in.
+        query: the query, or None when no search is active.
+        multiline: whether a regex may match across line breaks (^T at
+            the search prompt) - see find_all_text_matches() and
+            PdfDocument.find_search_matches().
+        matches: every match of the query, in reading order.
+        pos: the index of the selected match in `matches`, or None.
+        index: the PDF search index (see PdfDocument.build_search_index()),
+            built on the first search - or None.
+    """
+
+    def __init__(self, viewer: Viewer) -> None:
+        """Args:
+            viewer: the Viewer searched in.
+        """
+        self.viewer = viewer
+        self.query: str | None = None
+        self.multiline = False
+        self.matches: Sequence[SearchMatch] = []
+        self.pos: int | None = None
+        self.index: list[dict[str, Any]] | None = None
+
+    def reset(self) -> None:
+        """Clear the search and drop the index, for a reload or a switch
+        to another file - the index is built again on the next search."""
+        self.index = None
+        self.clear()
+
+    def start(self, query: str, backward: bool = False, multiline: bool = False) -> None:
+        """Search the whole document for `query` and jump to one match -
+        which one depends on where you are now and on `backward`, i.e.
+        on whether the prompt was opened with "?" rather than "/" (see
+        _match_index_from()). N/P walk every match from there on,
+        regardless of the direction this started in. `multiline` (^T at
+        the prompt) lets a regex match across line breaks, as a literal
+        query always may - see find_all_text_matches() and
+        PdfDocument.find_search_matches()."""
+        if not query:
+            return
+        self.query = query
+        self.multiline = multiline
+        if self.uses_text_lines():
+            # No page/bbox structure for a non-paginated document
+            # (plain text/RTF, or Markdown currently in text mode) -
+            # matches are just (line_idx, start, end) straight out of
+            # text_lines, the whole document's text.
+            self.matches = self.find_all_text_matches()
+            if not self.matches:
+                self.pos = None
+                self.viewer.draw_status(f'"{query}" not found')
+                return
+            # Positions are raw line indices, so "here" has to be one
+            # too - text_scroll itself counts display rows while the
+            # text is wrapped (see Viewer._top_text_line()).
+            self.go_to_match(self._match_index_from(
+                [m[0] for m in self.matches], self.viewer._top_text_line(), backward,
+            ))
+            return
+
+        if self.index is None:
+            self.viewer.draw_status("building search index...")
+            self.index = self.viewer.doc_handler.build_search_index()
+        self.matches = (
+            self.viewer.doc_handler.find_search_matches(self.index, query, multiline)
+            if self.index is not None else []  # nothing to search
+        )
+        if not self.matches:
+            self.pos = None
+            self.viewer.draw_status(f'"{query}" not found')
+            return
+        # A paginated document's matches are only ordered down to the
+        # page they're on, so that's the unit the starting point is
+        # measured in too.
+        self.go_to_match(self._match_index_from(
+            [m[0] for m in self.matches], self.viewer.page, backward,
+        ))
+
+    def repeat(self, forward: bool) -> None:
+        if not self.matches:
+            msg = (
+                f'"{self.query}" not found'
+                if self.query
+                else "no previous search pattern"
+            )
+            self.viewer.draw_status(msg)
+            return
+        if self.pos is None:
+            self.pos = 0
+        else:
+            step = 1 if forward else -1
+            next_pos = self.pos + step
+            if not (0 <= next_pos < len(self.matches)):
+                # No wraparound - N past the last match / P before the
+                # first one just reports there's nowhere further to go,
+                # the way less(1)'s own (non-wrapping) search does.
+                self.viewer.draw_status(
+                    f'"{self.query}" no more matches '
+                    + ("forward" if forward else "backward")
+                )
+                return
+            self.pos = next_pos
+        self.go_to_match(self.pos)
+
+    def clear(self) -> None:
+        self.query = None
+        self.matches = []
+        self.pos = None
+
+    def go_to_match(self, idx: int) -> None:
+        self.pos = idx
+
+        if self.uses_text_lines():
+            self.viewer._scroll_text_to_highlight(*self.matches[idx])
+            self.viewer.refresh()
+            self.viewer.draw_status(
+                f'"{self.query}" match {idx + 1}/{len(self.matches)}'
+            )
+            return
+
+        page = self.matches[idx][0]
+
+        if self.viewer.text_mode:
+            self.viewer.go_to_page_text(page, 0)
+        else:
+            self.viewer.go_page(page, 0)
+
+        # The viewer's page == page now, so this is the match we just
+        # landed on; Viewer._draw()/_draw_text() will independently
+        # rediscover and render it (marker box or text highlight) on every
+        # redraw from here on, including a later `t` mode toggle - see
+        # active_page_match().
+        match = self.active_page_match()
+        if match is None:
+            pass  # (the page couldn't be shown - nothing to scroll to)
+        elif self.viewer.text_mode:
+            self.scroll_text_to_match(match)
+        else:
+            self.scroll_image_to_match(match)
+
+        self.viewer.refresh()
+        self.viewer.draw_status(
+            f'"{self.query}" match {idx + 1}/{len(self.matches)} '
+            # The match's own page, not self.viewer.page: under -c/--continuous
+            # the view can settle with an earlier page at the top.
+            f"(page {page})"
+        )
+
+    @staticmethod
+    def _match_index_from(positions: list[int], here: int, backward: bool) -> int:
+        """Which of the matches a search should land on, given where it
+        started from. `positions` is every match's position in ascending
+        order, in whatever unit `here` is in (a page number, or a raw
+        text_lines index); the answer is an index into it.
+
+        Forward ("/"), that's the first match at or after `here`;
+        backward ("?"), the last one strictly before it - so "?" can
+        never move you forward, while "/" can leave you where you are if
+        a match is already on screen. Either way it wraps around the
+        ends of the document less(1)-style: a backward search from
+        before the first match lands on the last one, a forward search
+        from past the last one lands on the first."""
+        if backward:
+            for i in range(len(positions) - 1, -1, -1):
+                if positions[i] < here:
+                    return i
+            return len(positions) - 1
+        for i, pos in enumerate(positions):
+            if pos >= here:
+                return i
+        return 0
+
+    def uses_text_lines(self) -> bool:
+        """Whether / search should walk self.viewer.text_lines as one blob
+        (line_idx, start, end) matches rather than a PDF page/bbox
+        index. True for plain text files (always in text mode) and for
+        handlers like MarkdownDocument whose text mode shows the whole
+        raw source at once - but False in image mode even for those,
+        where a real PDF delegate's bbox index should still be used."""
+        return self.viewer.text_mode and not self.viewer.doc_handler.text_mode_is_paginated()
+
+    def active_page_match(self) -> BBoxMatch | None:
+        """The currently-selected search match (self.pos), but
+        only if it's on the page being displayed right now - this is
+        what lets the box marker (image mode) and highlight (text mode)
+        follow each other across a `t` toggle: both are derived from this
+        same bit of state, recomputed fresh on every draw, rather than
+        each mode tracking its own separate "is a match showing" flag."""
+        if self.pos is None:
+            return None
+        match = self.matches[self.pos]
+        if len(match) != 5:
+            return None  # a text-lines (line, start, end) match has no page
+        return match if match[0] == self.viewer.page else None
+
+    def visible_match(self) -> BBoxMatch | None:
+        """What to actually draw a match marker/highlight for: the same
+        as active_page_match(), except that under
+        -c/--continuous the match can be on any page that's on screen
+        too, not just the one at the top - in image mode, any page in
+        self.viewer._layout; in the continuous text view, any page at all,
+        since the whole document's text is loaded there and the
+        highlight is simply drawn wherever that line is. Used only for
+        drawing: everything that repositions the view around a match
+        still goes by active_page_match(), since it works from
+        the current page's own coordinates."""
+        if self.pos is None:
+            return None
+        match = self.matches[self.pos]
+        if len(match) != 5:
+            return None  # a text-lines (line, start, end) match has no page
+        if match[0] == self.viewer.page:
+            return match
+        if not self.viewer.continuous:
+            return None
+        if self.viewer.text_mode:
+            return match if self.viewer._text_continuous() else None
+        return match if self.viewer._visible_page_top(match[0]) is not None else None
+
+    def _active_occurrence_index(self) -> int | None:
+        """How many other matches with the same page precede
+        self.matches[self.pos] (0-indexed) - i.e. this is
+        the Nth occurrence of the query on that page, in reading order.
+        Used to correlate the same occurrence between the bbox-based
+        document search index and the independently pdftotext -layout
+        -extracted text-mode lines: when a page has the query more than
+        once, matching by *position* between the two isn't reliable
+        (their coordinate systems and line-splitting differ), but
+        reading order should still agree between them."""
+        if self.pos is None:
+            return None
+        page = self.matches[self.pos][0]
+        if page != self.viewer.page and not self.viewer._text_continuous():
+            return None  # (the continuous text view has every page loaded)
+        return sum(1 for m in self.matches[: self.pos] if m[0] == page)
+
+    def match_bbox_px(self, match: BBoxMatch) -> tuple[float, float, float, float]:
+        """Pixel bounding box (in its own page's image, at the current
+        zoom - self.viewer.img when it's on the current page) of a
+        (page, xMin, yMin, xMax, yMax) search match, in points."""
+        page, xmin_pt, ymin_pt, xmax_pt, ymax_pt = match
+        img = self.viewer.img if page == self.viewer.page else self.viewer._page_image(page)
+        assert self.index is not None  # a bbox match came from it
+        page_info = self.index[page - 1]
+        scale_x = img.width / page_info["width_pt"]
+        scale_y = img.height / page_info["height_pt"]
+        return (
+            xmin_pt * scale_x,
+            ymin_pt * scale_y,
+            xmax_pt * scale_x,
+            ymax_pt * scale_y,
+        )
+
+    def scroll_image_to_match(self, match: BBoxMatch) -> None:
+        """Scroll/pan the image view so `match` is visible, landing it a
+        little below the top-left rather than jammed against the edge."""
+        px_left, px_top, px_right, px_bottom = self.match_bbox_px(match)
+        margin = self.viewer.avail_height_px // 4
+        self.viewer.scroll = self.viewer._clamp_image_scroll(round(px_top) - margin)
+        if px_left < self.viewer.x_offset or px_right > self.viewer.x_offset + self.viewer.crop_width:
+            self.viewer._set_x_offset(round((px_left + px_right) / 2 - self.viewer.crop_width / 2))
+
+    def scroll_text_to_match(self, match: BBoxMatch) -> None:
+        """Scroll/pan the text view so `match` is visible, landing it a
+        little below the top rather than jammed against the top edge -
+        panning horizontally into view too, in case the terminal is too
+        narrow for the line and it's off to the side of the truncated
+        view (the text-mode equivalent of scroll_image_to_match()).
+        Wrapped text has no pan to speak of - Viewer._row_for_line() converts
+        the raw line position into a display-row scroll target instead."""
+        highlight = self._text_highlight_for_match(match)
+        if highlight:
+            self.viewer._scroll_text_to_highlight(*highlight)
+        else:
+            self.viewer._scroll_text_to_row(self.viewer._text_row_for_line(self._approx_text_line(match)))
+
+    def find_all_text_matches(self, line_range: tuple[int, int] | None = None) -> list[TextMatch]:
+        """Every occurrence of self.query within self.viewer.text_lines
+        (the current page's pdftotext -layout text, or the whole
+        document's), as a list of (line_idx, start, end), in reading
+        order - only lines line_range[0] up to (not including)
+        line_range[1] of it, if given (one page's share of the
+        continuous text view - see Viewer._text_page_range()).
+
+        The lines are searched joined together, so a match can run across
+        a line break - a PDF's text comes one printed line at a time, so
+        a paragraph's words are often split between two ("ござ" / "います").
+        That's only for a literal query (see search_query_is_literal()),
+        or with self.multiline on: otherwise a regex is matched
+        one line at a time.
+        The line break is whitespace like any other to
+        normalize_for_search(): dropped next to Japanese or Chinese, one
+        space between Latin words. Such a match's `end` counts on past
+        its own line (see TextMatch). A page separator line (continuous
+        view) is never searched across."""
+        if not self.query:
+            return []
+        pattern = compile_search_pattern(self.query)
+        start, end = line_range if line_range else (0, len(self.viewer.text_lines))
+        results = []
+        if not (self.multiline or search_query_is_literal(self.query)):
+            # A regex - "foo.*bar" - stays within one line, as in less(1),
+            # unless ^T at the prompt said otherwise: joined up, ".*" would
+            # reach from one "foo" to a "bar" any number of lines on.
+            for i in range(start, end):
+                if i not in self.viewer._text_separator_lines:
+                    results.extend(self._find_text_matches_in_block(pattern, i, i + 1))
+            return results
+        block_start = start
+        # Blocks of consecutive lines between separators, each searched
+        # as one string.
+        for i in range(start, end + 1):
+            if i < end and i not in self.viewer._text_separator_lines:
+                continue
+            if block_start < i:
+                results.extend(self._find_text_matches_in_block(pattern, block_start, i))
+            block_start = i + 1
+        return results
+
+    def _find_text_matches_in_block(
+        self, pattern: re.Pattern[str], first: int, stop: int,
+    ) -> list[TextMatch]:
+        """find_all_text_matches() for lines first..stop-1, none of them
+        a separator.
+
+        Args:
+            pattern: from compile_search_pattern().
+            first, stop: the lines to search, as one.
+
+        Returns:
+            (line_idx, start, end) of each match, `start` within line
+            line_idx and `end` counted from that same line's start.
+        """
+        lines = self.viewer.text_lines[first:stop]
+        # Joined by a space rather than "\n" - the same to
+        # normalize_for_search() (either is dropped next to Japanese or
+        # Chinese), but a single space between two Latin words needs no
+        # folding at all, which keeps a long plain-English text fast.
+        text = " ".join(lines)
+        normalized = normalize_lines_for_search(lines)
+        # Where each line starts in `text`.
+        line_starts = []
+        offset = 0
+        for line in lines:
+            line_starts.append(offset)
+            offset += len(line) + 1
+        results = []
+        for match_start, match_end in search_spans(pattern, text, normalized):
+            k = bisect.bisect_right(line_starts, match_start) - 1
+            results.append((first + k, match_start - line_starts[k], match_end - line_starts[k]))
+        return results
+
+    def text_highlight(self) -> TextMatch | None:
+        """(line_idx, start, end) to highlight while drawing text mode,
+        or None. Never returns a PDF bbox tuple."""
+        if self.pos is None or not self.matches:
+            return None
+        match = self.matches[self.pos]
+        if self.uses_text_lines():
+            if len(match) == 3:
+                return match
+            return self._text_highlight_for_match(match)
+        return self._text_highlight_for_match(self.visible_match())
+
+    def _text_highlight_for_match(self, match: BBoxMatch | None) -> TextMatch | None:
+        """(line_idx, start, end) of `match` within self.viewer.text_lines, or
+        None if the query doesn't appear there at all (a real
+        possibility, given the two extractions can differ)."""
+        if match is None:
+            return None
+        page_start, page_end = self.viewer._text_page_range(match[0])
+        all_matches = self.find_all_text_matches((page_start, page_end))
+        if not all_matches:
+            return None
+
+        occurrence_index = self._active_occurrence_index()
+        if occurrence_index is not None and occurrence_index < len(all_matches):
+            return all_matches[occurrence_index]
+
+        # Fall back to a proportional-position guess, for the rare case
+        # where the two extractions disagree on how many times the query
+        # appears on this page.
+        approx_line = self._approx_text_line(match)
+        return min(all_matches, key=lambda c: abs(c[0] - approx_line))
+
+    def _approx_text_line(self, match: tuple) -> int:
+        """A guess at the raw text_lines index a (page, xMin, yMin, xMax,
+        yMax) bbox match falls on - its vertical position on the page,
+        as the same fraction of that page's own lines - for when the
+        text extraction can't pin it down exactly (see
+        _text_highlight_for_match())."""
+        page, _xmin_pt, ymin_pt, _xmax_pt, _ymax_pt = match
+        assert self.index is not None  # a bbox match came from it
+        height_pt = self.index[page - 1]["height_pt"]
+        page_start, page_end = self.viewer._text_page_range(page)
+        return page_start + (
+            round((ymin_pt / height_pt) * (page_end - page_start)) if height_pt else 0
+        )
+
+
 class Viewer:
     def __init__(
         self, files: list[DocumentHandler | str], file_index: int, page: int, tmpdir: str, fd: int,
@@ -5765,27 +6512,11 @@ class Viewer:
         self._text_page_starts: list[int] | None = None
         self._text_separator_lines: frozenset[int] = frozenset()
         self._text_max_page_lines = 0  # the -N gutter's width, per page
-        # The box drawn over the page, if any: "help" (F1 - see
-        # show_help()) or "outline", the table of contents (o/TAB - see
-        # show_outline()). While one is up it takes every key and mouse
-        # event (see handle_overlay_key()).
-        self.overlay: Literal["help", "outline"] | None = None
-        self.help_scroll = 0  # the first help line in view
-        # The table of contents' selected entry, and the first entry in view.
-        self.outline_sel = 0
-        self.outline_scroll = 0
-        self._outline: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_outline()
-        self._search_index: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_search_index()
+        self.overlays: _Overlays = _Overlays(self)  # the help and the table of contents
         self._link_index: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_link_index()
         self._history_back: list[tuple[int, int, int]] = []  # [(page, scroll, x_offset), ...]
         self._history_forward: list[tuple[int, int, int]] = []
-        self.search_query: str | None = None
-        # Whether a regex search may match across line breaks (^T at the
-        # search prompt) - see _find_all_text_matches() and
-        # PdfDocument.find_search_matches().
-        self.search_multiline = False
-        self.search_matches: Sequence[SearchMatch] = []
-        self.search_pos: int | None = None
+        self.search: _Search = _Search(self)  # "/" and "?"
         # A plain text file has no image view at all - it's permanently
         # "in text mode", the same rendering PDF's `t` key switches to.
         self.text_mode = self.doc_handler.starts_in_text_mode()
@@ -5857,7 +6588,7 @@ class Viewer:
         # underlying page raster are both stale after a resize; simplest
         # is to just drop back to the normal view, which always does a
         # full redraw at the new size.
-        self.overlay = None
+        self.overlays.active = None
 
     def _classify(self, index: int, wait: bool = True, debug: bool | None = None) -> DocumentHandler | None:
         """files[index]'s DocumentHandler - already one (the file about
@@ -6075,10 +6806,9 @@ class Viewer:
         self.file_index = index
         self._set_current_file()
         self.encode_cache.clear()
-        self._search_index = None
-        self.clear_search()
+        self.search.reset()
         self._link_index = None
-        self._outline = None
+        self.overlays.forget_outline()
         self._history_back = []
         self._history_forward = []
         self.text_mode = self.doc_handler.starts_in_text_mode()
@@ -6479,8 +7209,8 @@ class Viewer:
                 self.mark_file_missing()
             return
         self._load_content()
-        if self.overlay is not None:
-            self._draw_overlay()
+        if self.overlays.active is not None:
+            self.overlays.draw()
         elif self.text_mode:
             self._draw_text()
         else:
@@ -6527,296 +7257,6 @@ class Viewer:
             sys.stdout.write(wrap_for_tmux(osc) + "\r\n")
         sys.stdout.flush()
 
-    def _overlay_box(
-        self, lines: list[tuple[str, str]], min_w: int = 0
-    ) -> tuple[int, int, int, int]:
-        """Where a boxed overlay (the help, the table of contents) goes:
-        centered over the page, above the status bar, wide enough for its
-        longest line but shrunk to fit the terminal - for _draw_box() and
-        for the callers' own scrolling and click hit-testing.
-
-        Args:
-            lines: every line of the box's content, as _draw_box() takes them.
-            min_w: the narrowest the content area may be.
-
-        Returns:
-            (row0, col0, content_h, content_w): the box's top-left corner
-            (1-based terminal cells) and the size of the content area
-            inside its border - content_h < len(lines) means it scrolls.
-        """
-        available_rows = max(1, self.rows - 1)  # bottom row is the status bar
-        # A line with a right part needs a space between its two parts.
-        longest = max(
-            display_width(left) + (1 + display_width(right) if right else 0)
-            for left, right in lines
-        )
-        content_w = min(max(20, self.cols - 4), max(min_w, longest))
-        content_h = min(max(1, available_rows - 2), len(lines))
-        box_w = content_w + 4  # border (2) + padding (2)
-        box_h = content_h + 2  # top/bottom border
-        row0 = max(1, (available_rows - box_h) // 2 + 1)
-        col0 = max(1, (self.cols - box_w) // 2 + 1)
-        return row0, col0, content_h, content_w
-
-    def _draw_box(
-        self, lines: list[tuple[str, str]], scroll: int,
-        selected: int | None = None, min_w: int = 0,
-    ) -> tuple[int, int]:
-        """Draw a boxed overlay (see _overlay_box()) over the page, showing
-        the window of `lines` that starts at `scroll`. We only ever move
-        the cursor and rewrite the exact cells the box covers, instead of
-        clearing the screen, so the page still showing in the rest of the
-        terminal is left untouched.
-
-        Args:
-            lines: every line of the content, each a (left, right) pair:
-                `left` is truncated to fit (by terminal columns - it may be
-                Japanese) and `right` (e.g. a page number, or "") is shown
-                in full, flush right.
-            scroll: the index of the first line in view.
-            selected: the index of the line to show in reverse video -
-                also scrolled into view - or None for no selection.
-            min_w: as for _overlay_box().
-
-        Returns:
-            (scroll, max_scroll): `scroll` clamped to what the box can
-            actually show (e.g. after a resize shrank it), for the caller
-            to store back, and the largest scroll there is (0 = no scrolling).
-        """
-        row0, col0, content_h, content_w = self._overlay_box(lines, min_w)
-        max_scroll = max(0, len(lines) - content_h)
-        # Scroll just enough to keep the selection in view.
-        if selected is not None:
-            if selected < scroll:
-                scroll = selected
-            elif selected >= scroll + content_h:
-                scroll = selected - content_h + 1
-        scroll = max(0, min(max_scroll, scroll))
-
-        box_w = content_w + 4
-        out = [SGR_RESET]
-        # Blank the box's cells first. Over text mode's lines, a cell can
-        # be the right half of a double-width character; a wide character
-        # of the box's written there makes the terminal (iTerm2, at least)
-        # drop the old one and move over a column, shifting the rest of
-        # the row (redrawing the box put it right, as its own cells were
-        # all that was left underneath by then). Plain spaces split such a
-        # character cleanly, leaving nothing for the box to trip on.
-        for row in range(row0, row0 + content_h + 2):
-            out.append(f"\x1b[{row};{col0}H{' ' * box_w}")
-        out.append(f"\x1b[{row0};{col0}H┌{'─' * (box_w - 2)}┐")
-        for i in range(content_h):
-            left, right = lines[scroll + i]
-            # `left` gets whatever `right` (and a space before it) leaves.
-            left_w = content_w - display_width(right)
-            left = truncate_to_width(left, max(0, left_w - 1) if right else left_w)
-            line = pad_to_width(left, left_w) + right
-            if scroll + i == selected:
-                line = f"\x1b[7m{line}{SGR_RESET}"
-            out.append(f"\x1b[{row0 + 1 + i};{col0}H│ {line} │")
-        out.append(f"\x1b[{row0 + content_h + 1};{col0}H└{'─' * (box_w - 2)}┘")
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
-        return scroll, max_scroll
-
-    def _help_lines(self) -> list[tuple[str, str]]:
-        """The help box's content (KEY_TABLE), as _draw_box() takes it."""
-        return [(line, "") for line in KEY_TABLE.splitlines()]
-
-    def _help_box(self) -> tuple[int, int, int, int]:
-        """_overlay_box() for the help - see there."""
-        return self._overlay_box(self._help_lines())
-
-    def show_help(self) -> None:
-        """F1/:h: put up the help (KEY_TABLE) as a box over the page."""
-        self.overlay = "help"
-        self.help_scroll = 0
-        self._draw_help()
-
-    def scroll_help(self, delta: int) -> None:
-        """Scroll the help box by `delta` lines (negative = up), for when
-        KEY_TABLE has grown taller than the box can show at once."""
-        lines = KEY_TABLE.splitlines()
-        content_h = self._help_box()[2]
-        max_scroll = max(0, len(lines) - content_h)
-        new_scroll = max(0, min(max_scroll, self.help_scroll + delta))
-        if new_scroll != self.help_scroll:
-            self.help_scroll = new_scroll
-            self._draw_help()
-
-    def _ensure_outline(self) -> list[dict[str, Any]]:
-        """self._outline (see PdfDocument.build_outline()), built on
-        first use - an empty list for anything without a real PDF behind
-        it (see _pdf_source()). A rendered document gets the bookmarks
-        of the PDF it was rendered to: WeasyPrint makes one per Markdown
-        heading, LibreOffice one per Word/OpenDocument heading or
-        PowerPoint slide title; Chrome's --print-to-pdf fallback makes
-        none, and neither does LibreOffice for RTF."""
-        if self._outline is None:
-            pdf_source = self._pdf_source()
-            self._outline = pdf_source.build_outline() if pdf_source is not None else []
-        return self._outline
-
-    def show_outline(self) -> None:
-        """o/TAB: put up the table of contents (the PDF's bookmarks - see
-        _ensure_outline() for the other formats that have one) as a
-        box over the page, with the entry for the page on screen already
-        selected - or just say so on the status line if there isn't one."""
-        outline = self._ensure_outline()
-        if not outline:
-            self.draw_status("no table of contents in this file")
-            return
-        # The last entry starting at or before the current page is the
-        # section being read - the same one a PDF viewer's sidebar
-        # highlights. Entries without a page don't count.
-        self.outline_sel = 0
-        for i, entry in enumerate(outline):
-            if entry["page"] is not None and entry["page"] <= self.page:
-                self.outline_sel = i
-        self.overlay = "outline"
-        self.outline_scroll = 0
-        self._draw_outline()
-
-    def _outline_lines(self) -> list[tuple[str, str]]:
-        """The table-of-contents box's content, as _draw_box() takes it:
-        each entry's title indented by its level, with its page number
-        (if it has one) flush right."""
-        return [
-            ("  " * e["level"] + e["title"], str(e["page"]) if e["page"] is not None else "")
-            for e in self._ensure_outline()
-        ]
-
-    def _outline_box(self) -> tuple[int, int, int, int]:
-        """_overlay_box() for the table of contents - see there."""
-        return self._overlay_box(self._outline_lines(), OUTLINE_MIN_W)
-
-    def _draw_outline(self) -> None:
-        """Draw the table-of-contents box over the page, with the selected
-        entry in reverse video and scrolled into view."""
-        outline = self._ensure_outline()
-        self.outline_sel = max(0, min(len(outline) - 1, self.outline_sel))
-        self.outline_scroll, _max_scroll = self._draw_box(
-            self._outline_lines(), self.outline_scroll, self.outline_sel, OUTLINE_MIN_W
-        )
-        self.draw_status(
-            f"ENTER to jump, q to close - {self.outline_sel + 1}/{len(outline)}"
-        )
-
-    def _move_outline_selection(self, delta: int) -> None:
-        """Move the selection `delta` entries down (negative = up),
-        stopping at either end."""
-        n = len(self._ensure_outline())
-        new_sel = max(0, min(n - 1, self.outline_sel + delta))
-        if new_sel != self.outline_sel:
-            self.outline_sel = new_sel
-            self._draw_outline()
-
-    def jump_to_outline_entry(self, index: int) -> None:
-        """Close the table of contents and go to entry `index`'s place:
-        in image mode, exactly where its destination points (like an
-        internal link, and recorded in the same [/] history); in text
-        mode, the top of its page."""
-        entry = self._ensure_outline()[index]
-        if entry["page"] is None:
-            self.draw_status("this entry doesn't point to a page in this file")
-            return
-        self.overlay = None
-        self._invalidate_screen()
-        if self.text_mode:
-            self.go_to_page_text(entry["page"], 0)
-        else:
-            self._push_history()
-            self.go_to_link_target(entry["page"], entry["top_pt"])
-        self.refresh()
-
-    # What each overlay (see self.overlay) is, as the calls the shared
-    # code below makes on it - everything else about the two boxes is
-    # handled the same way.
-    def _overlay_box_now(self) -> tuple[int, int, int, int]:
-        """_overlay_box() for the overlay that's up."""
-        return self._help_box() if self.overlay == "help" else self._outline_box()
-
-    def _draw_overlay(self) -> None:
-        """Draw the overlay that's up over the page, and its status line."""
-        if self.overlay == "help":
-            self._draw_help()
-        else:
-            self._draw_outline()
-
-    def _move_overlay(self, delta: int) -> None:
-        """j/k and the like on the overlay that's up: scroll the help by
-        `delta` lines, or move the table of contents' selection by
-        `delta` entries (negative = up) - either way stopping at the ends."""
-        if self.overlay == "help":
-            self.scroll_help(delta)
-        else:
-            self._move_outline_selection(delta)
-
-    def hide_overlay(self) -> None:
-        """Close the help or the table of contents, redrawing what it covered."""
-        self.overlay = None
-        self._invalidate_screen()  # the box overlays the page
-        self.refresh()
-
-    def handle_overlay_key(self, key: str) -> None:
-        """A key pressed while the help or the table of contents is up.
-        Both take the same keys:
-
-        - q, ESC, or the key that opened it (F1, or o/TAB) closes it;
-        - ^L (or a focus change - see handle_global_key()) repaints the
-          page underneath, then the box back over it;
-        - the usual line/window keys, d/u and g/G/</>/HOME/END scroll the
-          help or move the table of contents' selection;
-        - ENTER (table of contents only) jumps to the selected entry.
-
-        Everything else is swallowed, so page keys can't act on the page
-        hidden underneath."""
-        window = max(1, self._overlay_box_now()[2] - 1)
-        far = len(KEY_TABLE.splitlines()) + len(self._ensure_outline())  # past either end
-        closing = ("F1",) if self.overlay == "help" else ("o", "\t")
-        # ENTER before the line keys: "\r" is one of FORWARD_LINE_KEYS.
-        if key in ("\r", "\n") and self.overlay == "outline":
-            self.jump_to_outline_entry(self.outline_sel)
-        elif key in ("q", "\x1b") or key in closing:
-            self.hide_overlay()
-        elif key in ("\x0c", "FOCUS_IN"):
-            self._invalidate_screen()
-            if self.text_mode:
-                self._draw_text()
-            else:
-                self._draw()
-            self._draw_overlay()
-        elif key in FORWARD_LINE_KEYS:
-            self._move_overlay(1)
-        elif key in BACKWARD_LINE_KEYS:
-            self._move_overlay(-1)
-        elif key in FORWARD_WINDOW_KEYS or key in ("d", "\x04"):
-            self._move_overlay(window)
-        elif key in BACKWARD_WINDOW_KEYS or key in ("u", "\x15"):
-            self._move_overlay(-window)
-        elif key in ("g", "<", "HOME"):
-            self._move_overlay(-far)
-        elif key in ("G", ">", "END"):
-            self._move_overlay(far)
-
-    def handle_overlay_mouse(self, kind: str, col: int, row: int) -> None:
-        """A mouse event while the help or the table of contents is up:
-        the wheel scrolls it (moves the selection, for the table of
-        contents), a click anywhere outside the box closes it, and a
-        click on a table-of-contents entry jumps to it."""
-        if kind == "MOUSE_WHEEL_UP":
-            self._move_overlay(-1)
-        elif kind == "MOUSE_WHEEL_DOWN":
-            self._move_overlay(1)
-        elif kind == "MOUSE_CLICK":
-            row0, col0, content_h, content_w = self._overlay_box_now()
-            inside_cols = col0 <= col < col0 + content_w + 4
-            if inside_cols and row0 < row <= row0 + content_h:
-                if self.overlay == "outline":
-                    self.jump_to_outline_entry(self.outline_scroll + row - row0 - 1)
-            elif not (inside_cols and row0 <= row <= row0 + content_h + 1):
-                self.hide_overlay()  # outside the box (its border doesn't count)
-
     def can_enter_text_mode(self) -> bool:
         """Whether this file has any text-mode content to show at all -
         enter_text_mode()'s own precondition, and what run_viewer()'s
@@ -6843,7 +7283,7 @@ class Viewer:
         # The query to search again for in the new mode, if the match
         # itself can't carry over - see search_resets_on_text_mode_toggle().
         reindex_query = (
-            self.search_query if self.doc_handler.search_resets_on_text_mode_toggle() else None
+            self.search.query if self.doc_handler.search_resets_on_text_mode_toggle() else None
         )
         self._load_text_page()
         if reindex_query:
@@ -6851,14 +7291,14 @@ class Viewer:
             # (see search_resets_on_text_mode_toggle()) - the match object
             # itself can't carry over, so re-run the same query against
             # this mode's own text instead, landing on the nearest hit.
-            self.start_search(reindex_query)
+            self.search.start(reindex_query)
         else:
             # If there's a search match highlighted/boxed on this same
             # page, follow it across into text mode too, scrolled into
             # view.
-            match = self._active_search_page_match()
+            match = self.search.active_page_match()
             if match:
-                self._scroll_text_to_match(match)
+                self.search.scroll_text_to_match(match)
         self.refresh()
         return True
 
@@ -6887,7 +7327,7 @@ class Viewer:
         # The query to search again for in the new mode, if the match
         # itself can't carry over - see search_resets_on_text_mode_toggle().
         reindex_query = (
-            self.search_query if self.doc_handler.search_resets_on_text_mode_toggle() else None
+            self.search.query if self.doc_handler.search_resets_on_text_mode_toggle() else None
         )
         self.scroll = 0
         self._load_page()
@@ -6896,13 +7336,13 @@ class Viewer:
             # different extractions here, so re-run the same query
             # against image mode's own (bbox) index instead of trying to
             # carry the match object across.
-            self.start_search(reindex_query)
+            self.search.start(reindex_query)
         else:
             # Symmetric with enter_text_mode(): carry a highlighted match
             # back into the box marker on the rendered page.
-            match = self._active_search_page_match()
+            match = self.search.active_page_match()
             if match:
-                self._scroll_image_to_match(match)
+                self.search.scroll_image_to_match(match)
         self.refresh()
 
     def toggle_text_mode(self) -> bool:
@@ -7375,161 +7815,13 @@ class Viewer:
             self.text_x_offset_min, min(self.text_x_offset, self.text_x_offset_max)
         )
 
-    def _active_search_page_match(self) -> BBoxMatch | None:
-        """The currently-selected search match (self.search_pos), but
-        only if it's on the page being displayed right now - this is
-        what lets the box marker (image mode) and highlight (text mode)
-        follow each other across a `t` toggle: both are derived from this
-        same bit of state, recomputed fresh on every draw, rather than
-        each mode tracking its own separate "is a match showing" flag."""
-        if self.search_pos is None:
-            return None
-        match = self.search_matches[self.search_pos]
-        if len(match) != 5:
-            return None  # a text-lines (line, start, end) match has no page
-        return match if match[0] == self.page else None
-
-    def _visible_search_match(self) -> BBoxMatch | None:
-        """What to actually draw a match marker/highlight for: the same
-        as _active_search_page_match(), except that under
-        -c/--continuous the match can be on any page that's on screen
-        too, not just the one at the top - in image mode, any page in
-        self._layout; in the continuous text view, any page at all,
-        since the whole document's text is loaded there and the
-        highlight is simply drawn wherever that line is. Used only for
-        drawing: everything that repositions the view around a match
-        still goes by _active_search_page_match(), since it works from
-        the current page's own coordinates."""
-        if self.search_pos is None:
-            return None
-        match = self.search_matches[self.search_pos]
-        if len(match) != 5:
-            return None  # a text-lines (line, start, end) match has no page
-        if match[0] == self.page:
-            return match
-        if not self.continuous:
-            return None
-        if self.text_mode:
-            return match if self._text_continuous() else None
-        return match if self._visible_page_top(match[0]) is not None else None
-
-    def _active_search_occurrence_index(self) -> int | None:
-        """How many other matches with the same page precede
-        self.search_matches[self.search_pos] (0-indexed) - i.e. this is
-        the Nth occurrence of the query on that page, in reading order.
-        Used to correlate the same occurrence between the bbox-based
-        document search index and the independently pdftotext -layout
-        -extracted text-mode lines: when a page has the query more than
-        once, matching by *position* between the two isn't reliable
-        (their coordinate systems and line-splitting differ), but
-        reading order should still agree between them."""
-        if self.search_pos is None:
-            return None
-        page = self.search_matches[self.search_pos][0]
-        if page != self.page and not self._text_continuous():
-            return None  # (the continuous text view has every page loaded)
-        return sum(1 for m in self.search_matches[: self.search_pos] if m[0] == page)
-
-    def _match_bbox_px(self, match: BBoxMatch) -> tuple[float, float, float, float]:
-        """Pixel bounding box (in its own page's image, at the current
-        zoom - self.img when it's on the current page) of a
-        (page, xMin, yMin, xMax, yMax) search match, in points."""
-        page, xmin_pt, ymin_pt, xmax_pt, ymax_pt = match
-        img = self.img if page == self.page else self._page_image(page)
-        assert self._search_index is not None  # a bbox match came from it
-        page_info = self._search_index[page - 1]
-        scale_x = img.width / page_info["width_pt"]
-        scale_y = img.height / page_info["height_pt"]
-        return (
-            xmin_pt * scale_x,
-            ymin_pt * scale_y,
-            xmax_pt * scale_x,
-            ymax_pt * scale_y,
-        )
-
-    def _find_all_text_matches(self, line_range: tuple[int, int] | None = None) -> list[TextMatch]:
-        """Every occurrence of self.search_query within self.text_lines
-        (the current page's pdftotext -layout text, or the whole
-        document's), as a list of (line_idx, start, end), in reading
-        order - only lines line_range[0] up to (not including)
-        line_range[1] of it, if given (one page's share of the
-        continuous text view - see _text_page_range()).
-
-        The lines are searched joined together, so a match can run across
-        a line break - a PDF's text comes one printed line at a time, so
-        a paragraph's words are often split between two ("ござ" / "います").
-        That's only for a literal query (see search_query_is_literal()),
-        or with self.search_multiline on: otherwise a regex is matched
-        one line at a time.
-        The line break is whitespace like any other to
-        normalize_for_search(): dropped next to Japanese or Chinese, one
-        space between Latin words. Such a match's `end` counts on past
-        its own line (see TextMatch). A page separator line (continuous
-        view) is never searched across."""
-        if not self.search_query:
-            return []
-        pattern = compile_search_pattern(self.search_query)
-        start, end = line_range if line_range else (0, len(self.text_lines))
-        results = []
-        if not (self.search_multiline or search_query_is_literal(self.search_query)):
-            # A regex - "foo.*bar" - stays within one line, as in less(1),
-            # unless ^T at the prompt said otherwise: joined up, ".*" would
-            # reach from one "foo" to a "bar" any number of lines on.
-            for i in range(start, end):
-                if i not in self._text_separator_lines:
-                    results.extend(self._find_text_matches_in_block(pattern, i, i + 1))
-            return results
-        block_start = start
-        # Blocks of consecutive lines between separators, each searched
-        # as one string.
-        for i in range(start, end + 1):
-            if i < end and i not in self._text_separator_lines:
-                continue
-            if block_start < i:
-                results.extend(self._find_text_matches_in_block(pattern, block_start, i))
-            block_start = i + 1
-        return results
-
-    def _find_text_matches_in_block(
-        self, pattern: re.Pattern[str], first: int, stop: int,
-    ) -> list[TextMatch]:
-        """_find_all_text_matches() for lines first..stop-1, none of them
-        a separator.
-
-        Args:
-            pattern: from compile_search_pattern().
-            first, stop: the lines to search, as one.
-
-        Returns:
-            (line_idx, start, end) of each match, `start` within line
-            line_idx and `end` counted from that same line's start.
-        """
-        lines = self.text_lines[first:stop]
-        # Joined by a space rather than "\n" - the same to
-        # normalize_for_search() (either is dropped next to Japanese or
-        # Chinese), but a single space between two Latin words needs no
-        # folding at all, which keeps a long plain-English text fast.
-        text = " ".join(lines)
-        normalized = normalize_lines_for_search(lines)
-        # Where each line starts in `text`.
-        line_starts = []
-        offset = 0
-        for line in lines:
-            line_starts.append(offset)
-            offset += len(line) + 1
-        results = []
-        for match_start, match_end in search_spans(pattern, text, normalized):
-            k = bisect.bisect_right(line_starts, match_start) - 1
-            results.append((first + k, match_start - line_starts[k], match_end - line_starts[k]))
-        return results
-
     def _text_highlight_segments(self, highlight: TextMatch | None) -> dict[int, tuple[int, int]]:
         """The part of each line a (line_idx, start, end) highlight covers,
         for drawing it - one line's worth, or several for a match that
         runs across line breaks (see TextMatch).
 
         Args:
-            highlight: from _text_search_highlight(), or None.
+            highlight: from _Search.text_highlight(), or None.
 
         Returns:
             {line_idx: (start, end)} with offsets into that line, the
@@ -7549,53 +7841,6 @@ class Viewer:
             offset += line_len + 1
             line_idx += 1
         return segments
-
-    def _text_search_highlight(self) -> TextMatch | None:
-        """(line_idx, start, end) to highlight while drawing text mode,
-        or None. Never returns a PDF bbox tuple."""
-        if self.search_pos is None or not self.search_matches:
-            return None
-        match = self.search_matches[self.search_pos]
-        if self._search_uses_text_lines():
-            if len(match) == 3:
-                return match
-            return self._text_highlight_for_match(match)
-        return self._text_highlight_for_match(self._visible_search_match())
-
-    def _text_highlight_for_match(self, match: BBoxMatch | None) -> TextMatch | None:
-        """(line_idx, start, end) of `match` within self.text_lines, or
-        None if the query doesn't appear there at all (a real
-        possibility, given the two extractions can differ)."""
-        if match is None:
-            return None
-        page_start, page_end = self._text_page_range(match[0])
-        all_matches = self._find_all_text_matches((page_start, page_end))
-        if not all_matches:
-            return None
-
-        occurrence_index = self._active_search_occurrence_index()
-        if occurrence_index is not None and occurrence_index < len(all_matches):
-            return all_matches[occurrence_index]
-
-        # Fall back to a proportional-position guess, for the rare case
-        # where the two extractions disagree on how many times the query
-        # appears on this page.
-        approx_line = self._approx_text_line(match)
-        return min(all_matches, key=lambda c: abs(c[0] - approx_line))
-
-    def _approx_text_line(self, match: tuple) -> int:
-        """A guess at the raw text_lines index a (page, xMin, yMin, xMax,
-        yMax) bbox match falls on - its vertical position on the page,
-        as the same fraction of that page's own lines - for when the
-        text extraction can't pin it down exactly (see
-        _text_highlight_for_match())."""
-        page, _xmin_pt, ymin_pt, _xmax_pt, _ymax_pt = match
-        assert self._search_index is not None  # a bbox match came from it
-        height_pt = self._search_index[page - 1]["height_pt"]
-        page_start, page_end = self._text_page_range(page)
-        return page_start + (
-            round((ymin_pt / height_pt) * (page_end - page_start)) if height_pt else 0
-        )
 
     def _scroll_text_to_row(self, row: int) -> None:
         """Scroll text mode so `row` lands a quarter of the screen down
@@ -7622,29 +7867,6 @@ class Viewer:
                     ),
                 )
         self._scroll_text_to_row(self._text_row_for_line(line_idx))
-
-    def _scroll_image_to_match(self, match: BBoxMatch) -> None:
-        """Scroll/pan the image view so `match` is visible, landing it a
-        little below the top-left rather than jammed against the edge."""
-        px_left, px_top, px_right, px_bottom = self._match_bbox_px(match)
-        margin = self.avail_height_px // 4
-        self.scroll = self._clamp_image_scroll(round(px_top) - margin)
-        if px_left < self.x_offset or px_right > self.x_offset + self.crop_width:
-            self._set_x_offset(round((px_left + px_right) / 2 - self.crop_width / 2))
-
-    def _scroll_text_to_match(self, match: BBoxMatch) -> None:
-        """Scroll/pan the text view so `match` is visible, landing it a
-        little below the top rather than jammed against the top edge -
-        panning horizontally into view too, in case the terminal is too
-        narrow for the line and it's off to the side of the truncated
-        view (the text-mode equivalent of _scroll_image_to_match()).
-        Wrapped text has no pan to speak of - _row_for_line() converts
-        the raw line position into a display-row scroll target instead."""
-        highlight = self._text_highlight_for_match(match)
-        if highlight:
-            self._scroll_text_to_highlight(*highlight)
-        else:
-            self._scroll_text_to_row(self._text_row_for_line(self._approx_text_line(match)))
 
     def go_to_page_text(self, page: int, scroll: int | None) -> None:
         """Show `page` in text mode: scroll=0 is its top, None its
@@ -7868,7 +8090,7 @@ class Viewer:
         own to border - it just keeps flowing to fill the width."""
         display_rows = self._ensure_display_rows()
         avail_rows = self._text_avail_rows()
-        highlight = self._text_highlight_segments(self._text_search_highlight())
+        highlight = self._text_highlight_segments(self.search.text_highlight())
 
         out = []
         n_rows = len(display_rows)
@@ -7930,7 +8152,7 @@ class Viewer:
         # below never needs to know it exists.
         gutter_width = self._line_number_gutter_width()
         avail_cols = max(1, self._text_avail_cols() - gutter_width)
-        highlight = self._text_highlight_segments(self._text_search_highlight())
+        highlight = self._text_highlight_segments(self.search.text_highlight())
         out = []
 
         left_col = -1 - self.text_x_offset
@@ -8048,16 +8270,6 @@ class Viewer:
 
         self._finish_text_frame(out, avail_rows)
 
-    def _draw_help(self) -> None:
-        """Overlay the help (KEY_TABLE) as a box over the page, scrolled
-        to self.help_scroll."""
-        self.help_scroll, max_scroll = self._draw_box(self._help_lines(), self.help_scroll)
-        if max_scroll:
-            pct = round(100 * self.help_scroll / max_scroll)
-            self.draw_status(f"q to close help - j/k or wheel to scroll ({pct}%)")
-        else:
-            self.draw_status("q to close help")
-
     def _encode_crop(self, crop: Image.Image) -> bytes:
         buf = io.BytesIO()
         if iterm2_like():
@@ -8145,10 +8357,10 @@ class Viewer:
         self._last_viewport_set = True
         self._remember_drawn_position()
 
-        match = self._visible_search_match()
+        match = self.search.visible_match()
         new_bounds = (
             self._match_marker_bounds(
-                *self._match_bbox_px(match), page_top=self._visible_page_top(match[0])
+                *self.search.match_bbox_px(match), page_top=self._visible_page_top(match[0])
             )
             if match else None
         )
@@ -8255,7 +8467,7 @@ class Viewer:
                 or self._last_zoom_key != round(self.zoom * 100)
                 or self._last_fit_key != (self.fit, self.continuous)
                 or self._last_marker_bounds is not None
-                or self._visible_search_match() is not None):
+                or self.search.visible_match() is not None):
             return None
         delta = self._scroll_delta_px()
         if delta is None or delta == 0 or delta % self.cell_h_px != 0:
@@ -8547,7 +8759,7 @@ class Viewer:
         landed on a PDF hyperlink in the currently displayed crop,
         follow it - open a URL in the system browser, or jump to an
         internal link's target page/position."""
-        if self.text_mode or self.overlay is not None or row >= self.rows:
+        if self.text_mode or self.overlays.active is not None or row >= self.rows:
             return  # row == self.rows is the status bar
         # Any press starts a fresh gesture: one that lands on the
         # scrollbar keeps following the pointer until the button comes
@@ -8615,7 +8827,7 @@ class Viewer:
         flush_scrollbar_drag() applies the last one once the burst lets
         up rather than walking every page in between. Returns whether
         the drag was taken."""
-        if not self._scrollbar_drag or self.text_mode or self.overlay is not None:
+        if not self._scrollbar_drag or self.text_mode or self.overlays.active is not None:
             return False
         self._scrollbar_drag_row = row
         return True
@@ -8661,7 +8873,7 @@ class Viewer:
         same page-boundary roll-over as e/y. Only meaningful in the page
         image (mouse reporting is off in text mode, so this shouldn't
         normally fire there, but the guard is cheap insurance)."""
-        if self.text_mode or self.overlay is not None:
+        if self.text_mode or self.overlays.active is not None:
             return
         step = self.cell_h_px * self.wheel_scroll_step
         if direction < 0:
@@ -8702,7 +8914,7 @@ class Viewer:
         self, from_stack: list[tuple[int, int, int]], to_stack: list[tuple[int, int, int]],
         label: str,
     ) -> None:
-        if self.text_mode or self.overlay is not None:
+        if self.text_mode or self.overlays.active is not None:
             return
         if not from_stack:
             self.draw_status(f"no {label} position")
@@ -8722,7 +8934,7 @@ class Viewer:
         """Jump to `page`, scrolled so the link's target y-position
         (`top_pt`, in PDF points, bottom-up - or None if the link didn't
         specify one) lands a little below the top of the window, the
-        same placement _scroll_image_to_match() uses for search matches."""
+        same placement _Search.scroll_image_to_match() uses for search matches."""
         self.page = max(1, min(self.npages, page))
         self._load_page()
         if top_pt is None:
@@ -8768,169 +8980,15 @@ class Viewer:
                 self.npages = len(pages)
                 self.page = max(1, min(self.npages, self.page))
         self.cache.clear()
-        self._search_index = None
+        self.search.reset()
         self._text_pages = None  # stale too - re-extracted on demand
-        self._outline = None  # the outline may have changed too
-        if self.overlay == "outline":
-            self.overlay = None  # ... and its entries with it
-        self.clear_search()
+        self.overlays.forget_outline()  # the outline may have changed too
         if self.text_mode:
             self._load_text_page()
         else:
             self._load_page()
         self.refresh()
         self.draw_status(f"reloaded (file changed) - page {self.page}/{self.npages}")
-
-    def clear_search(self) -> None:
-        self.search_query = None
-        self.search_matches = []
-        self.search_pos = None
-
-    @staticmethod
-    def _match_index_from(positions: list[int], here: int, backward: bool) -> int:
-        """Which of the matches a search should land on, given where it
-        started from. `positions` is every match's position in ascending
-        order, in whatever unit `here` is in (a page number, or a raw
-        text_lines index); the answer is an index into it.
-
-        Forward ("/"), that's the first match at or after `here`;
-        backward ("?"), the last one strictly before it - so "?" can
-        never move you forward, while "/" can leave you where you are if
-        a match is already on screen. Either way it wraps around the
-        ends of the document less(1)-style: a backward search from
-        before the first match lands on the last one, a forward search
-        from past the last one lands on the first."""
-        if backward:
-            for i in range(len(positions) - 1, -1, -1):
-                if positions[i] < here:
-                    return i
-            return len(positions) - 1
-        for i, pos in enumerate(positions):
-            if pos >= here:
-                return i
-        return 0
-
-    def _search_uses_text_lines(self) -> bool:
-        """Whether / search should walk self.text_lines as one blob
-        (line_idx, start, end) matches rather than a PDF page/bbox
-        index. True for plain text files (always in text mode) and for
-        handlers like MarkdownDocument whose text mode shows the whole
-        raw source at once - but False in image mode even for those,
-        where a real PDF delegate's bbox index should still be used."""
-        return self.text_mode and not self.doc_handler.text_mode_is_paginated()
-
-    def start_search(self, query: str, backward: bool = False, multiline: bool = False) -> None:
-        """Search the whole document for `query` and jump to one match -
-        which one depends on where you are now and on `backward`, i.e.
-        on whether the prompt was opened with "?" rather than "/" (see
-        _match_index_from()). N/P walk every match from there on,
-        regardless of the direction this started in. `multiline` (^T at
-        the prompt) lets a regex match across line breaks, as a literal
-        query always may - see _find_all_text_matches() and
-        PdfDocument.find_search_matches()."""
-        if not query:
-            return
-        self.search_query = query
-        self.search_multiline = multiline
-        if self._search_uses_text_lines():
-            # No page/bbox structure for a non-paginated document
-            # (plain text/RTF, or Markdown currently in text mode) -
-            # matches are just (line_idx, start, end) straight out of
-            # text_lines, the whole document's text.
-            self.search_matches = self._find_all_text_matches()
-            if not self.search_matches:
-                self.search_pos = None
-                self.draw_status(f'"{query}" not found')
-                return
-            # Positions are raw line indices, so "here" has to be one
-            # too - text_scroll itself counts display rows while the
-            # text is wrapped (see _top_text_line()).
-            self._goto_search_match(self._match_index_from(
-                [m[0] for m in self.search_matches], self._top_text_line(), backward,
-            ))
-            return
-
-        if self._search_index is None:
-            self.draw_status("building search index...")
-            self._search_index = self.doc_handler.build_search_index()
-        self.search_matches = (
-            self.doc_handler.find_search_matches(self._search_index, query, multiline)
-            if self._search_index is not None else []  # nothing to search
-        )
-        if not self.search_matches:
-            self.search_pos = None
-            self.draw_status(f'"{query}" not found')
-            return
-        # A paginated document's matches are only ordered down to the
-        # page they're on, so that's the unit the starting point is
-        # measured in too.
-        self._goto_search_match(self._match_index_from(
-            [m[0] for m in self.search_matches], self.page, backward,
-        ))
-
-    def repeat_search(self, forward: bool) -> None:
-        if not self.search_matches:
-            msg = (
-                f'"{self.search_query}" not found'
-                if self.search_query
-                else "no previous search pattern"
-            )
-            self.draw_status(msg)
-            return
-        if self.search_pos is None:
-            self.search_pos = 0
-        else:
-            step = 1 if forward else -1
-            next_pos = self.search_pos + step
-            if not (0 <= next_pos < len(self.search_matches)):
-                # No wraparound - N past the last match / P before the
-                # first one just reports there's nowhere further to go,
-                # the way less(1)'s own (non-wrapping) search does.
-                self.draw_status(
-                    f'"{self.search_query}" no more matches '
-                    + ("forward" if forward else "backward")
-                )
-                return
-            self.search_pos = next_pos
-        self._goto_search_match(self.search_pos)
-
-    def _goto_search_match(self, idx: int) -> None:
-        self.search_pos = idx
-
-        if self._search_uses_text_lines():
-            self._scroll_text_to_highlight(*self.search_matches[idx])
-            self.refresh()
-            self.draw_status(
-                f'"{self.search_query}" match {idx + 1}/{len(self.search_matches)}'
-            )
-            return
-
-        page = self.search_matches[idx][0]
-
-        if self.text_mode:
-            self.go_to_page_text(page, 0)
-        else:
-            self.go_page(page, 0)
-
-        # self.page == page now, so this is the match we just landed on;
-        # _draw()/_draw_text() will independently rediscover and render
-        # it (marker box or text highlight) on every redraw from here on,
-        # including a later `t` mode toggle - see _active_search_page_match().
-        match = self._active_search_page_match()
-        if match is None:
-            pass  # (the page couldn't be shown - nothing to scroll to)
-        elif self.text_mode:
-            self._scroll_text_to_match(match)
-        else:
-            self._scroll_image_to_match(match)
-
-        self.refresh()
-        self.draw_status(
-            f'"{self.search_query}" match {idx + 1}/{len(self.search_matches)} '
-            # The match's own page, not self.page: under -c/--continuous
-            # the view can settle with an earlier page at the top.
-            f"(page {page})"
-        )
 
     def _match_marker_bounds(
         self, px_left: float, px_top: float, px_right: float, px_bottom: float,
@@ -9245,9 +9303,9 @@ class Viewer:
             # free either, being less's backward search, so help lives on
             # F1, with ":h" as a second way in for terminals that send
             # something unexpected for F1.
-            self.show_help()
+            self.overlays.show_help()
         elif key in ("o", "\t"):
-            self.show_outline()
+            self.overlays.show_outline()
         elif key in ("t", "T"):
             # T is t and C combined into one press/undo - see
             # toggle_clean_text_mode().
@@ -9301,10 +9359,10 @@ class Viewer:
     def handle_mouse(self, kind: str, col: int, row: int) -> None:
         """One decoded mouse event (see decode_sgr_mouse()): the help or
         the table of contents takes it while one is up (see
-        handle_overlay_mouse()), and otherwise clicks/drags/the wheel/
+        _Overlays.handle_mouse()), and otherwise clicks/drags/the wheel/
         the back and forward buttons act on the page."""
-        if self.overlay is not None:
-            self.handle_overlay_mouse(kind, col, row)
+        if self.overlays.active is not None:
+            self.overlays.handle_mouse(kind, col, row)
         elif kind == "MOUSE_CLICK":
             self.handle_click(col, row)
         elif kind == "MOUSE_DRAG":
@@ -9425,7 +9483,7 @@ class _LineEditor:
     under it, and ^U/^K kill from it to the start/end (DEL is the one
     exception to readline, added for the plain Delete key on keyboards
     without an easy ^D). ^T turns on (or off again) matching a regex
-    across line breaks (see Viewer._find_all_text_matches()). Enter
+    across line breaks (see _Search.find_all_text_matches()). Enter
     submits, Esc/^C cancel, and so does backspace on an already-empty
     line. Every other key is swallowed, so nothing leaks through as a
     page command while the prompt is up."""
@@ -9433,7 +9491,7 @@ class _LineEditor:
     def __init__(self) -> None:
         self.text = ""
         self.cursor = 0  # index into text the next edit applies at
-        self.multiline = False  # ^T - see Viewer.start_search()
+        self.multiline = False  # ^T - see _Search.start()
 
     def handle(self, key: str) -> str | None:
         """Apply `key`: returns "submit", "cancel", "changed" (redraw the
@@ -9495,7 +9553,7 @@ _PREFIX_BINDINGS: dict[str, dict[str, Callable[[Viewer], Any]]] = {
     ":": {
         "n": Viewer.next_file,
         "p": Viewer.previous_file,
-        "h": Viewer.show_help,
+        "h": lambda viewer: viewer.overlays.show_help(),
         "q": lambda viewer: False,
     },
     "-": {
@@ -9725,8 +9783,8 @@ class _KeyDispatcher:
             return self._prefix_key(self.pending_prefix, key)
         if key == "\x03":
             return False
-        if viewer.overlay is not None:
-            viewer.handle_overlay_key(key)
+        if viewer.overlays.active is not None:
+            viewer.overlays.handle_key(key)
             return True
         if viewer.handle_global_key(key):
             return True
@@ -9756,7 +9814,7 @@ class _KeyDispatcher:
             self.search_editor = None
             if query:
                 self.last_search_query = query
-                viewer.start_search(query, backward=self.search_backward, multiline=editor.multiline)
+                viewer.search.start(query, backward=self.search_backward, multiline=editor.multiline)
             else:
                 viewer.draw_status()
         elif outcome == "cancel":
@@ -9785,7 +9843,7 @@ class _KeyDispatcher:
         less(1)'s pair: "/" searches forward from here, "?" backward.
         Either way the whole document is searched and N/P then walk every
         match - the direction only decides which match this search lands
-        on first (see Viewer._match_index_from()). Search always works in
+        on first (see _Search._match_index_from()). Search always works in
         text mode (there's always a flat list of lines to search)
         regardless of what the file kind supports in image mode
         (doc_handler.supports_search() - a real PDF's bbox index)."""
@@ -9801,18 +9859,18 @@ class _KeyDispatcher:
         """n/N/p/P and q/ESC while a search is active - True if `key` was
         one of them."""
         viewer = self.viewer
-        if viewer.search_query is None:
+        if viewer.search.query is None:
             return False
         if key in ("n", "N"):
-            viewer.repeat_search(forward=True)
+            viewer.search.repeat(forward=True)
         elif key in ("p", "P"):
-            viewer.repeat_search(forward=False)
+            viewer.search.repeat(forward=False)
         elif key in ("q", "\x1b"):
             # With a search active, "q"/Esc dismiss it (removing the
             # match box/highlight and its status line) rather than
             # quitting pdfless outright - quit still works normally on
             # a second press, once there's no longer a search to clear.
-            viewer.clear_search()
+            viewer.search.clear()
             viewer.refresh()
         else:
             return False

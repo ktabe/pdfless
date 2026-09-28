@@ -121,8 +121,8 @@ def test_a_pan_change_is_not_eligible(sample_pdf, monkeypatch):
 
 def test_an_active_search_marker_is_not_eligible(sample_pdf, monkeypatch):
     viewer = make_viewer(pdfless.PdfDocument(sample_pdf), monkeypatch)
-    viewer.start_search("Lorem")
-    if viewer.search_pos is None:
+    viewer.search.start("Lorem")
+    if viewer.search.pos is None:
         return  # nothing to find in this fixture at this zoom - not what
         # this test is about
     viewer._draw()  # commit the marker as "on screen"
