@@ -9851,158 +9851,285 @@ def run_viewer(
     return viewer
 
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """pdfless's command line: every option main() reads, and --help's
+    text (KEY_TABLE included, as its epilog).
+
+    Returns:
+        The parser, not yet run on sys.argv."""
     parser = argparse.ArgumentParser(
         prog="pdfless",
         description=(
-            "Display a PDF, image, text, or (macOS only, needs a local "
-            "Chrome) Quick-Look-previewable file (Word, Excel, "
-            "PowerPoint, ...) in iTerm2 or WezTerm, less(1)-style."
+            "Display PDF, image, and text files in iTerm2 or WezTerm, "
+            "less(1)-style. Office documents, SVG, and Markdown are "
+            "supported with additional dependencies (see the README)."
         ),
         epilog=f"Cache directory (--no-cache/--clear-cache): {_office_cache_root()}\n\n{KEY_TABLE}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
     )
     parser.add_argument(
-        "--help", action="help", help="show this help message and exit"
+        "--help", action="help", help="show this help and exit"
     )
     parser.add_argument(
         "-v", "--version", action="version", version=f"%(prog)s {__version__}"
     )
     parser.add_argument(
         "files", nargs="*", metavar="file",
-        help="path to one or more PDF, image, text, or Quick-Look-"
-             "previewable files - reads from stdin instead if none are "
-             "given (or if \"-\" is given in their place), so pdfless "
-             "can also be used as $PAGER",
+        help="PDF, image, text, or supported document files; read stdin "
+             "if omitted or if \"-\" is given",
     )
     parser.add_argument(
         "-p", "--page", type=int, default=1,
-        help="page to start on, in the first file (default: 1)",
+        help="start on page PAGE in the first file (default: %(default)s)",
     )
     parser.add_argument(
         "-d", "--debug",
         action="store_true",
-        help="print timing for each stage of Quick Look preview "
-             "rendering (qlmanage, pdftocairo, measuring, rendering, "
-             "splitting into pages) to stderr",
+        help="print debugging information to stderr",
     )
     parser.add_argument(
         "-s", "--rendering-scale", type=float, default=OFFICE_RENDER_SCALE, metavar="N",
-        help="device-pixel-ratio to render Quick Look preview files "
-             "(Excel/PowerPoint/Keynote/Pages/etc., macOS only) at - higher "
-             "looks sharper when zoomed in but is slower to render (default: "
-             "%(default)s). No effect on Word/RTF, which render to a "
-             "real PDF instead and are always sharp regardless of zoom",
+        help="rendering scale for image-based Quick Look previews "
+             "(default: %(default)s)",
     )
     parser.add_argument(
         "-c", "--continuous",
         action="store_true",
-        help="continuous view: scroll through consecutive pages one "
-             "after another, so the bottom of one page and the top of "
-             "the next can be on screen together, instead of one page "
-             "at a time (a PDF's text mode likewise shows the whole "
-             "document, with a separator row between pages); toggle "
-             "any time with c",
+        help="show consecutive pages continuously",
     )
     parser.add_argument(
         "-k", "--keep",
         action="store_true",
-        help="leave the last page on screen when quitting (q or ^C) "
-             "instead of restoring the terminal screen",
+        help="leave the last page on screen when quitting",
     )
     parser.add_argument(
         "-h", "--fit-height",
         action="store_true",
-        help="fit each page to the terminal's full height instead of its "
-             "full width (default: fit width)",
+        help="fit pages to the terminal height instead of its width",
     )
     parser.add_argument(
         "-F", "--quit-if-one-screen",
         action="store_true",
-        help="if the document is a single page (or, in text mode, "
-             "already fits the terminal with no scrolling needed), print "
-             "it fit-to-height and quit immediately, leaving it in the "
-             "normal scrollback instead of entering the pager; otherwise "
-             "start up normally (less(1)-style)",
+        help="quit after displaying a document that fits on one screen",
     )
     parser.add_argument(
         "-B", "--no-border",
         action="store_false",
         dest="border",
         default=True,
-        help="don't draw a border around the page's edges in text mode "
-             "(t); on by default (except for a plain text file, where "
-             "it's off by default regardless of this), toggle any time "
-             "with B",
+        help="hide page borders in text mode",
     )
     parser.add_argument(
         "-S", "--chop-long-lines",
         action="store_true",
-        help="in text mode, don't wrap long lines - pan across them "
-             "instead with h/l/H/L, less(1)-style. Already the default "
-             "for anything but a plain text file, which normally wraps; "
-             "toggle any time by typing -S",
+        help="don't wrap long lines in text mode",
     )
     parser.add_argument(
         "-E", "--no-eol-mark",
         action="store_false",
         dest="eol_mark",
         default=True,
-        help="don't mark a real end-of-line (↵) in text mode - shown "
-             "by default (regardless of -S/--chop-long-lines) to tell a "
-             "genuine line ending apart from where wrapping/panning "
-             "simply ran out of room",
+        help="hide end-of-line markers in text mode",
     )
     parser.add_argument(
         "-N", "--line-numbers",
         action="store_true",
-        help="show line numbers in text mode, less(1)-style - off by "
-             "default; toggle any time with # (or -N, kept for less(1) "
-             "compatibility)",
+        help="show line numbers in text mode",
     )
     parser.add_argument(
         "--no-scrollbar",
         action="store_false",
         dest="scrollbar",
         default=True,
-        help="don't show the scrollbar (a column on the terminal's "
-             "right edge marking your position) - shown by default, in "
-             "both image and text mode; toggle any time with r",
+        help="hide the scrollbar",
     )
     parser.add_argument(
         "--no-incremental-scroll",
         action="store_false",
         dest="incremental_scroll",
         default=True,
-        help="always redraw the full page image on scroll, instead of "
-             "shifting the terminal's existing content and transmitting "
-             "only the newly-exposed strip - a fallback for a terminal "
-             "where that shortcut (iTerm2/WezTerm-only, and already off "
-             "under tmux) doesn't render correctly",
+        help="redraw the full page image on every scroll",
     )
     parser.add_argument(
         "-f", "--follow",
         action="store_true",
-        help="watch the file and reload it if it changes on disk "
-             f"(checked every {FOLLOW_INTERVAL:.0f}s), staying on the "
-             "same page and in the same mode; toggle any time with F",
+        help="reload the current file when it changes",
     )
     parser.add_argument(
         "--wheel-scroll-step", type=positive_int, default=2, metavar="N",
-        help="scroll N lines per mouse wheel step, in the page image "
+        help="scroll N lines per mouse-wheel step in image mode "
              "(default: %(default)s)",
     )
     parser.add_argument(
         "--no-cache",
         action="store_true",
-        help="render afresh without reading or writing the persistent cache",
+        help="render without using the persistent cache",
     )
     parser.add_argument(
         "--clear-cache",
         action="store_true",
-        help="delete the persistent cache and exit without opening any files",
+        help="delete the persistent cache and exit",
     )
+    return parser
+
+
+def _capture_stdin(tmpdir: str) -> str:
+    """Drain stdin (the document, when pdfless runs as $PAGER) into a
+    file of its own - every DocumentHandler.sniff() reads a real path,
+    not a stream.
+
+    Args:
+        tmpdir: the scratch directory to write it into.
+
+    Returns:
+        The file's path."""
+    stdin_path = os.path.join(tmpdir, "stdin")
+    with open(stdin_path, "wb") as f:
+        shutil.copyfileobj(sys.stdin.buffer, f)
+    return stdin_path
+
+
+def _collect_files(
+    paths: list[str], tmpdir: str, page: int, debug: bool = False,
+) -> tuple[list[DocumentHandler | str], int, int]:
+    """Decide what the viewer opens: the files among `paths` that exist,
+    and the first of them pdfless can actually display - telling the
+    user on stderr about each one skipped, and exiting via die() if
+    none is left.
+
+    Args:
+        paths: the files as given on the command line (stdin's already
+            captured to a file - see _capture_stdin()).
+        tmpdir: the scratch directory handlers render into.
+        page: -p/--page, the page asked to start on.
+        debug: -d/--debug, passed on to the sniffing.
+
+    Returns:
+        (files, start_file_index, start_page): files as Viewer takes
+        them - absolute paths, except files[start_file_index], already
+        its DocumentHandler - and `page` clamped to that file's pages
+        (when they're known yet)."""
+    # Only checked for existence up front, not sniffed - an
+    # expensive check for some kinds (ImageDocument.sniff() actually
+    # decodes the whole image, to catch a format that passes a
+    # lighter check but still fails to load) that would otherwise
+    # run on every file given, before the very first page ever
+    # appears, even for a large batch that's never actually paged
+    # through to the end.
+    candidates = []  # [abs_path, ...] - files that at least exist
+    for arg in paths:
+        if not os.path.isfile(arg):
+            print(f"pdfless: no such file, skipping: {arg}", file=sys.stderr)
+            continue
+        candidates.append(os.path.abspath(arg))
+    if any(PdfDocument.is_pdf_file(path) for path in candidates):
+        check_deps()
+
+    # Sniff candidates in order, stopping at the first one pdfless can
+    # actually display - that's the only one that has to be known
+    # before the viewer can even start. Every other candidate is left
+    # as a bare path in `files` below, sniffed lazily by
+    # Viewer._classify() the moment (if ever) you actually navigate to
+    # it via next_file()/previous_file()/go_to_file(). A raised
+    # UnusableFile means some handler positively identified a leading
+    # candidate's format but couldn't actually use it (e.g. a corrupt
+    # PDF, or a password-protected one whose prompt - see
+    # PdfDocument._ensure_unlocked(), forced here by the page_count()
+    # call below - was cancelled) - specific enough to report and
+    # skip, rather than falling through to try treating it as some
+    # other kind.
+    for i, path in enumerate(candidates):
+        try:
+            handler = _sniff_file(path, tmpdir, debug=debug)
+            if handler is None:
+                print(
+                    f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
+                    f"file, skipping: {path}",
+                    file=sys.stderr,
+                )
+                continue
+            # A None page_count() (an office-kind first file) means
+            # its real page count isn't known until Viewer.__init__
+            # actually renders it, which also clamps self.page
+            # against it then; here just keep whatever page number
+            # was asked for (>= 1). For a PdfDocument, this is also
+            # where a password prompt (if the file turns out to be
+            # encrypted) actually happens - forced here, rather than
+            # left for Viewer.__init__ to trigger, so cancelling it
+            # falls through to the next candidate exactly like any
+            # other unusable file.
+            npages = handler.page_count()
+        except UnusableFile as e:
+            print(f"pdfless: {e}, skipping: {path}", file=sys.stderr)
+            continue
+        # [DocumentHandler | path str, ...], in the given order - only
+        # this one is an actual handler at this point; see Viewer.files.
+        files: list[DocumentHandler | str] = list(candidates)
+        files[i] = handler
+        start_page = page if npages is None else min(npages, page)
+        return files, i, max(1, start_page)
+
+    die("no valid PDF, image, text, or Quick-Look-previewable files given")
+
+
+def _open_key_input(reading_stdin: bool) -> tuple[int, int | None]:
+    """The terminal to read keys and mouse events from - stdin, unless
+    stdin is the document itself (pdfless as $PAGER) - exiting via
+    die() if there's no usable one.
+
+    Args:
+        reading_stdin: whether the document came in on stdin.
+
+    Returns:
+        (fd, fd_to_close): the terminal's fd, and the same fd again if
+        it was opened here (/dev/tty) for the caller to close when
+        done, or None if it's stdin's own."""
+    if reading_stdin:
+        # stdin's own fd has been drained (see _capture_stdin()) and
+        # is never read again - /dev/tty is the real keyboard now, the
+        # same trick less(1)/most(1) use to double as $PAGER.
+        try:
+            fd = os.open("/dev/tty", os.O_RDWR)
+        except OSError as e:
+            die(f"can't open /dev/tty for keyboard input: {e}")
+        return fd, fd
+    if not sys.stdin.isatty():
+        die("stdin must be a terminal (or pipe something into "
+            "pdfless, or pass \"-\", to page it)")
+    return sys.stdin.fileno(), None
+
+
+def _leave_viewer_screen(viewer: Viewer | None, keep: bool) -> None:
+    """Put the terminal's screen back the way run_viewer() found it -
+    whether it returned or raised.
+
+    Args:
+        viewer: the Viewer run_viewer() ran, or None if it never got
+            as far as making one.
+        keep: -k/--keep: leave the last page on screen instead of
+            switching back from the alternate screen."""
+    if viewer is not None and viewer.entered_alt_screen:
+        if keep:
+            # Stay in the alternate screen buffer so the last
+            # rendered page remains visible; just clear the
+            # status line and bring the cursor back so the
+            # shell prompt lands cleanly below the image.
+            sys.stdout.write(
+                _leave_screen_seq(alt_screen=False)
+                + f"\x1b[{viewer.rows};1H\x1b[2K"
+            )
+        else:
+            sys.stdout.write(_leave_screen_seq(alt_screen=True))
+        sys.stdout.flush()
+    # else: the alternate screen was never entered (-F/--quit-
+    # if-one-screen's dump-and-quit path) - nothing to restore.
+
+
+def main() -> None:
+    """pdfless's entry point: parse the command line, open the files, and
+    run the viewer on the terminal until it quits."""
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
     if args.clear_cache:
@@ -10027,102 +10154,21 @@ def main() -> None:
             "into pdfless, or name a file")
 
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
-    tty_fd = None  # set below if reading_stdin - ours to close on the way out
+    tty_fd = None  # /dev/tty, if _open_key_input() opened it - ours to close
     try:
         if reading_stdin:
-            stdin_path = os.path.join(tmpdir, "stdin")
-            with open(stdin_path, "wb") as f:
-                shutil.copyfileobj(sys.stdin.buffer, f)
+            stdin_path = _capture_stdin(tmpdir)
             # "-" (if given) stands for this same captured file; bare
             # `pdfless.py` with no file arguments at all means just it.
             args.files = [stdin_path if a == "-" else a for a in args.files] or [stdin_path]
 
-        # Only checked for existence up front, not sniffed - an
-        # expensive check for some kinds (ImageDocument.sniff() actually
-        # decodes the whole image, to catch a format that passes a
-        # lighter check but still fails to load) that would otherwise
-        # run on every file given, before the very first page ever
-        # appears, even for a large batch that's never actually paged
-        # through to the end.
-        candidates = []  # [abs_path, ...] - files that at least exist
-        for arg in args.files:
-            if not os.path.isfile(arg):
-                print(f"pdfless: no such file, skipping: {arg}", file=sys.stderr)
-                continue
-            candidates.append(os.path.abspath(arg))
-        if any(PdfDocument.is_pdf_file(path) for path in candidates):
-            check_deps()
-
-        # Sniff candidates in order, stopping at the first one pdfless can
-        # actually display - that's the only one that has to be known
-        # before the viewer can even start. Every other candidate is left
-        # as a bare path in `files` below, sniffed lazily by
-        # Viewer._classify() the moment (if ever) you actually navigate to
-        # it via next_file()/previous_file()/go_to_file(). A raised
-        # UnusableFile means some handler positively identified a leading
-        # candidate's format but couldn't actually use it (e.g. a corrupt
-        # PDF, or a password-protected one whose prompt - see
-        # PdfDocument._ensure_unlocked(), forced here by the page_count()
-        # call below - was cancelled) - specific enough to report and
-        # skip, rather than falling through to try treating it as some
-        # other kind.
-        start_file_index = None
-        first_handler = None
-        first_npages = None
-        for i, path in enumerate(candidates):
-            try:
-                handler = _sniff_file(path, tmpdir, debug=args.debug)
-                if handler is None:
-                    print(
-                        f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
-                        f"file, skipping: {path}",
-                        file=sys.stderr,
-                    )
-                    continue
-                # A None page_count() (an office-kind first file) means
-                # its real page count isn't known until Viewer.__init__
-                # actually renders it, which also clamps self.page
-                # against it then; here just keep whatever page number
-                # was asked for (>= 1). For a PdfDocument, this is also
-                # where a password prompt (if the file turns out to be
-                # encrypted) actually happens - forced here, rather than
-                # left for Viewer.__init__ to trigger, so cancelling it
-                # falls through to the next candidate exactly like any
-                # other unusable file.
-                first_npages = handler.page_count()
-            except UnusableFile as e:
-                print(f"pdfless: {e}, skipping: {path}", file=sys.stderr)
-                continue
-            start_file_index, first_handler = i, handler
-            break
-
-        if start_file_index is None:
-            die("no valid PDF, image, text, or Quick-Look-previewable files given")
-        start_page = args.page if first_npages is None else min(first_npages, args.page)
-        start_page = max(1, start_page)
-
-        # [DocumentHandler | path str, ...], in the given order - only
-        # start_file_index is an actual handler at this point; see
-        # Viewer.files.
-        files = list(candidates)
-        files[start_file_index] = first_handler
+        files, start_file_index, start_page = _collect_files(
+            args.files, tmpdir, args.page, debug=args.debug,
+        )
 
         if not sys.stdout.isatty():
             die("stdout must be a terminal")
-        if reading_stdin:
-            # stdin's own fd was just drained above (or was never going
-            # to be read again, for bare `pdfless.py`) - /dev/tty is the
-            # real keyboard now, the same trick less(1)/most(1) use to
-            # double as $PAGER.
-            try:
-                fd = tty_fd = os.open("/dev/tty", os.O_RDWR)
-            except OSError as e:
-                die(f"can't open /dev/tty for keyboard input: {e}")
-        else:
-            if not sys.stdin.isatty():
-                die("stdin must be a terminal (or pipe something into "
-                    "pdfless, or pass \"-\", to page it)")
-            fd = sys.stdin.fileno()
+        fd, tty_fd = _open_key_input(reading_stdin)
 
         with RawTerminal(fd) as rt:
             # Entering the alternate screen (and enabling mouse/alt-
@@ -10154,21 +10200,7 @@ def main() -> None:
                 keep = False
                 raise
             finally:
-                if viewer is not None and viewer.entered_alt_screen:
-                    if keep:
-                        # Stay in the alternate screen buffer so the last
-                        # rendered page remains visible; just clear the
-                        # status line and bring the cursor back so the
-                        # shell prompt lands cleanly below the image.
-                        sys.stdout.write(
-                            _leave_screen_seq(alt_screen=False)
-                            + f"\x1b[{viewer.rows};1H\x1b[2K"
-                        )
-                    else:
-                        sys.stdout.write(_leave_screen_seq(alt_screen=True))
-                    sys.stdout.flush()
-                # else: the alternate screen was never entered (-F/--quit-
-                # if-one-screen's dump-and-quit path) - nothing to restore.
+                _leave_viewer_screen(viewer, keep)
     finally:
         if tty_fd is not None:
             os.close(tty_fd)
