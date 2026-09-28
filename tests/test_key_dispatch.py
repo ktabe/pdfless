@@ -238,7 +238,7 @@ def test_the_search_prompt_takes_every_key_until_enter(sample_pdf, monkeypatch):
     viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
     searches, clicks = [], []
     monkeypatch.setattr(viewer.search, "start", lambda q, backward, multiline: searches.append((q, backward)))
-    monkeypatch.setattr(viewer, "handle_mouse", lambda *a: clicks.append(a))
+    monkeypatch.setattr(viewer.mouse, "handle", lambda *a: clicks.append(a))
     d = dispatcher_for(viewer)
     # "q" and "n" are typed into the query, not quitting or repeating;
     # a click while typing is dropped.

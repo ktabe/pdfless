@@ -242,7 +242,7 @@ def test_docx_hyperlink_survives_as_a_real_pdf_link(sample_docx_with_link, tmp_p
     /Link annotation (confirmed by hand with pypdf) - so it's clickable
     exactly like a native PDF's hyperlink, via the exact same
     PdfDocument.build_link_index() a real PDF's links go through (see
-    Viewer._ensure_link_index()'s pdf_source fallback to
+    Viewer.links.ensure_index()'s pdf_source fallback to
     doc_handler._pdf_delegate)."""
     handler = classify(sample_docx_with_link, tmp_path)
     assert isinstance(handler, pdfless.OfficeDocument)
@@ -311,13 +311,13 @@ def test_docx_internal_link_click_scrolls_without_crashing(sample_docx_with_inte
     viewer = pdfless.Viewer([handler], 0, 1, str(tmp_path), slave, None)
     viewer.refresh()
 
-    viewer._ensure_link_index()
-    found_on_page, link = _find_goto_links(viewer._link_index)[0]
+    viewer.links.ensure_index()
+    found_on_page, link = _find_goto_links(viewer.links.index)[0]
 
     viewer.page = found_on_page
     viewer._load_page()
     viewer.scroll = 0
-    viewer._activate_link(link)
+    viewer.links.activate(link)
     assert viewer.page == link["page"]
     assert viewer.scroll > 0
 
