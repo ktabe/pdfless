@@ -57,7 +57,7 @@ import unicodedata
 import webbrowser
 from collections import OrderedDict, deque
 
-from typing import Any, Callable, Iterator, List, NoReturn, Protocol, Sequence, Tuple, Union, cast
+from typing import Any, Callable, Iterator, List, Literal, NoReturn, Protocol, Sequence, Tuple, Union, cast
 
 from PIL import ExifTags, Image, ImageChops, ImageOps
 
@@ -5765,11 +5765,13 @@ class Viewer:
         self._text_page_starts: list[int] | None = None
         self._text_separator_lines: frozenset[int] = frozenset()
         self._text_max_page_lines = 0  # the -N gutter's width, per page
-        self.help_active = False
-        self.help_scroll = 0
-        # The table-of-contents box (o/TAB - see show_outline()): whether
-        # it's up, which entry is selected, and the first entry in view.
-        self.outline_active = False
+        # The box drawn over the page, if any: "help" (F1 - see
+        # show_help()) or "outline", the table of contents (o/TAB - see
+        # show_outline()). While one is up it takes every key and mouse
+        # event (see handle_overlay_key()).
+        self.overlay: Literal["help", "outline"] | None = None
+        self.help_scroll = 0  # the first help line in view
+        # The table of contents' selected entry, and the first entry in view.
         self.outline_sel = 0
         self.outline_scroll = 0
         self._outline: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_outline()
@@ -5851,12 +5853,11 @@ class Viewer:
 
     def request_resize(self) -> None:
         self.resized = True
-        # The help box's size/position and the underlying page raster are
-        # both stale after a resize; simplest is to just drop back to the
-        # normal view, which always does a full redraw at the new size.
-        # The same goes for the table-of-contents box.
-        self.help_active = False
-        self.outline_active = False
+        # The help or table-of-contents box's size/position and the
+        # underlying page raster are both stale after a resize; simplest
+        # is to just drop back to the normal view, which always does a
+        # full redraw at the new size.
+        self.overlay = None
 
     def _classify(self, index: int, wait: bool = True, debug: bool | None = None) -> DocumentHandler | None:
         """files[index]'s DocumentHandler - already one (the file about
@@ -6150,7 +6151,10 @@ class Viewer:
         still being rendered waits for that render instead of starting
         a second one (see PageCache.get()). A daemon thread, so quitting
         never waits for it."""
-        if self.text_mode or self.file_missing or self.help_active or self.npages <= 1:
+        # The help or the table of contents being up doesn't matter: the
+        # page under the help is still the one read next, and one page's
+        # render is all a jump from the table of contents can waste.
+        if self.text_mode or self.file_missing or self.npages <= 1:
             return
         if self._page_prefetch_thread is not None and self._page_prefetch_thread.is_alive():
             return
@@ -6475,10 +6479,8 @@ class Viewer:
                 self.mark_file_missing()
             return
         self._load_content()
-        if self.help_active:
-            self._draw_help()
-        elif self.outline_active:
-            self._draw_outline()
+        if self.overlay is not None:
+            self._draw_overlay()
         elif self.text_mode:
             self._draw_text()
         else:
@@ -6626,7 +6628,8 @@ class Viewer:
         return self._overlay_box(self._help_lines())
 
     def show_help(self) -> None:
-        self.help_active = True
+        """F1/:h: put up the help (KEY_TABLE) as a box over the page."""
+        self.overlay = "help"
         self.help_scroll = 0
         self._draw_help()
 
@@ -6640,27 +6643,6 @@ class Viewer:
         if new_scroll != self.help_scroll:
             self.help_scroll = new_scroll
             self._draw_help()
-
-    def hide_help(self) -> None:
-        self.help_active = False
-        self._invalidate_screen()  # help chars overlay the page
-        self.refresh()
-
-    def handle_help_key(self, key: str) -> None:
-        """A key pressed while the help screen is up: only "q"/F1 (close
-        it) and the scroll keys (for when KEY_TABLE is taller than the
-        box) do anything. Everything else is swallowed so page keys can't
-        leak through underneath it."""
-        if key in ("q", "F1"):
-            self.hide_help()
-        elif key in FORWARD_LINE_KEYS:
-            self.scroll_help(1)
-        elif key in BACKWARD_LINE_KEYS:
-            self.scroll_help(-1)
-        elif key in FORWARD_WINDOW_KEYS:
-            self.scroll_help(max(1, self.rows - 3))
-        elif key in BACKWARD_WINDOW_KEYS:
-            self.scroll_help(-max(1, self.rows - 3))
 
     def _ensure_outline(self) -> list[dict[str, Any]]:
         """self._outline (see PdfDocument.build_outline()), built on
@@ -6691,14 +6673,9 @@ class Viewer:
         for i, entry in enumerate(outline):
             if entry["page"] is not None and entry["page"] <= self.page:
                 self.outline_sel = i
-        self.outline_active = True
+        self.overlay = "outline"
         self.outline_scroll = 0
         self._draw_outline()
-
-    def hide_outline(self) -> None:
-        self.outline_active = False
-        self._invalidate_screen()  # the box overlays the page
-        self.refresh()
 
     def _outline_lines(self) -> list[tuple[str, str]]:
         """The table-of-contents box's content, as _draw_box() takes it:
@@ -6743,7 +6720,7 @@ class Viewer:
         if entry["page"] is None:
             self.draw_status("this entry doesn't point to a page in this file")
             return
-        self.outline_active = False
+        self.overlay = None
         self._invalidate_screen()
         if self.text_mode:
             self.go_to_page_text(entry["page"], 0)
@@ -6752,55 +6729,93 @@ class Viewer:
             self.go_to_link_target(entry["page"], entry["top_pt"])
         self.refresh()
 
-    def handle_outline_key(self, key: str) -> None:
-        """A key pressed while the table of contents is up: ENTER jumps
-        to the selected entry, q/ESC/o/TAB close it, the usual line/
-        window keys and g/G/</>/HOME/END move the selection. Everything
-        else is swallowed, like handle_help_key()."""
-        n = len(self._ensure_outline())
-        window = max(1, self._outline_box()[2] - 1)
+    # What each overlay (see self.overlay) is, as the calls the shared
+    # code below makes on it - everything else about the two boxes is
+    # handled the same way.
+    def _overlay_box_now(self) -> tuple[int, int, int, int]:
+        """_overlay_box() for the overlay that's up."""
+        return self._help_box() if self.overlay == "help" else self._outline_box()
+
+    def _draw_overlay(self) -> None:
+        """Draw the overlay that's up over the page, and its status line."""
+        if self.overlay == "help":
+            self._draw_help()
+        else:
+            self._draw_outline()
+
+    def _move_overlay(self, delta: int) -> None:
+        """j/k and the like on the overlay that's up: scroll the help by
+        `delta` lines, or move the table of contents' selection by
+        `delta` entries (negative = up) - either way stopping at the ends."""
+        if self.overlay == "help":
+            self.scroll_help(delta)
+        else:
+            self._move_outline_selection(delta)
+
+    def hide_overlay(self) -> None:
+        """Close the help or the table of contents, redrawing what it covered."""
+        self.overlay = None
+        self._invalidate_screen()  # the box overlays the page
+        self.refresh()
+
+    def handle_overlay_key(self, key: str) -> None:
+        """A key pressed while the help or the table of contents is up.
+        Both take the same keys:
+
+        - q, ESC, or the key that opened it (F1, or o/TAB) closes it;
+        - ^L (or a focus change - see handle_global_key()) repaints the
+          page underneath, then the box back over it;
+        - the usual line/window keys, d/u and g/G/</>/HOME/END scroll the
+          help or move the table of contents' selection;
+        - ENTER (table of contents only) jumps to the selected entry.
+
+        Everything else is swallowed, so page keys can't act on the page
+        hidden underneath."""
+        window = max(1, self._overlay_box_now()[2] - 1)
+        far = len(KEY_TABLE.splitlines()) + len(self._ensure_outline())  # past either end
+        closing = ("F1",) if self.overlay == "help" else ("o", "\t")
         # ENTER before the line keys: "\r" is one of FORWARD_LINE_KEYS.
-        if key in ("\r", "\n"):
+        if key in ("\r", "\n") and self.overlay == "outline":
             self.jump_to_outline_entry(self.outline_sel)
-        elif key in ("q", "\x1b", "o", "\t"):
-            self.hide_outline()
+        elif key in ("q", "\x1b") or key in closing:
+            self.hide_overlay()
         elif key in ("\x0c", "FOCUS_IN"):
-            # ^L (or a focus change - see handle_global_key()): repaint
-            # the page underneath, then the box back over it.
             self._invalidate_screen()
             if self.text_mode:
                 self._draw_text()
             else:
                 self._draw()
-            self._draw_outline()
+            self._draw_overlay()
         elif key in FORWARD_LINE_KEYS:
-            self._move_outline_selection(1)
+            self._move_overlay(1)
         elif key in BACKWARD_LINE_KEYS:
-            self._move_outline_selection(-1)
+            self._move_overlay(-1)
         elif key in FORWARD_WINDOW_KEYS or key in ("d", "\x04"):
-            self._move_outline_selection(window)
+            self._move_overlay(window)
         elif key in BACKWARD_WINDOW_KEYS or key in ("u", "\x15"):
-            self._move_outline_selection(-window)
+            self._move_overlay(-window)
         elif key in ("g", "<", "HOME"):
-            self._move_outline_selection(-n)
+            self._move_overlay(-far)
         elif key in ("G", ">", "END"):
-            self._move_outline_selection(n)
+            self._move_overlay(far)
 
-    def handle_outline_mouse(self, kind: str, col: int, row: int) -> None:
-        """A mouse event while the table of contents is up: the wheel
-        moves the selection, a click on an entry jumps to it, and a
-        click anywhere outside the box closes it."""
+    def handle_overlay_mouse(self, kind: str, col: int, row: int) -> None:
+        """A mouse event while the help or the table of contents is up:
+        the wheel scrolls it (moves the selection, for the table of
+        contents), a click anywhere outside the box closes it, and a
+        click on a table-of-contents entry jumps to it."""
         if kind == "MOUSE_WHEEL_UP":
-            self._move_outline_selection(-1)
+            self._move_overlay(-1)
         elif kind == "MOUSE_WHEEL_DOWN":
-            self._move_outline_selection(1)
+            self._move_overlay(1)
         elif kind == "MOUSE_CLICK":
-            row0, col0, content_h, content_w = self._outline_box()
+            row0, col0, content_h, content_w = self._overlay_box_now()
             inside_cols = col0 <= col < col0 + content_w + 4
             if inside_cols and row0 < row <= row0 + content_h:
-                self.jump_to_outline_entry(self.outline_scroll + row - row0 - 1)
+                if self.overlay == "outline":
+                    self.jump_to_outline_entry(self.outline_scroll + row - row0 - 1)
             elif not (inside_cols and row0 <= row <= row0 + content_h + 1):
-                self.hide_outline()  # outside the box (its border doesn't count)
+                self.hide_overlay()  # outside the box (its border doesn't count)
 
     def can_enter_text_mode(self) -> bool:
         """Whether this file has any text-mode content to show at all -
@@ -8532,7 +8547,7 @@ class Viewer:
         landed on a PDF hyperlink in the currently displayed crop,
         follow it - open a URL in the system browser, or jump to an
         internal link's target page/position."""
-        if self.text_mode or self.help_active or row >= self.rows:
+        if self.text_mode or self.overlay is not None or row >= self.rows:
             return  # row == self.rows is the status bar
         # Any press starts a fresh gesture: one that lands on the
         # scrollbar keeps following the pointer until the button comes
@@ -8600,7 +8615,7 @@ class Viewer:
         flush_scrollbar_drag() applies the last one once the burst lets
         up rather than walking every page in between. Returns whether
         the drag was taken."""
-        if not self._scrollbar_drag or self.text_mode or self.help_active:
+        if not self._scrollbar_drag or self.text_mode or self.overlay is not None:
             return False
         self._scrollbar_drag_row = row
         return True
@@ -8646,7 +8661,7 @@ class Viewer:
         same page-boundary roll-over as e/y. Only meaningful in the page
         image (mouse reporting is off in text mode, so this shouldn't
         normally fire there, but the guard is cheap insurance)."""
-        if self.text_mode or self.help_active:
+        if self.text_mode or self.overlay is not None:
             return
         step = self.cell_h_px * self.wheel_scroll_step
         if direction < 0:
@@ -8687,7 +8702,7 @@ class Viewer:
         self, from_stack: list[tuple[int, int, int]], to_stack: list[tuple[int, int, int]],
         label: str,
     ) -> None:
-        if self.text_mode or self.help_active:
+        if self.text_mode or self.overlay is not None:
             return
         if not from_stack:
             self.draw_status(f"no {label} position")
@@ -8756,7 +8771,8 @@ class Viewer:
         self._search_index = None
         self._text_pages = None  # stale too - re-extracted on demand
         self._outline = None  # the outline may have changed too
-        self.outline_active = False  # ... and its entries with it
+        if self.overlay == "outline":
+            self.overlay = None  # ... and its entries with it
         self.clear_search()
         if self.text_mode:
             self._load_text_page()
@@ -9283,16 +9299,12 @@ class Viewer:
         return True
 
     def handle_mouse(self, kind: str, col: int, row: int) -> None:
-        """One decoded mouse event (see decode_sgr_mouse()): the wheel
-        scrolls the help box while it's up, and otherwise clicks/drags/
-        the wheel/the back and forward buttons act on the page."""
-        if self.help_active:
-            if kind == "MOUSE_WHEEL_UP":
-                self.scroll_help(-1)
-            elif kind == "MOUSE_WHEEL_DOWN":
-                self.scroll_help(1)
-        elif self.outline_active:
-            self.handle_outline_mouse(kind, col, row)
+        """One decoded mouse event (see decode_sgr_mouse()): the help or
+        the table of contents takes it while one is up (see
+        handle_overlay_mouse()), and otherwise clicks/drags/the wheel/
+        the back and forward buttons act on the page."""
+        if self.overlay is not None:
+            self.handle_overlay_mouse(kind, col, row)
         elif kind == "MOUSE_CLICK":
             self.handle_click(col, row)
         elif kind == "MOUSE_DRAG":
@@ -9744,11 +9756,8 @@ def run_viewer(
             if key == "\x03":
                 break
 
-            if viewer.help_active:
-                viewer.handle_help_key(key)
-                continue
-            if viewer.outline_active:
-                viewer.handle_outline_key(key)
+            if viewer.overlay is not None:
+                viewer.handle_overlay_key(key)
                 continue
 
             if viewer.handle_global_key(key):
