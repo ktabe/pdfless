@@ -9573,6 +9573,303 @@ def _suspend(fd: int, old_termios: list[Any], keep: bool, viewer: Viewer) -> Non
     # stopped, and its contents are gone either way
 
 
+def _fall_back_to_text_mode(viewer: Viewer) -> None:
+    """Start in text mode instead of image mode on a terminal that can't
+    show inline images (see iterm2_like()), telling the user so on the
+    real screen first - or, if the file has no text mode, just warn.
+
+    Args:
+        viewer: the Viewer about to start, in image mode."""
+    # Image mode is drawn entirely via the OSC 1337 inline-image
+    # protocol (see iterm2_like()) - on a terminal that doesn't
+    # understand it, that escape sequence is either ignored or shown
+    # as garbage, so nothing meaningful ever reaches the screen.
+    # Warn on the real (not yet alternate) screen, then fall back to
+    # text mode where this file has one; run_viewer()'s own "t"/"T"
+    # handling keeps you there afterwards (see there).
+    name = os.path.basename(viewer.path)
+    has_text = viewer.can_enter_text_mode()
+    if has_text:
+        warning = f"{name}: this terminal doesn't support inline images (needs iTerm2/WezTerm) - showing text mode instead"
+    else:
+        warning = f"{name}: this terminal doesn't support inline images (needs iTerm2/WezTerm), and no text mode is available for this file"
+    sys.stdout.write(warning + "\r\n")
+    sys.stdout.flush()
+    time.sleep(2)
+    if has_text:
+        viewer.text_mode = True
+        # _load_content() only (re)loads text_mode content when
+        # switching *into* it (starts_in_text_mode()) or via
+        # enter_text_mode() - flipping the flag directly like this
+        # would otherwise leave text_lines at its __init__ default
+        # ([]), drawing an empty page (border/scrollbar/status line
+        # only, no content) until something else happened to reload it.
+        viewer._load_text_page()
+
+
+def _dump_if_one_screen(viewer: Viewer) -> bool:
+    """-F/--quit-if-one-screen: print the first file straight to the
+    terminal, and have run_viewer() quit, if it fits on one screen -
+    otherwise put the viewer back the way the interactive session needs.
+
+    Args:
+        viewer: the Viewer about to start.
+
+    Returns:
+        True if it was printed (and pdfless should quit)."""
+    # -F/--quit-if-one-screen: real less(1)'s own -F. Only affects
+    # whether/how this first file starts up - never entering the
+    # alternate screen at all here is what leaves the dump in the
+    # terminal's real scrollback, the same as less -F itself (as
+    # opposed to -k/--keep, which stays parked in the alternate
+    # screen instead - not real scrollback).
+    viewer._dump_margin_rows = 1  # see Viewer.__init__ - applied to
+    # the "does it fit" check itself (not just the eventual render),
+    # so a file that only fits with no margin at all correctly falls
+    # through to the interactive session instead of still being
+    # dumped somewhere it would immediately scroll itself out of.
+    if viewer.text_mode:
+        # -h/fit doesn't apply to text mode; "fits" here means the
+        # actual line count needs no scrolling - not just "1 page"
+        # (every plain-text/RTF file reports npages==1 regardless of
+        # length, so gating on that alone would dump-and-quit any
+        # length of piped $PAGER input instead of paging it).
+        viewer._load_content()
+        if viewer.text_scroll_max <= 0:
+            viewer.dump_and_quit()
+            return True
+    elif viewer.npages == 1:
+        # Force fit-to-height for the dump regardless of -h, so a
+        # single page is guaranteed to fit vertically; -h still
+        # governs the multi-page (interactive) case untouched.
+        viewer.fit = "height"
+        viewer._load_content()
+        viewer.dump_and_quit()
+        return True
+    # else/fallthrough: not dumping after all (more than one page,
+    # or - in text mode - didn't fit even with the margin) - undo it
+    # and force a fresh geometry recompute, so the interactive
+    # session gets the terminal's full usable height back
+    # rather than staying stuck with one row less than it should have.
+    viewer._dump_margin_rows = 0
+    viewer.resized = True
+    # The outcome is decided now - a later :n/:p to another office
+    # file should get the normal interactive status-line progress
+    # (_ViewerProgress), not _ensure_office_pages()'s own stderr
+    # _ProgressLine fallback, which only makes sense while this
+    # first file's dump-or-interactive question was still open.
+    viewer.quit_if_one_screen = False
+    return False
+
+
+class _KeyDispatcher:
+    """run_viewer()'s input loop's decisions: what each key or mouse
+    event means right now, given what's been typed so far, and the
+    input state that carries over from one key to the next.
+
+    At most one piece of that state is active at a time: a number being
+    typed in (a count for the next key - see Viewer.handle_count_key()),
+    a one-key prefix awaiting its second key (see _PREFIX_BINDINGS), or
+    a search query being typed.
+
+    Attributes:
+        viewer: the Viewer the keys act on.
+        num_buf: the digits of a count typed so far, or "".
+        pending_prefix: ":" or "-" while its second key is awaited, or None.
+        search_editor: a _LineEditor while the "/"/"?" prompt is up, or None.
+        search_backward: whether that prompt was opened with "?".
+        last_search_query: remembered across searches, for a bare "/"/"?".
+    """
+
+    def __init__(self, viewer: Viewer, fd: int, old_termios: list[Any], keep: bool) -> None:
+        """Args:
+            viewer: the Viewer the keys act on.
+            fd, old_termios, keep: what ^Z needs to suspend and resume
+                (see _suspend()).
+        """
+        self.viewer = viewer
+        self._fd = fd
+        self._old_termios = old_termios
+        self._keep = keep
+        self.num_buf = ""
+        self.pending_prefix: str | None = None
+        self.search_editor: _LineEditor | None = None
+        self.search_backward = False
+        self.last_search_query: str | None = None
+
+    def handle(self, key: str | tuple) -> bool:
+        """Act on one read_key() result.
+
+        The order of the checks is what decides which meaning a key gets:
+        ^Z beats everything (even typing a search query), a prompt or
+        pending prefix swallows the next key whatever it is, and the help
+        or the table of contents swallows every other key but its own.
+
+        Args:
+            key: a key name, or ("MOUSE", kind, col, row).
+
+        Returns:
+            False to quit pdfless, True to keep reading keys."""
+        viewer = self.viewer
+        if isinstance(key, tuple):  # ("MOUSE", kind, col, row)
+            if self.search_editor is None:
+                viewer.handle_mouse(*key[1:])
+            return True
+        if key == "\x1a":
+            _suspend(self._fd, self._old_termios, self._keep, viewer)
+            return True
+        if self.search_editor is not None:
+            self._search_prompt_key(self.search_editor, key)
+            return True
+        if self.pending_prefix is not None:
+            return self._prefix_key(self.pending_prefix, key)
+        if key == "\x03":
+            return False
+        if viewer.overlay is not None:
+            viewer.handle_overlay_key(key)
+            return True
+        if viewer.handle_global_key(key):
+            return True
+        if key == ":" or (key == "-" and viewer.text_mode):
+            # In image mode, "-" already means zoom out (see
+            # Viewer.handle_key()) - only text mode gets the less(1)-style
+            # "-S"/"-N" toggles.
+            self.pending_prefix = key
+            viewer.draw_status(key)
+            return True
+        if key in ("/", "?"):
+            self._open_search_prompt(backward=key == "?")
+            return True
+        if self._search_match_key(key):
+            return True
+        if self._count_key(key):
+            return True
+        return self._view_key(key)
+
+    def _search_prompt_key(self, editor: _LineEditor, key: str) -> None:
+        """A key typed at the "/"/"?" prompt: edit the query, or submit
+        it (an empty one repeats the last query) or cancel it."""
+        viewer = self.viewer
+        outcome = editor.handle(key)
+        if outcome == "submit":
+            query = editor.text or self.last_search_query
+            self.search_editor = None
+            if query:
+                self.last_search_query = query
+                viewer.start_search(query, backward=self.search_backward, multiline=editor.multiline)
+            else:
+                viewer.draw_status()
+        elif outcome == "cancel":
+            self.search_editor = None
+            viewer.draw_status()
+        elif outcome == "changed":
+            viewer.draw_search_prompt(
+                editor.text, editor.cursor, backward=self.search_backward,
+                multiline=editor.multiline,
+            )
+
+    def _prefix_key(self, prefix: str, key: str) -> bool:
+        """The key after ":" or "-" (see _PREFIX_BINDINGS) - False if it
+        was ":q"."""
+        self.pending_prefix = None
+        action = _PREFIX_BINDINGS[prefix].get(key)
+        if action is None:
+            self.viewer.draw_status()
+        elif action(self.viewer) is False:
+            return False
+        return True
+
+    def _open_search_prompt(self, backward: bool) -> None:
+        """"/" or "?": put up the search prompt.
+
+        less(1)'s pair: "/" searches forward from here, "?" backward.
+        Either way the whole document is searched and N/P then walk every
+        match - the direction only decides which match this search lands
+        on first (see Viewer._match_index_from()). Search always works in
+        text mode (there's always a flat list of lines to search)
+        regardless of what the file kind supports in image mode
+        (doc_handler.supports_search() - a real PDF's bbox index)."""
+        viewer = self.viewer
+        if viewer.text_mode or viewer.doc_handler.supports_search():
+            self.search_editor = _LineEditor()
+            self.search_backward = backward
+            viewer.draw_search_prompt("", 0, backward=backward)
+        else:
+            viewer.draw_status("search isn't available for this file type")
+
+    def _search_match_key(self, key: str) -> bool:
+        """n/N/p/P and q/ESC while a search is active - True if `key` was
+        one of them."""
+        viewer = self.viewer
+        if viewer.search_query is None:
+            return False
+        if key in ("n", "N"):
+            viewer.repeat_search(forward=True)
+        elif key in ("p", "P"):
+            viewer.repeat_search(forward=False)
+        elif key in ("q", "\x1b"):
+            # With a search active, "q"/Esc dismiss it (removing the
+            # match box/highlight and its status line) rather than
+            # quitting pdfless outright - quit still works normally on
+            # a second press, once there's no longer a search to clear.
+            viewer.clear_search()
+            viewer.refresh()
+        else:
+            return False
+        return True
+
+    def _count_key(self, key: str) -> bool:
+        """A digit of a count, or a key a count applies to - True if
+        `key` was fully handled here. Any other key cancels a pending
+        count and is left for _view_key()."""
+        viewer = self.viewer
+        # A lone "0" (no pending number) resets the zoom/pan instead of
+        # starting a number entry.
+        if key.isdigit() and not (key == "0" and not self.num_buf):
+            self.num_buf += key
+            viewer.draw_status(f"number: {self.num_buf}")
+            return True
+
+        count = int(self.num_buf) if self.num_buf else None
+        if key in ("g", "G") and count is not None:
+            # "<number>g"/"<number>G": in text mode, jump straight to that
+            # line of the current page's text. There's no page-image
+            # equivalent of "line", so in image mode the count is simply
+            # dropped and this falls through to plain g/G (the top/bottom
+            # of the current page).
+            self.num_buf = ""
+            if viewer.text_mode:
+                viewer.go_to_text_line(count)
+                viewer.refresh()
+                return True
+        elif viewer.handle_count_key(key, count):
+            self.num_buf = ""
+            return True
+
+        if self.num_buf:
+            # Any other key cancels a pending number.
+            self.num_buf = ""
+            viewer.draw_status()
+        return False
+
+    def _view_key(self, key: str) -> bool:
+        """Every other key: Viewer.handle_key()'s, redrawing if it
+        changed the view - False if it was the one to quit."""
+        viewer = self.viewer
+        border_before = viewer.text_border
+        before = viewer._view_state()
+        if not viewer.handle_key(key):
+            return False
+        if viewer._view_state() != before:
+            viewer.refresh()
+            if viewer.text_border != border_before and viewer.text_wrap:
+                # "B" toggled text_border, but _draw_text_wrapped() never
+                # draws a border regardless of it - without this, B looks
+                # like it does nothing at all while wrapped.
+                viewer.draw_status("no border while wrapped - see -S/-s")
+        return True
+
+
 def run_viewer(
     files: list[DocumentHandler | str], start_file_index: int, start_page: int, tmpdir: str,
     fd: int, old_termios: list[Any], options: ViewerOptions = ViewerOptions(),
@@ -9590,80 +9887,13 @@ def run_viewer(
     would leave the terminal in whatever raw/alternate-screen/mouse-
     reporting state it was in when the exception hit - see main()."""
     viewer = Viewer(files, start_file_index, start_page, tmpdir, fd, options=options)
-    keep = options.keep
     if viewer_out is not None:
         viewer_out.append(viewer)
 
     if not viewer.text_mode and not iterm2_like():
-        # Image mode is drawn entirely via the OSC 1337 inline-image
-        # protocol (see iterm2_like()) - on a terminal that doesn't
-        # understand it, that escape sequence is either ignored or shown
-        # as garbage, so nothing meaningful ever reaches the screen.
-        # Warn on the real (not yet alternate) screen, then fall back to
-        # text mode where this file has one; run_viewer()'s own "t"/"T"
-        # handling below keeps you there afterwards (see there).
-        name = os.path.basename(viewer.path)
-        has_text = viewer.can_enter_text_mode()
-        if has_text:
-            warning = f"{name}: this terminal doesn't support inline images (needs iTerm2/WezTerm) - showing text mode instead"
-        else:
-            warning = f"{name}: this terminal doesn't support inline images (needs iTerm2/WezTerm), and no text mode is available for this file"
-        sys.stdout.write(warning + "\r\n")
-        sys.stdout.flush()
-        time.sleep(2)
-        if has_text:
-            viewer.text_mode = True
-            # _load_content() only (re)loads text_mode content when
-            # switching *into* it (starts_in_text_mode()) or via
-            # enter_text_mode() - flipping the flag directly like this
-            # would otherwise leave text_lines at its __init__ default
-            # ([]), drawing an empty page (border/scrollbar/status line
-            # only, no content) until something else happened to reload it.
-            viewer._load_text_page()
-
-    if options.quit_if_one_screen:
-        # -F/--quit-if-one-screen: real less(1)'s own -F. Only affects
-        # whether/how this first file starts up - never entering the
-        # alternate screen at all here is what leaves the dump in the
-        # terminal's real scrollback, the same as less -F itself (as
-        # opposed to -k/--keep, which stays parked in the alternate
-        # screen instead - not real scrollback).
-        viewer._dump_margin_rows = 1  # see Viewer.__init__ - applied to
-        # the "does it fit" check itself (not just the eventual render),
-        # so a file that only fits with no margin at all correctly falls
-        # through to interactive mode below instead of still being
-        # dumped somewhere it would immediately scroll itself out of.
-        if viewer.text_mode:
-            # -h/fit doesn't apply to text mode; "fits" here means the
-            # actual line count needs no scrolling - not just "1 page"
-            # (every plain-text/RTF file reports npages==1 regardless of
-            # length, so gating on that alone would dump-and-quit any
-            # length of piped $PAGER input instead of paging it).
-            viewer._load_content()
-            if viewer.text_scroll_max <= 0:
-                viewer.dump_and_quit()
-                return viewer
-        elif viewer.npages == 1:
-            # Force fit-to-height for the dump regardless of -h, so a
-            # single page is guaranteed to fit vertically; -h still
-            # governs the multi-page (interactive) case below untouched.
-            viewer.fit = "height"
-            viewer._load_content()
-            viewer.dump_and_quit()
-            return viewer
-        # else/fallthrough: not dumping after all (more than one page,
-        # or - in text mode - didn't fit even with the margin) - undo it
-        # and force a fresh geometry recompute, so the interactive
-        # session below gets the terminal's full usable height back
-        # rather than staying stuck with one row less than it should have.
-        viewer._dump_margin_rows = 0
-        viewer.resized = True
-        # The outcome is decided now - a later :n/:p to another office
-        # file should get the normal interactive status-line progress
-        # (_ViewerProgress), not _ensure_office_pages()'s own stderr
-        # _ProgressLine fallback, which only makes sense while this
-        # first file's dump-or-interactive question was still open.
-        viewer.quit_if_one_screen = False
+        _fall_back_to_text_mode(viewer)
+    if options.quit_if_one_screen and _dump_if_one_screen(viewer):
+        return viewer
 
     sys.stdout.write(_enter_screen_seq(alt_screen=True, mouse=not viewer.text_mode))
     sys.stdout.flush()
@@ -9674,16 +9904,7 @@ def run_viewer(
 
     signal.signal(signal.SIGWINCH, on_winch)
 
-    # The run loop's own input state - at most one of these is active at
-    # a time: a number being typed in (a count for the next key - see
-    # Viewer.handle_count_key()), a one-key prefix awaiting its second
-    # key (see _PREFIX_BINDINGS), or a search query being typed.
-    num_buf = ""
-    pending_prefix = None  # ":" or "-", or None
-    search_editor = None  # a _LineEditor while the "/"/"?" prompt is up
-    search_backward = False  # whether that prompt was opened with "?"
-    last_search_query = None  # remembered across searches, for a bare "/"/"?"
-
+    dispatcher = _KeyDispatcher(viewer, fd, old_termios, options.keep)
     viewer.refresh()
     viewer._schedule_prefetch()
     while True:
@@ -9709,141 +9930,8 @@ def run_viewer(
         if key is None:
             break
         try:
-            if isinstance(key, tuple):  # ("MOUSE", kind, col, row)
-                if search_editor is None:
-                    viewer.handle_mouse(*key[1:])
-                continue
-
-            # The order of the checks from here on is what decides which
-            # meaning a key gets: ^Z beats everything (even typing a search
-            # query), a prompt or pending prefix swallows the next key
-            # whatever it is, and the help screen swallows every other key
-            # but its own.
-            if key == "\x1a":
-                _suspend(fd, old_termios, keep, viewer)
-                continue
-
-            if search_editor is not None:
-                outcome = search_editor.handle(key)
-                if outcome == "submit":
-                    query = search_editor.text or last_search_query
-                    multiline = search_editor.multiline
-                    search_editor = None
-                    if query:
-                        last_search_query = query
-                        viewer.start_search(query, backward=search_backward, multiline=multiline)
-                    else:
-                        viewer.draw_status()
-                elif outcome == "cancel":
-                    search_editor = None
-                    viewer.draw_status()
-                elif outcome == "changed":
-                    viewer.draw_search_prompt(
-                        search_editor.text, search_editor.cursor, backward=search_backward,
-                        multiline=search_editor.multiline,
-                    )
-                continue
-
-            if pending_prefix is not None:
-                action = _PREFIX_BINDINGS[pending_prefix].get(key)
-                pending_prefix = None
-                if action is None:
-                    viewer.draw_status()
-                elif action(viewer) is False:
-                    break
-                continue
-
-            if key == "\x03":
+            if not dispatcher.handle(key):
                 break
-
-            if viewer.overlay is not None:
-                viewer.handle_overlay_key(key)
-                continue
-
-            if viewer.handle_global_key(key):
-                continue
-
-            if key == ":" or (key == "-" and viewer.text_mode):
-                # In image mode, "-" already means zoom out (see
-                # Viewer.handle_key()) - only text mode gets the less(1)-style
-                # "-S"/"-N" toggles.
-                pending_prefix = key
-                viewer.draw_status(key)
-                continue
-
-            if key in ("/", "?"):
-                # less(1)'s pair: "/" searches forward from here, "?"
-                # backward. Either way the whole document is searched and N/P
-                # then walk every match - the direction only decides which
-                # match this search lands on first (see
-                # Viewer._match_index_from()). Search always works in text
-                # mode (there's always a flat list of lines to search)
-                # regardless of what the file kind supports in image mode
-                # (doc_handler.supports_search() - a real PDF's bbox index).
-                if viewer.text_mode or viewer.doc_handler.supports_search():
-                    search_editor = _LineEditor()
-                    search_backward = key == "?"
-                    viewer.draw_search_prompt("", 0, backward=search_backward)
-                else:
-                    viewer.draw_status("search isn't available for this file type")
-                continue
-
-            if viewer.search_query is not None:
-                if key in ("n", "N"):
-                    viewer.repeat_search(forward=True)
-                    continue
-                if key in ("p", "P"):
-                    viewer.repeat_search(forward=False)
-                    continue
-                if key in ("q", "\x1b"):
-                    # With a search active, "q"/Esc dismiss it (removing the
-                    # match box/highlight and its status line) rather than
-                    # quitting pdfless outright - quit still works normally on
-                    # a second press, once there's no longer a search to clear.
-                    viewer.clear_search()
-                    viewer.refresh()
-                    continue
-
-            # A lone "0" (no pending number) resets the zoom/pan instead of
-            # starting a number entry.
-            if key.isdigit() and not (key == "0" and not num_buf):
-                num_buf += key
-                viewer.draw_status(f"number: {num_buf}")
-                continue
-
-            count = int(num_buf) if num_buf else None
-            if key in ("g", "G") and count is not None:
-                # "<number>g"/"<number>G": in text mode, jump straight to that
-                # line of the current page's text. There's no page-image
-                # equivalent of "line", so in image mode the count is simply
-                # dropped and this falls through to plain g/G below (the top/
-                # bottom of the current page).
-                num_buf = ""
-                if viewer.text_mode:
-                    viewer.go_to_text_line(count)
-                    viewer.refresh()
-                    continue
-            elif viewer.handle_count_key(key, count):
-                num_buf = ""
-                continue
-
-            if num_buf:
-                # Any other key cancels a pending number.
-                num_buf = ""
-                viewer.draw_status()
-
-            border_before = viewer.text_border
-            before = viewer._view_state()
-            if not viewer.handle_key(key):
-                break
-            if viewer._view_state() != before:
-                viewer.refresh()
-                if viewer.text_border != border_before and viewer.text_wrap:
-                    # "B" toggled text_border, but _draw_text_wrapped() never
-                    # draws a border regardless of it - without this, B looks
-                    # like it does nothing at all while wrapped.
-                    viewer.draw_status("no border while wrapped - see -S/-s")
-
         except (subprocess.CalledProcessError, OSError):
             # e.g. the text, or the search index, this key needed
             _report_unreadable_file(viewer)
