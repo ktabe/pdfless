@@ -11850,9 +11850,9 @@ def _collect_files(
 
 
 def _open_key_input(reading_stdin: bool) -> tuple[int, int | None]:
-    """The terminal to read keys and mouse events from - stdin, unless
-    stdin is the document itself (pdfless as $PAGER) - exiting via
-    die() if there's no usable one.
+    """The terminal to read keys and mouse events from - stdin if it's
+    one, otherwise /dev/tty - exiting via die() if there's no usable
+    one.
 
     Args:
         reading_stdin: whether the document came in on stdin.
@@ -11861,19 +11861,18 @@ def _open_key_input(reading_stdin: bool) -> tuple[int, int | None]:
         (fd, fd_to_close): the terminal's fd, and the same fd again if
         it was opened here (/dev/tty) for the caller to close when
         done, or None if it's stdin's own."""
-    if reading_stdin:
-        # stdin's own fd has been drained (see _capture_stdin()) and
-        # is never read again - /dev/tty is the real keyboard now, the
-        # same trick less(1)/most(1) use to double as $PAGER.
-        try:
-            fd = os.open("/dev/tty", os.O_RDWR)
-        except OSError as e:
-            die(f"can't open /dev/tty for keyboard input: {e}")
-        return fd, fd
-    if not sys.stdin.isatty():
-        die("stdin must be a terminal (or pipe something into "
-            "pdfless, or pass \"-\", to page it)")
-    return sys.stdin.fileno(), None
+    if not reading_stdin and sys.stdin.isatty():
+        return sys.stdin.fileno(), None
+    # Either stdin was the document (pdfless as $PAGER - drained, see
+    # _capture_stdin(), and never read again), or it's no terminal at
+    # all: `find ... | xargs pdfless` (BSD xargs gives the command
+    # /dev/null for stdin), `pdfless a.pdf < /dev/null`. Either way
+    # /dev/tty is the real keyboard, the same trick less(1)/most(1) use.
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError as e:
+        die(f"can't open /dev/tty for keyboard input: {e}")
+    return fd, fd
 
 
 def _leave_viewer_screen(viewer: Viewer | None, keep: bool) -> None:
