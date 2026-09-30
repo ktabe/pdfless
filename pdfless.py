@@ -55,6 +55,7 @@ import threading
 import time
 import tty
 import unicodedata
+import urllib.parse
 import webbrowser
 from collections import OrderedDict, deque
 
@@ -7121,6 +7122,11 @@ class _Search:
         )
 
 
+# What a click on a PDF's link opens (see _Links.activate()) - anything
+# else (file:, an app's own scheme, ...) is only shown.
+_OPENABLE_LINK_SCHEMES = frozenset({"http", "https", "mailto"})
+
+
 class _Links:
     """A PDF's hyperlinks, and the back/forward history of the jumps
     internal links and the table of contents make: a click on a link
@@ -7241,6 +7247,13 @@ class _Links:
         left from (see push_history())."""
         viewer = self.viewer
         if link["kind"] == "uri":
+            scheme = urllib.parse.urlsplit(link["uri"]).scheme.lower()
+            if scheme not in _OPENABLE_LINK_SCHEMES:
+                # A document's link to a local file, an app, or some app's
+                # own URL scheme isn't followed just because it was
+                # clicked - only shown.
+                viewer.draw_status(f"not opened (only http, https and mailto links are): {link['uri']}")
+                return
             try:
                 opened = webbrowser.open(link["uri"])
             except webbrowser.Error:

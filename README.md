@@ -242,7 +242,7 @@ plain images and previews without extractable text. While a search is active,
 | `S` | Show or hide page thumbnails down the left edge (image mode, in a terminal at least 60 columns wide). The page being viewed is framed. Click a thumbnail to go to its page; the mouse wheel over them, or their own scrollbar on the right of them, scrolls them. |
 | `s` | Move to the page thumbnails (showing them if needed) to pick one: move with `j`/`k`, press `ENTER` to go to that page (`t`/`T`: in text mode), or `q`/`s` to go back to the page with the thumbnails left up. |
 | `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-f`/`--follow` is specified. |
-| Click a PDF link | Open a URL in the system browser or follow an internal link. |
+| Click a PDF link | Open a URL in the system browser (`http`, `https` and `mailto` links only; others are just shown on the status line) or follow an internal link. |
 | `[` / `]` | Go back / forward through the positions internal links and the table of contents (`o`) jumped from. |
 | `o`, `TAB` | Show the table of contents (a PDF's bookmarks, or a document's headings), with the current section selected. Move with `j`/`k` or the mouse wheel, then press `ENTER` or click an entry to jump there. Press `q` to close it. |
 | Click or drag the scrollbar | Jump to a document position in image mode. In text mode, the scrollbar is display-only. |

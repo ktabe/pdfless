@@ -377,3 +377,16 @@ def test_half_a_screen_is_at_least_a_line(sample_text):
     before = viewer.text_scroll
     viewer.handle_key_text("d")
     assert viewer.text_scroll > before
+
+
+def test_only_web_and_mail_links_are_opened(sample_pdf, monkeypatch, capsys):
+    """A PDF's /URI link went to webbrowser.open() whatever its scheme -
+    file:, a .app, some app's own URL scheme."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    opened = []
+    monkeypatch.setattr(pdfless.webbrowser, "open", lambda uri: opened.append(uri) or True)
+    for uri in ("https://example.com/", "mailto:a@example.com", "file:///etc/passwd",
+                "x-apple.systempreferences:com.apple.preference", "javascript:alert(1)"):
+        viewer.links.activate({"kind": "uri", "uri": uri})
+    assert opened == ["https://example.com/", "mailto:a@example.com"]
+    assert "not opened" in capsys.readouterr().out
