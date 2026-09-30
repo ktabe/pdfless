@@ -15,7 +15,7 @@ def namespace(**overrides):
     `overrides`."""
     defaults = dict(
         fit_height=False, border=True, chop_long_lines=False, eol_mark=True,
-        line_numbers=False, scrollbar=True, wheel_scroll_step=2,
+        line_numbers=False, scrollbar=True, sidebar=False, wheel_scroll_step=2,
         incremental_scroll=True, debug=False, rendering_scale=1.0,
         continuous=False, follow=False, quit_if_one_screen=False, keep=False,
     )
