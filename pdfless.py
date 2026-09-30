@@ -8220,6 +8220,18 @@ class Viewer:
                 self.draw_status(boundary_message)
                 return
             index += step
+        if self._copy_mode_saved is not None:
+            # Copy mode ("C", or "T") belongs to the file it was turned on
+            # in: put back what it hid, as exit_text_mode() would, rather
+            # than carry it (and the stale values to restore) over - the
+            # next file's own defaults for the border/wrap follow below.
+            scrollbar = self.scrollbar
+            (
+                self.eol_mark, self.text_border, self.scrollbar, self.line_numbers
+            ) = self._copy_mode_saved
+            self._copy_mode_saved = None
+            if self.scrollbar != scrollbar:
+                self._recompute_geometry()  # its column comes back from the page's width
         self.file_index = index
         self._set_current_file()
         self.encode_cache.clear()
