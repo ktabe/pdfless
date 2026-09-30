@@ -260,3 +260,28 @@ def test_a_markdown_file_loads_nothing_from_the_network_unless_asked(sample_imag
             assert requests == expected
     finally:
         server.shutdown()
+
+
+@requires_markdown_rendering
+def test_a_search_run_again_on_t_is_drawn_once_and_its_status_kept(sample_md, tmp_path, monkeypatch, capsys):
+    """The search run again in the new mode drew the view and said
+    "match i/N" - then t drew it all again, over that status line."""
+    from test_search import make_viewer
+
+    handler = classify(sample_md, tmp_path)
+    handler.build_pages(str(tmp_path))
+    viewer = make_viewer(handler)
+    viewer.search.start("追加セクション2")
+    draws = []
+    real = viewer._draw_text
+    monkeypatch.setattr(viewer, "_draw_text", lambda: draws.append(1) or real())
+    capsys.readouterr()
+    assert viewer.enter_text_mode()
+    assert len(draws) == 1
+    out = capsys.readouterr().out
+    assert out.rfind("match 1/") > out.rfind("\x1b[H\x1b[2J")  # the status came after the draw
+
+    viewer.search.start("## リスト")  # found in the source only
+    capsys.readouterr()
+    viewer.toggle_text_mode()
+    assert '"## リスト" not found' in capsys.readouterr().out
