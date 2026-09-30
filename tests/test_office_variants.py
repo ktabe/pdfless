@@ -10,6 +10,7 @@ actually rendering.
 """
 
 import fcntl
+import os
 import pty
 import struct
 import termios
@@ -583,3 +584,86 @@ def test_find_chrome_never_picks_vivaldi_from_path(monkeypatch):
         lambda name: "/usr/bin/" + name if name.startswith("vivaldi") else None,
     )
     assert pdfless.find_chrome() is None
+
+
+@requires_soffice
+def test_same_named_documents_get_pdfs_of_their_own(sample_twopage_docx, sample_twoslide_pptx, tmp_path):
+    """Regression test: every soffice conversion used to write into the
+    one session directory, so report.docx and report.pptx - both
+    report.pdf - overwrote each other's, and the first one opened then
+    showed the second."""
+    import shutil
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    shutil.copy(sample_twopage_docx, docs / "report.docx")
+    shutil.copy(sample_twoslide_pptx, docs / "report.pptx")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    texts = []
+    for name in ("report.docx", "report.pptx"):
+        handler = classify(str(docs / name), scratch)
+        handler.build_pages(str(scratch))
+        texts.append((handler._pdf_delegate.path, "\n".join(handler.extract_text(1))))
+    (docx_pdf, docx_text), (pptx_pdf, pptx_text) = texts
+    assert docx_pdf != pptx_pdf
+    assert os.path.isfile(docx_pdf) and os.path.isfile(pptx_pdf)
+    assert docx_text != pptx_text
+
+
+def test_file_urls_are_percent_encoded():
+    """A "#" in a file name read to Chrome as the start of a fragment -
+    the page didn't load, and the document rendered as the failure
+    placeholder."""
+    url = pdfless._file_url("/tmp/Report #3 100%?.key")
+    assert url == "file:///tmp/Report%20%233%20100%25%3F.key"
+
+
+def test_the_svg_wrapper_quotes_the_file_name(tmp_path):
+    """The SVG's path went into the wrapper page's src="..." as it was -
+    a name with a quote in it broke out of the attribute."""
+    wrapper = tmp_path / "wrap.html"
+    pdfless.SvgDocument._write_svg_wrapper(
+        str(wrapper), '/tmp/a"><script>x</script>.svg', None, None,
+    )
+    page = wrapper.read_text()
+    assert "<script>" not in page
+    assert 'src="file:///tmp/a%22%3E%3Cscript%3Ex%3C/script%3E.svg"' in page
+
+
+@requires_office_support
+def test_an_svg_with_a_hash_in_its_name_renders(sample_svg, tmp_path):
+    import shutil
+    path = tmp_path / "figure #1.svg"
+    shutil.copy(sample_svg, path)
+    handler = classify(str(path), tmp_path)
+    assert handler.build_pages(str(tmp_path))
+    assert handler._pdf_delegate is not None
+
+
+def test_a_screenshot_chrome_didnt_write_is_no_image(tmp_path, sample_image):
+    """Chrome can exit 0 without writing its screenshot: that's a failed
+    render (the placeholder), not a crash."""
+    assert pdfless._open_screenshot(str(tmp_path / "missing.png")) is None
+    garbage = tmp_path / "garbage.png"
+    garbage.write_bytes(b"not an image")
+    assert pdfless._open_screenshot(str(garbage)) is None
+    assert pdfless._open_screenshot(sample_image).size > (0, 0)
+
+
+def test_a_failed_gpu_screenshot_is_retried_without_it(tmp_path, monkeypatch):
+    """Only a timeout used to fall back to --disable-gpu: a GPU crash
+    (a non-zero exit) failed the whole render."""
+    import subprocess
+    out_png = tmp_path / "shot.png"
+    calls = []
+
+    def fake(args, **kwargs):
+        calls.append(args)
+        if "--disable-gpu" not in args:
+            raise subprocess.CalledProcessError(1, args)
+        out_png.write_bytes(b"png")
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(pdfless, "run_subprocess", fake)
+    pdfless._capture_html_screenshot("chrome", str(tmp_path / "a.html"), 100, 100, str(out_png), 1.0)
+    assert len(calls) == 2 and "--disable-gpu" in calls[1]

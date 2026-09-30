@@ -183,17 +183,30 @@ def test_ordinary_docx_is_unaffected_by_the_cfb_check(sample_docx, tmp_path):
     assert not pdfless.is_password_protected_ooxml_or_visio(sample_docx)
 
 
-def test_invalid_utf8_non_pdf_file_raises_unusable_file(tmp_path):
+def test_text_in_no_known_encoding_still_opens(tmp_path):
+    """No NUL byte (so is_probably_text() says yes), but neither UTF-8
+    nor a legacy Japanese encoding: shown, with what doesn't decode as
+    U+FFFD, rather than refused."""
     bad = tmp_path / "bad.txt"
-    # No NUL byte (so is_probably_text() says yes), but not valid UTF-8.
     bad.write_bytes(b"\xff\xfe invalid utf8, no nul bytes here")
-    raised = False
-    try:
-        classify(str(bad), tmp_path)
-    except pdfless.UnusableFile as e:
-        raised = True
-        assert "UTF-8" in str(e)
-    assert raised
+    handler = classify(str(bad), tmp_path)
+    assert isinstance(handler, pdfless.TextDocument)
+    assert handler.extract_text(1)[0].endswith(" invalid utf8, no nul bytes here")
+    assert "\ufffd" in handler.extract_text(1)[0]
+
+
+def test_shift_jis_and_euc_jp_text_is_read_as_such(tmp_path):
+    for encoding in ("cp932", "euc_jp"):
+        path = tmp_path / f"{encoding}.txt"
+        path.write_bytes("日本語のテキスト\n二行目\n".encode(encoding))
+        handler = classify(str(path), tmp_path)
+        assert handler.extract_text(1) == ["日本語のテキスト", "二行目"]
+
+
+def test_a_utf8_bom_is_dropped(tmp_path):
+    path = tmp_path / "bom.txt"
+    path.write_bytes("\ufeffhello".encode("utf-8"))
+    assert classify(str(path), tmp_path).extract_text(1) == ["hello"]
 
 
 def test_unrecognizable_binary_file_classifies_as_none(tmp_path):

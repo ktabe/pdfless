@@ -290,3 +290,35 @@ def test_a_count_goes_to_the_key_after_it(sample_pdf, monkeypatch):
     monkeypatch.setattr(viewer, "go_to_text_line", lines.append)
     feed(d, ["1", "2", "g"])
     assert lines == [12]
+
+
+def test_only_ascii_digits_make_a_count(sample_pdf):
+    """"²" (AltGr+2 on a German keyboard) or "①" (from an input method)
+    pass str.isdigit() but not int() - they're just keys that do nothing."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    d = dispatcher_for(viewer)
+    for key in ("²", "①"):
+        assert d.handle(key)
+        assert d.num_buf == ""
+        assert d.handle("j")  # no ValueError from a count of "²"
+
+
+def test_a_reload_reads_the_links_again(sample_pdf, tmp_path):
+    """Regression test: reload() kept the old file's link index, so a
+    PDF that grew (under -f) crashed on a click on a new page - an
+    IndexError from links.at()."""
+    import shutil
+    from pypdf import PdfWriter
+    path = tmp_path / "doc.pdf"
+    writer = PdfWriter()
+    writer.append(sample_pdf, pages=(0, 3), import_outline=False)
+    writer.write(str(path))
+    viewer = make_viewer(pdfless.PdfDocument(str(path)))
+    assert len(viewer.links.ensure_index()) == 3
+    viewer.links.push_history()
+    shutil.copy(sample_pdf, path)  # now 7 pages
+    viewer.reload()
+    viewer.go_page(7, 0)
+    assert viewer.links.at(5, 5) is None  # no IndexError
+    assert len(viewer.links.index) == 7
+    assert viewer.links.back  # the history stays

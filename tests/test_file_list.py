@@ -139,3 +139,20 @@ def test_a_long_path_loses_its_start_not_its_name(sample_pdf, tmp_path, monkeypa
     left, number = viewer.overlays._files_lines()[1]
     assert left.startswith("  …") and left.endswith("/the-file-itself.pdf")
     assert pdfless.display_width(left) + 1 + len(number) == content_w  # fills the box, no more
+
+
+def test_copy_mode_stays_with_its_own_file(sample_pdf, tmp_path, monkeypatch):
+    """Regression test: T (text mode, cleared for copying) then :n left
+    the next file with the scrollbar, the EOL marks and the line numbers
+    stuck off - and the next C put back the first file's values."""
+    other = tmp_path / "b.pdf"
+    shutil.copy(sample_pdf, other)
+    viewer = make_viewer([pdfless.PdfDocument(sample_pdf), str(other)], monkeypatch)
+    before = (viewer.eol_mark, viewer.scrollbar, viewer.line_numbers)
+    width = viewer.base_width_px
+    viewer.handle_global_key("T")
+    assert viewer._copy_mode_saved is not None and not viewer.scrollbar
+    viewer.go_to_file(1)
+    assert viewer._copy_mode_saved is None
+    assert (viewer.eol_mark, viewer.scrollbar, viewer.line_numbers) == before
+    assert viewer.base_width_px == width  # the scrollbar's column is back

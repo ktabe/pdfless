@@ -708,7 +708,7 @@ class _ProgressLine:
         if not self.enabled:
             return
         with self._lock:
-            text = truncate_to_width(f"pdfless: {text}", self._stderr_cols())
+            text = truncate_to_width(f"pdfless: {display_safe(text)}", self._stderr_cols())
             pad = max(0, self._last_width - display_width(text))
             sys.stderr.write("\r" + text + " " * pad)
             sys.stderr.flush()
@@ -1191,6 +1191,12 @@ _SOFFICE_SPREADSHEET_PDF_FILTER = (
 _SOFFICE_SPREADSHEET_TIMEOUT = 180
 
 
+# Held while soffice runs - see _convert_via_soffice(): one profile,
+# one conversion at a time (a background prefetch and a jump to another
+# document can otherwise start two).
+_SOFFICE_LOCK = threading.Lock()
+
+
 def _convert_via_soffice(
     soffice: str, path: str, tmpdir: str, timeout: int = 60, debug: bool = False,
 ) -> str | None:
@@ -1209,10 +1215,14 @@ def _convert_via_soffice(
     glyph-resolution bug), while running without it renders correctly,
     including over SSH.
 
-    -env:UserInstallation points at a profile directory scoped to this
-    `tmpdir` (unique per render), so concurrent soffice invocations
-    (e.g. two files opened around the same time) don't collide over a
-    shared user profile lock.
+    -env:UserInstallation points at a profile directory of pdfless's own
+    in `tmpdir` - kept for the session, as making one takes soffice a
+    few seconds - and conversions take turns with it (see _SOFFICE_LOCK):
+    a second soffice on a profile in use just hands its request to the
+    first and produces nothing. Each conversion writes into a directory
+    of its own, so two documents with the same name (report.docx and
+    report.pptx, or a/x.docx and b/x.docx) can't overwrite, or be
+    mistaken for, each other's PDF.
 
     A spreadsheet (_SOFFICE_SPREADSHEET_EXTENSIONS) is exported one page
     per sheet (see _SOFFICE_SPREADSHEET_PDF_FILTER), with at least
@@ -1222,28 +1232,30 @@ def _convert_via_soffice(
     is reported to stderr - see below for why that's not rare (soffice
     routinely exits 0 without one)."""
     profile_dir = os.path.join(tmpdir, "soffice-profile")
+    outdir = tempfile.mkdtemp(prefix="soffice-out-", dir=tmpdir)
     name = os.path.basename(path)
     convert_to = "pdf"
     if path.lower().endswith(_SOFFICE_SPREADSHEET_EXTENSIONS):
         convert_to = _SOFFICE_SPREADSHEET_PDF_FILTER
         timeout = max(timeout, _SOFFICE_SPREADSHEET_TIMEOUT)
     try:
-        result = run_subprocess(
-            [
-                soffice,
-                f"-env:UserInstallation=file://{profile_dir}",
-                "--convert-to", convert_to,
-                "--outdir", tmpdir,
-                path,
-            ],
-            capture_output=True, timeout=timeout,
-        )
+        with _SOFFICE_LOCK:
+            result = run_subprocess(
+                [
+                    soffice,
+                    f"-env:UserInstallation={pathlib.Path(profile_dir).as_uri()}",
+                    "--convert-to", convert_to,
+                    "--outdir", outdir,
+                    path,
+                ],
+                capture_output=True, timeout=timeout,
+            )
     except (subprocess.TimeoutExpired, OSError) as e:
         if debug:
             _debug_log(f"{name}: soffice failed to run: {e}")
         return None
     base = os.path.splitext(os.path.basename(path))[0]
-    out_pdf = os.path.join(tmpdir, f"{base}.pdf")
+    out_pdf = os.path.join(outdir, f"{base}.pdf")
     if os.path.isfile(out_pdf):
         return out_pdf
     if debug:
@@ -1516,6 +1528,26 @@ def _rasterize_broken_img_sources(
     return _patch(html_path)
 
 
+def _open_screenshot(path: str) -> Image.Image | None:
+    """A screenshot Chrome was to write, opened and loaded - None if it
+    didn't (it can exit 0 without one) or wrote something that isn't
+    an image, for the caller to report as a failed render rather than
+    crash on.
+
+    Args:
+        path: the PNG's path.
+
+    Returns:
+        The image, or None.
+    """
+    try:
+        img = Image.open(path)
+        img.load()
+        return img
+    except OSError:  # FileNotFoundError, PIL's UnidentifiedImageError, a truncated file
+        return None
+
+
 def _capture_html_screenshot(
     chrome: str, html_path: str, width: int, height: int, out_png: str, render_scale: float,
 ) -> None:
@@ -1526,14 +1558,18 @@ def _capture_html_screenshot(
         f"--window-size={width},{height}",
         f"--force-device-scale-factor={render_scale}",
         f"--screenshot={out_png}",
-        f"file://{os.path.abspath(html_path)}",
+        _file_url(html_path),
     ]
     if max(physical_w, physical_h) < OfficeVariant.OFFICE_GPU_SAFE_PHYSICAL_PX:
         try:
             run_subprocess(base_args, capture_output=True, check=True, timeout=8)
-            return
-        except subprocess.TimeoutExpired:
-            pass  # bigger than expected for this content; fall through
+            if os.path.isfile(out_png):
+                return
+            # Exited cleanly without a screenshot: try again without the GPU.
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            # Bigger than expected for this content, or the GPU path
+            # itself failed: fall through to the software renderer.
+            pass
     run_subprocess(
         [base_args[0], "--disable-gpu", *base_args[1:]],
         capture_output=True, check=True, timeout=30,
@@ -1588,7 +1624,7 @@ def _capture_html_pdf(
             [
                 chrome, "--headless", "--disable-gpu", "--no-sandbox",
                 f"--print-to-pdf={out_pdf}", "--print-to-pdf-no-header",
-                f"file://{os.path.abspath(print_path)}",
+                _file_url(print_path),
             ],
             capture_output=True, check=True, timeout=timeout,
         )
@@ -1759,7 +1795,7 @@ def _chrome_dump_title(
     args = [chrome, "--headless", "--no-sandbox"]
     if width is not None:
         args.append(f"--window-size={width},1080")
-    args += ["--dump-dom", "--virtual-time-budget=8000", f"file://{os.path.abspath(measure_path)}"]
+    args += ["--dump-dom", "--virtual-time-budget=8000", _file_url(measure_path)]
     try:
         r = run_subprocess(args, capture_output=True, text=True, timeout=timeout, check=True)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
@@ -2059,8 +2095,9 @@ class ExcelWorkbook(OfficeVariant):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return None
         try:
-            trimmed = Image.open(out_png)
-            trimmed.load()
+            trimmed = _open_screenshot(out_png)
+            if trimmed is None:
+                return None
             return self._save_pages(trimmed, [0, trimmed.height], tmpdir, debug, progress)
         finally:
             if os.path.exists(out_png):
@@ -2104,8 +2141,9 @@ class SlideDeck(OfficeVariant):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return None
         try:
-            trimmed = Image.open(out_png)
-            trimmed.load()
+            trimmed = _open_screenshot(out_png)
+            if trimmed is None:
+                return None
             if continuous or not self.confident:
                 bounds = [0, trimmed.height]
             else:
@@ -2247,8 +2285,9 @@ class FlowingText(OfficeVariant):
                         )
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
                     return None
-                img = Image.open(out_png)
-                img.load()
+                img = _open_screenshot(out_png)
+                if img is None:
+                    return None
                 trimmed, cut_off = _trim_trailing_blank_rows(img, _sample_background_color(img))
                 if not cut_off or capture_height >= self.OFFICE_MAX_CAPTURE_HEIGHT:
                     break
@@ -2324,18 +2363,86 @@ def is_password_protected_ooxml_or_visio(path: str) -> bool:
         return False
 
 
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Control characters that mustn't reach the terminal as they are: C0
+# (but tab, newline and carriage return), DEL, and the C1 range - a
+# terminal may take U+009B as CSI, say.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
 def _caret_notation(match: re.Match[str]) -> str:
     """"^X" caret notation for one C0 control character or DEL (e.g.
     "\\x0c" (^L) or "\\x1b" (^[)) - XORing the byte with 0x40 maps the
     whole range (0x00-0x1f, plus 0x7f) to the right letter/symbol in one
-    step, the same trick a terminal's own ^-echoing uses."""
-    return "^" + chr(ord(match.group()) ^ 0x40)
+    step, the same trick a terminal's own ^-echoing uses. A C1 one
+    (U+0080-U+009F) has no caret form, so it's shown as its code, "<9B>",
+    as less(1) does."""
+    code = ord(match.group())
+    return f"<{code:02X}>" if code >= 0x80 else "^" + chr(code ^ 0x40)
 
 
-def read_plain_text_lines(path: str, tab_width: int = 8) -> list[str]:
+def display_safe(text: str, tab_width: int = 8) -> str:
+    """`text` made safe to write to the terminal: control characters in
+    caret notation (see _caret_notation()) - so a document can't send
+    escape sequences of its own (setting the clipboard with OSC 52,
+    say) - and tabs expanded, as the renderer's column math knows
+    nothing of tab stops.
+
+    Args:
+        text: text from a document (its extracted text, a title, a file
+            name, ...).
+        tab_width: the tab stops' spacing.
+
+    Returns:
+        The text, as it's to be shown.
+    """
+    if "\t" in text:
+        text = text.expandtabs(tab_width)
+    if _CONTROL_CHAR_RE.search(text):
+        text = _CONTROL_CHAR_RE.sub(_caret_notation, text)
+    return text
+
+
+# What a text file that isn't UTF-8 is tried as, in turn (see
+# read_text_file()): the encodings Japanese text still often comes in.
+_LEGACY_TEXT_ENCODINGS = ("cp932", "euc_jp")
+_PRIVATE_USE_RE = re.compile("[\ue000-\uf8ff]")
+
+
+def read_text_file(path: str, legacy: bool = True) -> str:
+    """A text file's content: as UTF-8 (a BOM dropped), or failing that
+    as each of _LEGACY_TEXT_ENCODINGS (Shift_JIS as Windows writes it,
+    EUC-JP), or failing those as UTF-8 again with whatever doesn't decode
+    shown as U+FFFD - so a file in some other encoding still opens,
+    rather than crashing text mode or being refused.
+
+    Args:
+        path: the file.
+        legacy: whether to try _LEGACY_TEXT_ENCODINGS - not for a
+            Markdown file, which in practice is always UTF-8.
+
+    Returns:
+        Its text.
+
+    Raises:
+        OSError: if it can't be read.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    for encoding in ("utf-8-sig",) + (_LEGACY_TEXT_ENCODINGS if legacy else ()):
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        # Python's cp932 "decodes" bytes Shift_JIS leaves unused (0xFD-
+        # 0xFF, the user-defined rows) into the Private Use Area - taken
+        # as a sign it isn't Shift_JIS at all, which next to never has them.
+        if encoding != "utf-8-sig" and _PRIVATE_USE_RE.search(text):
+            continue
+        return text
+    return data.decode("utf-8", errors="replace")
+
+
+def read_plain_text_lines(path: str, tab_width: int = 8, legacy: bool = True) -> list[str]:
     """A plain text file's lines, as pdftotext -layout's output is for a
     PDF page: ready to hand straight to the existing text-mode renderer.
     Tabs are expanded (there's no terminal-native tab stop handling in
@@ -2348,9 +2455,9 @@ def read_plain_text_lines(path: str, tab_width: int = 8) -> list[str]:
     words, font/color tables, ...) rather than its document text, which
     is exactly what a plain-text sniff/decode check wants. RtfDocument
     is the one that knows to prefer extract_office_text() over this raw
-    markup for actual display - see RtfDocument.extract_text()."""
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
+    markup for actual display - see RtfDocument.extract_text(). Decoded
+    as read_text_file() decodes it (`legacy` being passed on to it)."""
+    content = read_text_file(path, legacy)
     content = content.expandtabs(tab_width)
     content = _CONTROL_CHAR_RE.sub(_caret_notation, content)
     return content.splitlines()
@@ -3682,18 +3789,30 @@ class PdfDocument(DocumentHandler):
         # zlib compression would be pure overhead - and it's most of
         # pdftoppm's run time (e.g. ~700ms of ~770ms for a 1600px-wide
         # page), far more than writing/reading the bigger raw file.
-        prefix = os.path.join(cache.tmpdir, f"page-{page}-{round(dpi)}")
-        run_subprocess(
-            [
-                "pdftoppm", *self._password_args(self.password), "-r", str(dpi),
-                "-f", str(page), "-l", str(page),
-                "-singlefile", self.path, prefix,
-            ],
-            check=True,
-        )
-        img = Image.open(prefix + ".ppm")
-        img.load()
-        os.unlink(prefix + ".ppm")
+        #
+        # Into a directory of its own: renders run on more than one thread
+        # (the page prefetch, the thumbnails) and for more than one file
+        # (a prefetch for the one just left can still be running), and
+        # one named for the page and DPI alone would have two of them
+        # writing - and reading back - the same file.
+        workdir = tempfile.mkdtemp(prefix="page-", dir=cache.tmpdir)
+        prefix = os.path.join(workdir, "page")
+        try:
+            # stderr captured: poppler's warnings about a slightly
+            # malformed PDF ("Syntax Error: ...") would otherwise land
+            # over the page on screen - and it's what a failure says.
+            run_subprocess(
+                [
+                    "pdftoppm", *self._password_args(self.password), "-r", str(dpi),
+                    "-f", str(page), "-l", str(page),
+                    "-singlefile", self.path, prefix,
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            img = Image.open(prefix + ".ppm")
+            img.load()
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
         cache._store(key, img)
         return img
@@ -3953,9 +4072,12 @@ class _RawTextView:
     (and over RenderedDocument's PDF-delegating ones)."""
 
     path: str  # set by the DocumentHandler it's mixed into
+    # Whether the file may be in a legacy encoding (see read_text_file())
+    # - not a Markdown file, which in practice is always UTF-8.
+    _legacy_encodings = True
 
     def extract_text(self, page: int) -> list[str]:
-        return read_plain_text_lines(self.path)
+        return read_plain_text_lines(self.path, legacy=self._legacy_encodings)
 
     def text_mode_is_paginated(self) -> bool:
         return False
@@ -3978,12 +4100,10 @@ class TextDocument(_RawTextView, DocumentHandler):
 
     @classmethod
     def sniff(cls, path: str, tmpdir: str, debug: bool = False) -> TextDocument | None:
+        # (No need to read it all to see that it decodes: read_text_file()
+        # takes any encoding, one way or another.)
         if not is_probably_text(path):
             return None
-        try:
-            read_plain_text_lines(path)  # just to validate it decodes
-        except Exception as e:
-            raise UnusableFile(f"not valid UTF-8 text ({e})") from e
         return cls(path)
 
     def page_count(self) -> int:
@@ -4964,13 +5084,13 @@ class SvgDocument(RenderedDocument):
         build_pages()), which needs the image at its own natural size
         instead."""
         style = f"width:{width}px;height:{height}px;" if width and height else ""
-        html = (
+        page = (
             "<!DOCTYPE html><html><head></head><body style=\"margin:0\">"
             f'<img id="svg" style="display:block;{style}" '
-            f'src="file://{os.path.abspath(svg_path)}"></body></html>'
+            f'src="{html.escape(_file_url(svg_path))}"></body></html>'
         )
         with open(wrapper_path, "w", encoding="utf-8") as f:
-            f.write(html)
+            f.write(page)
 
 
 # A fenced code block's opening/closing line (``` or ~~~), an ATX
@@ -5050,6 +5170,7 @@ class MarkdownDocument(_RawTextView, RenderedDocument):
     _Search.uses_text_lines())."""
 
     _MARKDOWN_EXTENSIONS = (".md", ".markdown")
+    _legacy_encodings = False  # read as UTF-8 only - see _RawTextView
 
     # Minimal styling for the rendered pages - just enough that
     # headings/code/quotes are visually distinct, deliberately not
@@ -5176,8 +5297,7 @@ img { max-width: 100%; height: auto; }
         from weasyprint import HTML
 
         try:
-            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
-                source = f.read()
+            source = read_text_file(self.path, legacy=False)  # as text mode reads it
         except OSError:
             return False
         body = markdown.markdown(source, extensions=["extra", "sane_lists"])
@@ -5303,6 +5423,21 @@ class RawTerminal:
 # ispeed, ospeed, cc] - tty.LFLAG/tty.CC spell these out, but only since
 # Python 3.12 (pdfless supports 3.9+, see its shebang), hence these.
 _TC_LFLAG, _TC_CC = 3, 6
+
+
+def _file_url(path: str) -> str:
+    """A file:// URL for `path`, percent-encoded - a file name with "#",
+    "?" or "%" in it (they go into the Quick Look preview's own path, see
+    OfficeDocument._generate_ql_preview()) otherwise reads to Chrome as
+    a fragment or a query, and the page doesn't load at all.
+
+    Args:
+        path: the file, relative or absolute.
+
+    Returns:
+        The URL.
+    """
+    return pathlib.Path(os.path.abspath(path)).as_uri()
 
 
 def run_subprocess(
@@ -6249,7 +6384,7 @@ class _Overlays:
         each entry's title indented by its level, with its page number
         (if it has one) flush right."""
         return [
-            ("  " * e["level"] + e["title"], str(e["page"]) if e["page"] is not None else "")
+            ("  " * e["level"] + display_safe(e["title"]), str(e["page"]) if e["page"] is not None else "")
             for e in self._ensure_outline()
         ]
 
@@ -6337,7 +6472,7 @@ class _Overlays:
                 name = "(stdin)"  # see _capture_stdin()
             else:
                 name = os.path.relpath(path)
-            rows.append(("* " if i == viewer.file_index else "  ", name, str(i + 1)))
+            rows.append(("* " if i == viewer.file_index else "  ", display_safe(name), str(i + 1)))
         # How wide the box gets for the whole paths (capped by the
         # terminal's width) - then each path cut to fit in it beside
         # its mark and number, and a space before the number.
@@ -6931,6 +7066,12 @@ class _Links:
         self.index: list[dict[str, Any]] | None = None
         self.back: list[tuple[int, int, int]] = []
         self.forward: list[tuple[int, int, int]] = []
+
+    def forget_index(self) -> None:
+        """Drop the links (they're read again on the next click), keeping
+        the history - for a reload of the same file (see Viewer.reload()),
+        whose pages, and links, may have changed."""
+        self.index = None
 
     def reset(self) -> None:
         """Drop the links and the history, for a switch to another file."""
@@ -8133,6 +8274,18 @@ class Viewer:
                 self.draw_status(boundary_message)
                 return
             index += step
+        if self._copy_mode_saved is not None:
+            # Copy mode ("C", or "T") belongs to the file it was turned on
+            # in: put back what it hid, as exit_text_mode() would, rather
+            # than carry it (and the stale values to restore) over - the
+            # next file's own defaults for the border/wrap follow below.
+            scrollbar = self.scrollbar
+            (
+                self.eol_mark, self.text_border, self.scrollbar, self.line_numbers
+            ) = self._copy_mode_saved
+            self._copy_mode_saved = None
+            if self.scrollbar != scrollbar:
+                self._recompute_geometry()  # its column comes back from the page's width
         self.file_index = index
         self._set_current_file()
         self.encode_cache.clear()
@@ -8963,7 +9116,12 @@ class Viewer:
             # document - fetched once per file and kept (see __init__),
             # since toggling t or c shouldn't have to wait for it again.
             if self._text_pages is None:
-                self._text_pages = self.doc_handler.extract_text_pages(self.npages)
+                pages = self.doc_handler.extract_text_pages(self.npages)
+                # Made safe to show - see display_safe().
+                self._text_pages = (
+                    [[display_safe(line) for line in lines] for lines in pages]
+                    if pages is not None else None
+                )
             if self._text_pages is not None:
                 self._build_continuous_text(self._text_pages)
                 self._display_rows = None
@@ -8982,7 +9140,10 @@ class Viewer:
         # than trying to cache it, since nothing else calls this often
         # enough for that to matter (see enter_text_mode()/reload(),
         # the only other places that ask for this same text).
-        self.text_lines = self.doc_handler.extract_text(self.page) or []
+        # Made safe to show: a PDF's or an Office document's text (via
+        # pdftotext or textutil) can carry escape sequences - see
+        # display_safe().
+        self.text_lines = [display_safe(line) for line in self.doc_handler.extract_text(self.page) or []]
         self._display_rows = None  # stale - built fresh from the new text_lines
         self.text_scroll = 0
         self.text_x_offset = 0
@@ -10124,7 +10285,7 @@ class Viewer:
             # image view's own page count is (a Markdown file rendered
             # to 15 PDF pages is still just its one raw source).
             page, npages = 1, 1
-        segments = [(f" {self.name} ", STATUS_COLOR_FILENAME)]
+        segments = [(f" {display_safe(self.name)} ", STATUS_COLOR_FILENAME)]
         if len(self.files) > 1:
             segments.append((
                 f" file {self.file_index + 1}/{len(self.files)} ",
@@ -10143,7 +10304,9 @@ class Viewer:
     def format_status(self, text: str | None = None) -> str:
         """Return escape sequence for the status line (no write)."""
         if text is not None:
-            status = pad_to_width(truncate_to_width(f" {text} ", self.cols), self.cols)
+            # A message can carry a file name or a document's text (see
+            # display_safe()).
+            status = pad_to_width(truncate_to_width(f" {display_safe(text)} ", self.cols), self.cols)
             return (
                 f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K"
                 f"{status}{SGR_RESET}"
@@ -10350,6 +10513,7 @@ class Viewer:
         self.cache.clear()
         self.sidebar.reset()
         self.search.reset()
+        self.links.forget_index()  # the pages (and their links) may have changed
         self._mode_switch = None
         self._text_pages = None  # stale too - re-extracted on demand
         self.overlays.forget_outline()  # the outline may have changed too
@@ -11236,8 +11400,10 @@ class _KeyDispatcher:
         count and is left for _view_key()."""
         viewer = self.viewer
         # A lone "0" (no pending number) resets the zoom/pan instead of
-        # starting a number entry.
-        if key.isdigit() and not (key == "0" and not self.num_buf):
+        # starting a number entry. ASCII digits only: str.isdigit() takes
+        # "²" (AltGr+2 on a German keyboard) or "①" (an input method) too,
+        # which int() can't read.
+        if key in "0123456789" and len(key) == 1 and not (key == "0" and not self.num_buf):
             self.num_buf += key
             viewer.draw_status(f"number: {self.num_buf}")
             return True

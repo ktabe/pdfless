@@ -204,3 +204,21 @@ def test_ensure_homebrew_lib_path_is_a_noop_off_macos(monkeypatch):
     pdfless.MarkdownDocument._ensure_homebrew_lib_path_for_weasyprint()
 
     assert "DYLD_FALLBACK_LIBRARY_PATH" not in pdfless.os.environ
+
+
+@requires_markdown_rendering
+def test_a_markdown_file_that_isnt_utf8_still_has_a_text_mode(tmp_path):
+    """Regression test: text mode read the source as strict UTF-8, so a
+    README in some other encoding rendered fine (that read replaced what
+    didn't decode) but crashed pdfless on t - and on o, for its headings.
+    Markdown is read as UTF-8 only (no Shift_JIS/EUC-JP guessing, as for
+    a plain text file), what doesn't decode shown as U+FFFD."""
+    path = tmp_path / "readme.md"
+    path.write_bytes("# Caf\u00e9\n\nBody.\n\n## Next\n".encode("latin-1"))
+    handler = classify(str(path), tmp_path)
+    assert isinstance(handler, pdfless.MarkdownDocument)
+    assert handler.extract_text(1)[0] == "# Caf\ufffd"
+    assert handler.heading_lines() == [0, 4]
+    sjis = tmp_path / "sjis.md"
+    sjis.write_bytes("# 見出し\n".encode("cp932"))
+    assert "見出し" not in classify(str(sjis), tmp_path).extract_text(1)[0]
