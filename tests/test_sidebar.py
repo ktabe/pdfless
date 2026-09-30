@@ -202,3 +202,67 @@ def test_clicking_and_dragging_its_scrollbar_scroll_it_alone(sample_pdf, monkeyp
     assert (viewer.page, viewer.scroll) == (1, 0)  # the page itself never moved
     viewer.mouse.handle("MOUSE_DRAG", bar, avail)  # no longer following
     assert viewer.sidebar.first == 1
+
+
+def test_t_while_picking_goes_to_the_picked_page_in_text_mode(sample_pdf, monkeypatch):
+    viewer = make_viewer(sample_pdf, monkeypatch, sidebar=False)
+    d = pdfless._KeyDispatcher(viewer, -1, [], keep=False)
+    d.handle("S")
+    d.handle("j")
+    d.handle("t")
+    assert viewer.text_mode and viewer.page == 2
+    assert not viewer.sidebar.picking
+
+
+def test_nothing_is_drawn_while_the_prompt_takes_input(sample_pdf, monkeypatch, capsys):
+    """Drawing would move the cursor away from the search prompt (and an
+    input method's composition window with it)."""
+    viewer = make_viewer(sample_pdf, monkeypatch)
+    capsys.readouterr()
+    viewer.sidebar.poll(prompt_open=True)  # starts rendering, draws nothing
+    assert viewer.sidebar._thread is not None
+    viewer.sidebar._thread.join(20)
+    viewer.sidebar.poll(prompt_open=True)
+    assert capsys.readouterr().out == ""
+    viewer.sidebar.poll()  # the prompt closed
+    assert "\x1b]1337;File=" in capsys.readouterr().out
+
+
+def test_picking_ends_when_the_column_goes(sample_pdf, monkeypatch):
+    viewer = make_viewer(sample_pdf, monkeypatch, sidebar=False)
+    d = pdfless._KeyDispatcher(viewer, -1, [], keep=False)
+    d.handle("S")
+    viewer.cols = pdfless.SIDEBAR_MIN_TERM_COLS - 1  # the terminal was narrowed
+    d.handle("n")  # a page key again, not a pick
+    assert not viewer.sidebar.picking and viewer.page == 2
+    d.handle("S")  # on but not shown: says why, and turns it off
+    assert viewer.sidebar.on is False
+
+
+def test_turning_a_page_redraws_the_frame_not_the_thumbnails(sample_pdf, monkeypatch):
+    viewer = make_viewer(sample_pdf, monkeypatch)
+    render_thumbnails(viewer)
+    assert "\x1b]1337;File=" in viewer.sidebar.escapes(full=True)
+    viewer.page = 2  # still in view (the first two slots)
+    marks = viewer.sidebar.escapes(full=False)
+    assert "━ 2 ━" in marks and "\x1b]1337;File=" not in marks
+
+
+def test_only_so_many_thumbnails_are_kept(sample_pdf, monkeypatch):
+    monkeypatch.setattr(pdfless, "SIDEBAR_KEPT_THUMBNAILS", 3)
+    viewer = make_viewer(sample_pdf, monkeypatch)
+    sidebar = viewer.sidebar
+    for page in range(1, 8):
+        sidebar._images[(page, 100)] = None
+        sidebar._encoded[(page, 100, 50)] = (b"", 1, 1)
+    sidebar._forget_old(range(6, 8), 100)
+    assert list(sidebar._images) == [(5, 100), (6, 100), (7, 100)]  # the newest, those in view kept
+    assert {k[0] for k in sidebar._encoded} == {5, 6, 7}
+
+
+def test_the_thumbnail_cache_lets_go_of_full_size_images(sample_image, tmp_path):
+    cache = pdfless.PageCache(str(tmp_path), pdfless.ImageDocument(sample_image))
+    cache.get(1, 50, "width")
+    assert cache._native_images
+    cache.forget_native(1)
+    assert not cache._native_images

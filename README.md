@@ -238,7 +238,7 @@ plain images and previews without extractable text. While a search is active,
 | `C` | Toggle a clean text display for copying, restoring previous settings on the second press. |
 | `c` | Toggle continuous view (`-c`/`--continuous`) in image or text mode while keeping the current position. |
 | `r` | Toggle the scrollbar (shown by default). |
-| `S` | Show page thumbnails down the left edge (image mode, in a terminal at least 60 columns wide), ready to pick one: move with `j`/`k`, press `ENTER` to go to that page, or `q` to leave the thumbnails up and go back to the page. With the thumbnails up, `S` picks again; while picking, `S` closes them. The page being viewed is framed. Clicking a thumbnail also goes to its page; the mouse wheel over them, or their own scrollbar on the right of them, scrolls them. |
+| `S` | Show page thumbnails down the left edge (image mode, in a terminal at least 60 columns wide), ready to pick one: move with `j`/`k`, press `ENTER` to go to that page (`t`/`T`: in text mode), or `q` to leave the thumbnails up and go back to the page. With the thumbnails up, `S` picks again; while picking, `S` closes them. The page being viewed is framed. Clicking a thumbnail also goes to its page; the mouse wheel over them, or their own scrollbar on the right of them, scrolls them. |
 | `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-f`/`--follow` is specified. |
 | Click a PDF link | Open a URL in the system browser or follow an internal link. |
 | `[` / `]` | Go back / forward through the positions internal links and the table of contents (`o`) jumped from. |

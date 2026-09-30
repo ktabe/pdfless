@@ -179,6 +179,7 @@ SCROLLBAR_THUMB = "\x1b[48;2;131;204;210m \x1b[0m"  # #83ccd2, light teal
 # thumbnail has its page number under it.
 SIDEBAR_COLS = 20
 SIDEBAR_MIN_TERM_COLS = 60
+SIDEBAR_KEPT_THUMBNAILS = 64  # rendered ones kept, beyond those in view
 SIDEBAR_FRAME_COLOR = "\x1b[38;2;238;160;45m"  # amber
 # The thumbnail picked while choosing one with the keys (see
 # _Sidebar.handle_key()) - the scrollbar thumb's teal.
@@ -472,8 +473,8 @@ Keys:
   r                       toggle the scrollbar
   S                       page thumbnails down the left edge (image
                           mode): pick one with j/k and go to its page
-                          with ENTER (or click one), q to leave them up,
-                          S again to close them
+                          with ENTER (t/T: in text mode) or click one;
+                          q to leave them up, S again to close them
   F                       toggle follow mode (auto-reload on file change)
                         <MISCELLANEOUS COMMANDS>
   v                       open the file in its own app (macOS only) and
@@ -5829,6 +5830,14 @@ class PageCache:
         get()) started after the latest clear(). Call with _lock held."""
         return getattr(self._render_generation, "value", self._generation) == self._generation
 
+    def forget_native(self, page: int) -> None:
+        """Drop `page`'s natively-loaded image (see _store_native()), for
+        a cache that only needs what was made from it - the sidebar's
+        thumbnails (see _Sidebar._render()) - so it isn't kept at full
+        size for every page scrolled past."""
+        with self._lock:
+            self._native_images.pop(page, None)
+
     def _store_native(self, page: int, img: Image.Image) -> None:
         """Remember `page`'s natively-loaded image (see
         DocumentHandler._native_page_image()) - unless, like _store(),
@@ -5976,7 +5985,8 @@ class _Overlays:
     def _box(
         self, lines: list[tuple[str, str]], min_w: int = 0
     ) -> tuple[int, int, int, int]:
-        """Where a boxed overlay (the help, the table of contents) goes:
+        """Where a boxed overlay (the help, the table of contents, the
+        file list) goes:
         centered over the page, above the status bar, wide enough for its
         longest line but shrunk to fit the terminal - for draw_box() and
         for the callers' own scrolling and click hit-testing.
@@ -7060,8 +7070,10 @@ class _Mouse:
     reporting off so the terminal's own text selection works): a click
     on the scrollbar jumps there and dragging it follows the pointer, a
     click on a link follows it (see _Links), the wheel scrolls, and the
-    back/forward buttons walk the jump history. While the help or the
-    table of contents is up, it takes every event instead.
+    back/forward buttons walk the jump history. While a box is up over
+    the page (the help, the table of contents, the file list), it takes
+    every event instead, and over the page thumbnails, they take the
+    clicks and the wheel (see _Sidebar.handle_mouse()).
 
     Attributes:
         viewer: the Viewer the events act on.
@@ -7364,21 +7376,33 @@ class _Sidebar:
         box_h_px = thumb_rows * viewer.cell_h_px
         ready = tuple(p for p in pages if (p, thumb_w_px) in self._images)
         framed = self.picked if self.picking else viewer.page
-        state = (self.first, viewer.page, framed, self.picking, thumb_w_px, thumb_rows, viewer.rows, ready)
-        if not full and state == self._drawn:
+        # What the thumbnails depend on, and what the frame and numbers
+        # around them do: turning a page (or moving the pick) only
+        # changes the latter, which never overlap a thumbnail's cells -
+        # so the thumbnails aren't sent again for it.
+        images = (self.first, thumb_w_px, thumb_rows, viewer.rows, ready)
+        marks = (viewer.page, framed, self.picking)
+        if not full and (images, marks) == self._drawn:
             return ""
-        self._drawn = state
+        redraw_images = full or self._drawn is None or self._drawn[0] != images
+        self._drawn = (images, marks)
 
         out = [SGR_RESET]
         width = cols - 1  # the slots', left of the separator
         bar = self._scrollbar_cells(slots)
         for row in range(1, max(1, viewer.rows - 1) + 1):
             # Erase the slots' cells (a thumbnail left from a scroll
-            # included), then the scrollbar's (or separator's).
-            out.append(f"\x1b[{row};1H\x1b[{width}X\x1b[{row};{cols}H{bar[row - 1]}")
+            # included) - or, keeping the thumbnails, just the frame's
+            # and numbers' rows and columns - then draw the scrollbar's
+            # (or separator's).
+            if redraw_images or (row - 1) % slot_rows in (0, slot_rows - 1):
+                out.append(f"\x1b[{row};1H\x1b[{width}X")
+            else:
+                out.append(f"\x1b[{row};1H \x1b[{row};{width}H ")
+            out.append(f"\x1b[{row};{cols}H{bar[row - 1]}")
         for i, page in enumerate(pages):
             top = 1 + i * slot_rows  # the frame's top edge
-            thumb = self._thumbnail(page, thumb_w_px, box_h_px)
+            thumb = self._thumbnail(page, thumb_w_px, box_h_px) if redraw_images else None
             if thumb is not None:
                 data, w, h = thumb
                 # Centered in its slot, by whole cells.
@@ -7436,15 +7460,25 @@ class _Sidebar:
             sys.stdout.write(SYNC_BEGIN + drawn + SYNC_END)
             sys.stdout.flush()
 
-    def poll(self) -> None:
+    def poll(self, prompt_open: bool = False) -> None:
         """run_viewer()'s every pass: draw the thumbnails the rendering
         thread has finished, and start it on the ones the column shows
         that aren't rendered yet. Nothing while the column isn't up, or
         something else has the screen (text mode, a box over the page, a
-        missing file)."""
+        missing file).
+
+        Args:
+            prompt_open: whether the status line is taking input (the
+                search prompt, a ":"/"-" prefix) - drawing then waits,
+                as it would move the cursor away from the prompt (and an
+                input method's composition window with it)."""
         viewer = self.viewer
         if (not self.columns() or viewer.text_mode or viewer.file_missing
                 or viewer.overlays.active is not None or viewer.img is None):
+            return
+        if prompt_open:
+            if self._thread is None or not self._thread.is_alive():
+                self._start_rendering()
             return
         if self._drag_row is not None:  # the last of a burst of drag events
             row, self._drag_row = self._drag_row, None
@@ -7457,9 +7491,19 @@ class _Sidebar:
                 sys.stdout.flush()
         if self._thread is not None and self._thread.is_alive():
             return
+        self._start_rendering()
+
+    def _start_rendering(self) -> None:
+        """Start the rendering thread (see _render()) on the thumbnails
+        the column shows that aren't rendered yet, if any - with no
+        thread running, so it's also the moment to let go of ones long
+        scrolled past (see SIDEBAR_KEPT_THUMBNAILS)."""
+        viewer = self.viewer
         thumb_w_px, _thumb_rows, _slot_rows, slots = self._layout()
         self._follow(slots)
-        missing = [p for p in self._visible_pages(slots) if (p, thumb_w_px) not in self._images]
+        visible = self._visible_pages(slots)
+        self._forget_old(visible, thumb_w_px)
+        missing = [p for p in visible if (p, thumb_w_px) not in self._images]
         if not missing:
             return
         if self._cache is None:
@@ -7469,6 +7513,32 @@ class _Sidebar:
             name="pdfless-thumbnails", daemon=True,
         )
         self._thread.start()
+
+    def _forget_old(self, visible: range, thumb_w_px: int) -> None:
+        """Keep at most SIDEBAR_KEPT_THUMBNAILS rendered thumbnails (and
+        their encodings), the first-rendered going first - never the
+        ones in view - so scrolling through a long document doesn't
+        hold on to all of it. Only called with no rendering thread
+        running (see _start_rendering()), which fills the same dict.
+
+        Args:
+            visible: the pages in view.
+            thumb_w_px: the thumbnails' width now.
+        """
+        excess = len(self._images) - SIDEBAR_KEPT_THUMBNAILS
+        if excess <= 0:
+            return
+        for key in list(self._images):
+            if excess <= 0:
+                break
+            page, width = key
+            if width == thumb_w_px and page in visible:
+                continue
+            del self._images[key]
+            excess -= 1
+        kept = {page for page, _width in self._images}
+        for encoded in [k for k in self._encoded if k[0] not in kept]:
+            del self._encoded[encoded]
 
     def _render(
         self, cache: PageCache, images: dict[tuple[int, int], Image.Image | None],
@@ -7489,6 +7559,10 @@ class _Sidebar:
                 img: Image.Image | None = cache.get(page, thumb_w_px, "width")
             except BaseException:  # SystemExit too - see die(); no thumbnail then
                 img = None
+            # A page that's an image of its own (an image file, a Quick
+            # Look screenshot) was decoded at full size to make it - the
+            # thumbnail is all that's needed of it here.
+            cache.forget_native(page)
             images[(page, thumb_w_px)] = img
             self._fresh = True
 
@@ -7522,6 +7596,7 @@ class _Sidebar:
         table of contents and the file list (see _Overlays.handle_key()):
 
         - ENTER goes to the picked page, and stops picking;
+        - t or T goes to it in text mode (see Viewer.handle_global_key());
         - q or ESC stops picking, the column staying up; S closes it;
         - ^L (or a focus change) repaints the screen;
         - the usual line/window keys, d/u and g/G/</>/HOME/END move the
@@ -7543,6 +7618,12 @@ class _Sidebar:
             self.stop_picking()
         elif key == "S":
             viewer.toggle_sidebar()
+        elif key in ("t", "T"):
+            # Into text mode (T: cleared for copying) at the picked page.
+            self.picking = False
+            if self.picked != viewer.page:
+                viewer.go_page(self.picked, 0)
+            viewer.handle_global_key(key)
         elif key in ("\x0c", "FOCUS_IN"):
             viewer._invalidate_screen()
             viewer.refresh()
@@ -7832,8 +7913,8 @@ class Viewer:
 
     def request_resize(self) -> None:
         self.resized = True
-        # The help or table-of-contents box's size/position and the
-        # underlying page raster are both stale after a resize; simplest
+        # A box's (the help's, the table of contents', the file list's)
+        # size/position and the underlying page raster are both stale after a resize; simplest
         # is to just drop back to the normal view, which always does a
         # full redraw at the new size.
         self.overlays.active = None
@@ -9085,6 +9166,12 @@ class Viewer:
         sidebar = self.sidebar
         if sidebar.on and not sidebar.picking and not self.text_mode and sidebar.columns():
             sidebar.start_picking()
+            return
+        if sidebar.on and not sidebar.columns():
+            # On, but the terminal has been narrowed since: say why
+            # there's nothing to see, rather than just turning it off.
+            sidebar.on = sidebar.picking = False
+            self.draw_status("page thumbnails off (too narrow a terminal to show them)")
             return
         sidebar.picking = False
         sidebar.on = not sidebar.on
@@ -11048,8 +11135,11 @@ class _KeyDispatcher:
             viewer.overlays.handle_key(key)
             return True
         if viewer.sidebar.picking:
-            viewer.sidebar.handle_key(key)
-            return True
+            if viewer.sidebar.columns():
+                viewer.sidebar.handle_key(key)
+                return True
+            # The column went (the terminal was narrowed): so does picking.
+            viewer.sidebar.picking = False
         if viewer.handle_global_key(key):
             return True
         if key == ":" or (key == "-" and viewer.text_mode):
@@ -11231,7 +11321,11 @@ def run_viewer(
     viewer._schedule_prefetch()
     while True:
         viewer._schedule_page_prefetch()
-        viewer.sidebar.poll()  # thumbnails rendered in the background
+        # Thumbnails rendered in the background - drawn once the prompt,
+        # if one is open, isn't taking input any more.
+        viewer.sidebar.poll(
+            prompt_open=dispatcher.search_editor is not None or dispatcher.pending_prefix is not None,
+        )
         r, _, _ = select.select([fd], [], [], 0.3)
         flush_background_debug()  # -d lines from a background prefetch
         viewer.poll_follow()
