@@ -379,6 +379,10 @@ tmux redraws it without the passed-through image. With focus events enabled,
 `pdfless` redraws automatically when you return to the pane. Press `Ctrl-L`
 to redraw manually if needed.
 
+Inside tmux, `pdfless` does not use synchronized output, because tmux would
+redraw each frame's lines and erase the image again. Redrawing can flicker a
+little more than it does outside tmux.
+
 ## Development
 
 Run the test suite:
