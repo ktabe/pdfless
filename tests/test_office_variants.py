@@ -684,3 +684,28 @@ def test_a_render_failure_without_poppler_says_so(sample_md, tmp_path, monkeypat
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 800, 480))
     pdfless.Viewer([handler], 0, 1, str(tmp_path), slave, "width")
     assert messages and "poppler's pdftoppm" in messages[0]
+
+
+@requires_office_support
+def test_quick_look_runs_once_for_the_probe_and_the_render(sample_twoslide_key, tmp_path, monkeypatch):
+    """sniff()'s probe made a Quick Look preview, and the render made the
+    very same one again - a good part of a second for nothing. It's made
+    again only once the file changes."""
+    import shutil
+    runs = []
+    real = pdfless.run_subprocess
+
+    def spy(args, **kwargs):
+        if args and args[0] == "qlmanage":
+            runs.append(args)
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(pdfless, "run_subprocess", spy)
+    path = tmp_path / "deck.key"
+    shutil.copy(sample_twoslide_key, path)
+    handler = pdfless._sniff_file(str(path), str(tmp_path))
+    assert handler.build_pages(str(tmp_path))
+    assert len(runs) == 1
+    os.utime(path, (1_000_000, 1_000_000))  # "changed"
+    assert pdfless.OfficeDocument._generate_ql_preview(str(path), str(tmp_path))
+    assert len(runs) == 2

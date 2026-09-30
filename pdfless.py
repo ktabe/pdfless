@@ -3700,8 +3700,9 @@ class PdfDocument(DocumentHandler):
             found: dict[tuple[int, int], tuple[float, float, float, float]] = {}
             for view in views:
                 order = view.get("order")
+                starts = [w[0] for w in view["words"]]
                 for pos, match_end in PdfDocument._view_spans(pattern, view, across_lines):
-                    hit = PdfDocument._match_box(view["words"], pos, match_end)
+                    hit = PdfDocument._match_box(view["words"], pos, match_end, starts)
                     if hit is None:
                         continue  # a line break (see _gap_box())
                     word_idx, local_start, box = hit
@@ -3745,23 +3746,38 @@ class PdfDocument(DocumentHandler):
     @staticmethod
     def _match_box(
         words: list[tuple[int, int, float, float, float, float]], pos: int, match_end: int,
+        starts: list[int] | None = None,
     ) -> tuple[int, int, tuple[float, float, float, float]] | None:
         """Where a match at text[pos:match_end] is on the page.
 
         Args:
             words: the (start, end, xMin, yMin, xMax, yMax) of each word
-                in the text searched.
+                in the text searched - in order, as the text is.
             pos, match_end: the match's offsets in that text.
+            starts: each word's start (words[i][0]) - passed in when
+                there are many matches to box on the same page, rather
+                than made again for every one.
 
         Returns:
             (index of the first word it touches, its offset in that word,
             (xMin, yMin, xMax, yMax) - the union of every word it
             touches), or - touching no word at all - _gap_box().
         """
+        if starts is None:
+            starts = [w[0] for w in words]
         box = None
         first = None
-        for word_idx, (word_start, word_end, xmin, ymin, xmax, ymax) in enumerate(words):
-            if word_start < match_end and word_end > pos:
+        # Only the words from the one the match starts in (or the one
+        # before it, for a match in the space after a word) - the words
+        # are in text order, so bisect finds it, rather than a walk over
+        # the whole page for every match (a common letter on a page of
+        # a thousand words is a thousand matches).
+        begin = max(0, bisect.bisect_right(starts, pos) - 1)
+        for word_idx in range(begin, len(words)):
+            word_start, word_end, xmin, ymin, xmax, ymax = words[word_idx]
+            if word_start >= match_end:
+                break
+            if word_end > pos:
                 # poppler often lumps a whole run of CJK text (with no
                 # spaces to split on) into a single <word>, sometimes
                 # spanning most of a line. Highlighting that whole word
@@ -3784,12 +3800,13 @@ class PdfDocument(DocumentHandler):
                     box[2] = max(box[2], sub_xmax)
                     box[3] = max(box[3], ymax)
         if box is None or first is None:
-            return PdfDocument._gap_box(words, pos, match_end)
+            return PdfDocument._gap_box(words, pos, match_end, starts)
         return first[0], first[1], (box[0], box[1], box[2], box[3])
 
     @staticmethod
     def _gap_box(
         words: list[tuple[int, int, float, float, float, float]], pos: int, match_end: int,
+        starts: list[int] | None = None,
     ) -> tuple[int, int, tuple[float, float, float, float]] | None:
         """_match_box() for a match that touches no word: only the space
         joining two words (a search for " "), which isn't in the PDF
@@ -3797,14 +3814,16 @@ class PdfDocument(DocumentHandler):
         the same printed line.
 
         Args:
-            words, pos, match_end: as for _match_box().
+            words, pos, match_end, starts: as for _match_box().
 
         Returns:
             (index of the word after the gap, -1 - so it sorts ahead of
             any match inside that word, (xMin, yMin, xMax, yMax) of the
             gap), or None if the gap is a line break.
         """
-        k = bisect.bisect_right([w[0] for w in words], pos)  # the first word after it
+        if starts is None:
+            starts = [w[0] for w in words]
+        k = bisect.bisect_right(starts, pos)  # the first word after it
         if not 0 < k < len(words) or not (words[k - 1][1] <= pos and match_end <= words[k][0]):
             return None
         _s, _e, _xmin, p_ymin, p_xmax, p_ymax = words[k - 1]
@@ -4465,6 +4484,12 @@ class RenderedDocument(DocumentHandler):
         return super().get_page_image(cache, page, target_px, fit)
 
 
+# Quick Look previews made this session (see
+# OfficeDocument._generate_ql_preview()), by (file, scratch directory):
+# the file's stamp when made (see _source_stamp()), and the preview.
+_QL_PREVIEWS: dict[tuple[str, str], tuple[str, tuple[str, int | None, int | None, bool, str | None]]] = {}
+
+
 class OfficeDocument(RenderedDocument):
     """Anything this Mac's Quick Look generators can preview (Word,
     Excel, PowerPoint, Keynote, Pages, ...) via qlmanage + a local
@@ -4535,6 +4560,15 @@ class OfficeDocument(RenderedDocument):
         here (no Preview.html either way)."""
         if shutil.which("qlmanage") is None:
             return None
+        # The one made for this very file, unchanged since, if there is
+        # one: sniff()'s probe (see _probe_preview()) makes it, and the
+        # render right after wants the same - qlmanage takes a good part
+        # of a second each time.
+        memo_key = (os.path.abspath(path), tmpdir)
+        stamp = _source_stamp(path)
+        memo = _QL_PREVIEWS.get(memo_key)
+        if memo is not None and memo[0] == stamp and os.path.isfile(memo[1][0]):
+            return memo[1]
         outdir = tempfile.mkdtemp(dir=tmpdir, prefix="qlpreview-")
         name = os.path.basename(path)
         try:
@@ -4581,7 +4615,10 @@ class OfficeDocument(RenderedDocument):
             page_element_xpath = props.get("PageElementXPath") or None
         except (OSError, ValueError):
             pass
-        return html_path, width, height, should_not_scale, page_element_xpath
+        preview = (html_path, width, height, should_not_scale, page_element_xpath)
+        if stamp is not None:
+            _QL_PREVIEWS[memo_key] = (stamp, preview)
+        return preview
 
     @staticmethod
     def _probe_preview(path: str, tmpdir: str, debug: bool = False) -> bool:
@@ -6753,7 +6790,7 @@ class _Search:
             self.index = self.viewer.doc_handler.build_search_index()
         return self.index
 
-    def start(self, query: str, backward: bool = False, multiline: bool = False) -> None:
+    def start(self, query: str, backward: bool = False, multiline: bool = False) -> bool:
         """Search the whole document for `query` and jump to one match -
         which one depends on where you are now and on `backward`, i.e.
         on whether the prompt was opened with "?" rather than "/" (see
@@ -6761,9 +6798,13 @@ class _Search:
         regardless of the direction this started in. `multiline` (^T at
         the prompt) lets a regex match across line breaks, as a literal
         query always may - see find_all_text_matches() and
-        PdfDocument.find_search_matches()."""
+        PdfDocument.find_search_matches().
+
+        Returns:
+            Whether it went to a match (and so redrew the view) - False
+            if there's none, having only said so on the status line."""
         if not query:
-            return
+            return False
         self.query = query
         self.multiline = multiline
         if self.uses_text_lines():
@@ -6775,14 +6816,14 @@ class _Search:
             if not self.matches:
                 self.pos = None
                 self.viewer.draw_status(f'"{query}" not found')
-                return
+                return False
             # Positions are raw line indices, so "here" has to be one
             # too - text_scroll itself counts display rows while the
             # text is wrapped (see Viewer._top_text_line()).
             self.go_to_match(self._match_index_from(
                 [m[0] for m in self.matches], self.viewer._top_text_line(), backward,
             ))
-            return
+            return True
 
         self.ensure_index()
         self.matches = (
@@ -6792,13 +6833,14 @@ class _Search:
         if not self.matches:
             self.pos = None
             self.viewer.draw_status(f'"{query}" not found')
-            return
+            return False
         # A paginated document's matches are only ordered down to the
         # page they're on, so that's the unit the starting point is
         # measured in too.
         self.go_to_match(self._match_index_from(
             [m[0] for m in self.matches], self.viewer.page, backward,
         ))
+        return True
 
     def repeat(self, forward: bool) -> None:
         if not self.matches:
@@ -8090,6 +8132,10 @@ class Viewer:
         # "in text mode", the same rendering PDF's `t` key switches to.
         self.text_mode = self.doc_handler.starts_in_text_mode()
         self.text_lines: list[str] = []
+        # The widest line of text_lines, and the list it was measured for
+        # - see _clamp_text_scroll().
+        self._text_widest = 0
+        self._text_widths_of: list[str] | None = None
         self.text_scroll = 0
         self.text_scroll_min = 0
         self.text_scroll_max = 0
@@ -8105,6 +8151,7 @@ class Viewer:
         # instead of panning across them (h/l/H/L) - see
         # _default_text_wrap(); no border while wrapped (see
         # _draw_text_wrapped()), regardless of text_border
+        self._line_rows: list[int] = []  # built alongside _display_rows - see _ensure_display_rows()
         self._display_rows: list[tuple[int, int, int]] | None = None  # lazily built by _ensure_display_rows(),
         # only while text_wrap is on - [(line_idx, start, end), ...], one
         # entry per on-screen row
@@ -9008,12 +9055,13 @@ class Viewer:
             self.search.query if self.doc_handler.search_resets_on_text_mode_toggle() else None
         )
         self._load_text_page()
+        redrawn = False  # (see _redraw_after_switch())
         if reindex_query:
             # image mode and text mode search different extractions here
             # (see search_resets_on_text_mode_toggle()) - the match object
             # itself can't carry over, so re-run the same query against
             # this mode's own text instead, landing on the nearest hit.
-            self.search.start(reindex_query)
+            redrawn = self.search.start(reindex_query)
         else:
             # If there's a search match highlighted/boxed on this same
             # page, follow it across into text mode too, scrolled into
@@ -9033,7 +9081,7 @@ class Viewer:
                 line = self._text_line_for_image_point(*reading)
                 if line is not None:
                     self._scroll_text_to_row(self._text_row_for_line(line))
-        self.refresh()
+        self._redraw_after_switch(reindex_query, redrawn)
         self._mode_switch = (self._view_spot(), (left[1], left[2]))
         return True
 
@@ -9071,12 +9119,13 @@ class Viewer:
         )
         self.scroll = 0
         self._load_page()
+        redrawn = False  # (see _redraw_after_switch())
         if reindex_query:
             # Symmetric with enter_text_mode(): the two modes search
             # different extractions here, so re-run the same query
             # against image mode's own (bbox) index instead of trying to
             # carry the match object across.
-            self.search.start(reindex_query)
+            redrawn = self.search.start(reindex_query)
         else:
             # Symmetric with enter_text_mode(): carry a highlighted match
             # back into the box marker on the rendered page.
@@ -9093,8 +9142,26 @@ class Viewer:
             elif reading is not None:
                 # Otherwise, the same place text mode was showing.
                 self._show_image_at(*reading)
-        self.refresh()
+        self._redraw_after_switch(reindex_query, redrawn)
         self._mode_switch = (self._view_spot(), (left[1], left[2]))
+
+    def _redraw_after_switch(self, reindex_query: str | None, redrawn: bool) -> None:
+        """The end of a `t`: draw the view in its new mode - unless a
+        search run again there (see search_resets_on_text_mode_toggle())
+        already did, going to a match: drawing again would only repeat
+        it, and put the normal status line over its "match i/N". A search
+        that found nothing did draw its "not found" - which the drawing
+        covers, so it's said again.
+
+        Args:
+            reindex_query: the query run again, or None.
+            redrawn: whether that went to a match (see _Search.start()).
+        """
+        if redrawn:
+            return
+        self.refresh()
+        if reindex_query:
+            self.draw_status(f'"{reindex_query}" not found')
 
     def _view_spot(self) -> tuple[bool, int, int]:
         """Where the view is: the mode, the page, and how far it's
@@ -9213,10 +9280,9 @@ class Viewer:
         if not last:
             return self._row_for_line(line_idx)
         rows = self._ensure_display_rows()
-        row = self._row_for_line(line_idx)
-        while row + 1 < len(rows) and rows[row + 1][0] == line_idx:
-            row += 1
-        return row
+        if 0 <= line_idx < len(self._line_rows) - 1:
+            return self._line_rows[line_idx + 1] - 1
+        return max(0, len(rows) - 1)
 
     def _text_page_top_row(self, page: int) -> int:
         """Where to scroll to put `page`'s top at the top of the screen
@@ -9622,9 +9688,13 @@ class Viewer:
         # The -N gutter (if on) lives outside this space entirely - see
         # _draw_text_unwrapped() - so the "page" is narrower by that much.
         avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
-        self.text_max_line_width = max(
-            (display_width(l) for l in self.text_lines), default=0
-        )
+        # Measured once per text_lines (a new list whenever it's loaded):
+        # this runs on every toggle and resize, and a big file's every
+        # line took most of a second each time.
+        if self._text_widths_of is not self.text_lines:
+            self._text_widest = max((display_width(l) for l in self.text_lines), default=0)
+            self._text_widths_of = self.text_lines
+        self.text_max_line_width = self._text_widest
         if self.eol_mark:
             # Otherwise the widest line's own marker (see
             # _draw_text_unwrapped()) would have nowhere to go without
@@ -9798,9 +9868,8 @@ class Viewer:
         highlighting, <N>g) target the right scroll position once
         wrapping has split that line across one or more screen rows."""
         rows = self._ensure_display_rows()
-        for row, (li, _start, _end) in enumerate(rows):
-            if li == line_idx:
-                return row
+        if 0 <= line_idx < len(self._line_rows) - 1:
+            return self._line_rows[line_idx]
         return max(0, len(rows) - 1)
 
     @staticmethod
@@ -9815,18 +9884,29 @@ class Viewer:
         width = max(1, width)
         if not line:
             return [(0, 0)]
+        n = len(line)
+        if line.isascii():
+            # Every character one column (text mode's lines have no
+            # control characters left - see display_safe()): fixed-width
+            # pieces, no measuring at all.
+            return [(start, min(start + width, n)) for start in range(0, n, width)]
+        if sum(map(char_width, line)) <= width:
+            return [(0, n)]  # most lines: one row, measured in one go
+        # Walked by index, a column count carried along - not measuring
+        # the rest of the line afresh for every row, which on a line
+        # megabytes long (minified JSON, say) took seconds.
         segments = []
         start = 0
-        n = len(line)
-        while start < n:
-            piece = truncate_to_width(line[start:], width)
-            if not piece:
-                # a single character wider than the whole available
-                # width - it still has to go somewhere
-                piece = line[start:start + 1]
-            end = start + len(piece)
-            segments.append((start, end))
-            start = end
+        used = 0
+        for i, ch in enumerate(line):
+            w = char_width(ch)
+            if used + w > width and i > start:
+                segments.append((start, i))
+                start, used = i, 0
+            used += w
+            # (A single character wider than the whole width still goes
+            # somewhere: it starts a piece, and it alone makes it.)
+        segments.append((start, n))
         return segments
 
     def _ensure_display_rows(self) -> list[tuple[int, int, int]]:
@@ -9848,11 +9928,18 @@ class Viewer:
             - self._line_number_gutter_width()
         )
         width = max(1, width)
-        rows = []
+        rows: list[tuple[int, int, int]] = []
+        # Where each line's rows start (and, last, where they end) - so
+        # finding a line's row (see _row_for_line()) is a lookup rather
+        # than a walk over every row.
+        line_rows = []
         for i, line in enumerate(self.text_lines):
+            line_rows.append(len(rows))
             for start, end in self._wrap_line_segments(line, width):
                 rows.append((i, start, end))
+        line_rows.append(len(rows))
         self._display_rows = rows
+        self._line_rows = line_rows
         return rows
 
     @staticmethod
