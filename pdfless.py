@@ -7541,7 +7541,7 @@ class _Sidebar:
         # (page, width) -> the rendered thumbnail, or None if it failed -
         # filled in by the rendering thread (see poll()).
         self._images: dict[tuple[int, int], Image.Image | None] = {}
-        self._encoded: dict[tuple[int, int, int], tuple[bytes, int, int]] = {}
+        self._encoded: dict[tuple[int, int, int, int | None], tuple[bytes, int, int]] = {}
         self._thread: threading.Thread | None = None
         self._fresh = False  # the thread has finished thumbnails not drawn yet
         # A press on the column's scrollbar, and the button not up yet -
@@ -7608,23 +7608,49 @@ class _Sidebar:
         self.first = max(1, min(self.first, viewer.npages - slots + 1))
 
     def _visible_pages(self, slots: int) -> range:
-        """The pages the column shows, from self.first."""
+        """The pages whose thumbnails the column shows whole, from
+        self.first - what it scrolls by (see _follow())."""
         return range(self.first, min(self.viewer.npages, self.first + slots - 1) + 1)
 
-    def _thumbnail(self, page: int, thumb_w_px: int, box_h_px: int) -> tuple[bytes, int, int] | None:
+    def _shown_pages(self, slot_rows: int, slots: int) -> range:
+        """The pages the column draws: those it shows whole, and the next
+        one too if the rows left under them hold its frame's top and at
+        least a row of it - cut off at the bottom of the screen, but
+        showing where the column goes on.
+
+        Args:
+            slot_rows, slots: see _layout().
+        """
+        whole = self._visible_pages(slots)
+        left = max(1, self.viewer.rows - 1) - slots * slot_rows
+        if left >= 2 and whole.stop <= self.viewer.npages:
+            return range(whole.start, whole.stop + 1)
+        return whole
+
+    def _thumbnail(
+        self, page: int, thumb_w_px: int, box_h_px: int, crop_h_px: int | None = None,
+    ) -> tuple[bytes, int, int] | None:
         """`page`'s thumbnail, encoded, fitted into thumb_w_px x box_h_px
         - or None if it isn't rendered (yet, or at all).
+
+        Args:
+            page, thumb_w_px, box_h_px: which, and the box it fits into.
+            crop_h_px: for one cut off at the bottom of the screen (see
+                _shown_pages()), how much of its top shows - None for all
+                of it.
 
         Returns:
             (data, width, height): the JPEG and its size in pixels.
         """
-        key = (page, thumb_w_px, box_h_px)
+        key = (page, thumb_w_px, box_h_px, crop_h_px)
         if key not in self._encoded:
             img = self._images.get((page, thumb_w_px))
             if img is None:
                 return None
             if img.height > box_h_px:  # a page taller than most: fit the height instead
                 img = img.resize((max(1, round(img.width * box_h_px / img.height)), box_h_px))
+            if crop_h_px is not None and img.height > crop_h_px:
+                img = img.crop((0, 0, img.width, max(1, crop_h_px)))
             buf = io.BytesIO()
             img.convert("RGB").save(buf, format="JPEG", quality=85)
             self._encoded[key] = (buf.getvalue(), img.width, img.height)
@@ -7647,8 +7673,9 @@ class _Sidebar:
             return ""
         thumb_w_px, thumb_rows, slot_rows, slots = self._layout()
         self._follow(slots)
-        pages = self._visible_pages(slots)
+        pages = self._shown_pages(slot_rows, slots)
         box_h_px = thumb_rows * viewer.cell_h_px
+        last_row = max(1, viewer.rows - 1)  # the status line's below it
         ready = tuple(p for p in pages if (p, thumb_w_px) in self._images)
         framed = self.picked if self.picking else viewer.page
         # What the thumbnails depend on, and what the frame and numbers
@@ -7677,24 +7704,34 @@ class _Sidebar:
             out.append(f"\x1b[{row};{cols}H{bar[row - 1]}")
         for i, page in enumerate(pages):
             top = 1 + i * slot_rows  # the frame's top edge
+            bottom = top + thumb_rows + 1  # the page number's row
+            # Centered in its slot, by whole cells - its top row, and
+            # the rows of it the screen has room for (the last slot's may
+            # be cut off - see _shown_pages()).
             thumb = self._thumbnail(page, thumb_w_px, box_h_px) if redraw_images else None
             if thumb is not None:
+                row = top + 1 + (box_h_px - thumb[2]) // 2 // viewer.cell_h_px
+                room_px = (last_row - row + 1) * viewer.cell_h_px
+                if room_px < thumb[2]:
+                    thumb = self._thumbnail(page, thumb_w_px, box_h_px, room_px) if room_px > 0 else None
+            if thumb is not None:
                 data, w, h = thumb
-                # Centered in its slot, by whole cells.
                 col = 2 + ((SIDEBAR_COLS - 3) * viewer.cell_w_px - w) // 2 // viewer.cell_w_px
-                row = top + 1 + (box_h_px - h) // 2 // viewer.cell_h_px
                 out.append(f"\x1b[{row};{col}H" + _inline_image(data, w, h))
             number = str(page)
-            bottom = top + thumb_rows + 1
             if page == framed:
                 inner = width - 2
                 left = (inner - len(number) - 2) // 2
                 right = inner - len(number) - 2 - left
                 color = SIDEBAR_PICK_COLOR if self.picking else SIDEBAR_FRAME_COLOR
                 out.append(color + f"\x1b[{top};1H┏{'━' * inner}┓")
-                for row in range(top + 1, bottom):
+                for row in range(top + 1, min(bottom, last_row + 1)):
                     out.append(f"\x1b[{row};1H┃\x1b[{row};{width}H┃")
-                out.append(f"\x1b[{bottom};1H┗{'━' * left} {number} {'━' * right}┛" + SGR_RESET)
+                if bottom <= last_row:
+                    out.append(f"\x1b[{bottom};1H┗{'━' * left} {number} {'━' * right}┛")
+                out.append(SGR_RESET)
+            elif bottom > last_row:
+                pass  # cut off above its number
             else:
                 # The page being viewed keeps its amber number while
                 # another one is picked.
@@ -7774,9 +7811,9 @@ class _Sidebar:
         thread running, so it's also the moment to let go of ones long
         scrolled past (see SIDEBAR_KEPT_THUMBNAILS)."""
         viewer = self.viewer
-        thumb_w_px, _thumb_rows, _slot_rows, slots = self._layout()
+        thumb_w_px, _thumb_rows, slot_rows, slots = self._layout()
         self._follow(slots)
-        visible = self._visible_pages(slots)
+        visible = self._shown_pages(slot_rows, slots)
         self._forget_old(visible, thumb_w_px)
         missing = [p for p in visible if (p, thumb_w_px) not in self._images]
         if not missing:
@@ -7953,7 +7990,7 @@ class _Sidebar:
             self._scroll_to_row(row)
         elif kind == "MOUSE_CLICK":
             page = self.first + (row - 1) // slot_rows
-            if (row - 1) // slot_rows < slots and page <= viewer.npages:
+            if page in self._shown_pages(slot_rows, slots):
                 self.picking = False
                 if page != viewer.page:
                     viewer.go_page(page, 0)
