@@ -169,6 +169,22 @@ PAGE_NUMBER_COLOR = "\x1b[1;32m"  # bold green
 # theme's background and a light one's alike.
 SCROLLBAR_TRACK = "\x1b[48;2;122;124;125m \x1b[0m"  # #7a7c7d, mid gray
 SCROLLBAR_THUMB = "\x1b[48;2;131;204;210m \x1b[0m"  # #83ccd2, light teal
+
+# S/--sidebar: page thumbnails down the left edge in image mode (see
+# _Sidebar). SIDEBAR_COLS columns wide, the last a separator line - it's
+# only put up in a terminal at least SIDEBAR_MIN_TERM_COLS wide, so the
+# page itself keeps room enough. The page being viewed is framed in the
+# search marker's amber (see SEARCH_MARKER_COLOR), over the terminal's own
+# background here since there's no image under the frame, and every
+# thumbnail has its page number under it.
+SIDEBAR_COLS = 20
+SIDEBAR_MIN_TERM_COLS = 60
+SIDEBAR_FRAME_COLOR = "\x1b[38;2;238;160;45m"  # amber
+# The thumbnail picked while choosing one with the keys (see
+# _Sidebar.handle_key()) - the scrollbar thumb's teal.
+SIDEBAR_PICK_COLOR = "\x1b[38;2;131;204;210m"  # #83ccd2
+SIDEBAR_LABEL_COLOR = "\x1b[38;2;128;128;128m"  # mid gray
+SIDEBAR_SEPARATOR = "\x1b[38;2;128;128;128m│\x1b[0m"
 CACHE_SIZE = 6
 # PageCache's memory budget, on top of CACHE_SIZE: a whole spreadsheet
 # sheet on one page (see _SOFFICE_SPREADSHEET_PDF_FILTER) can rasterize
@@ -454,6 +470,10 @@ Keys:
   c                       toggle continuous view (pages one after
                           another, instead of one page at a time)
   r                       toggle the scrollbar
+  S                       page thumbnails down the left edge (image
+                          mode): pick one with j/k and go to its page
+                          with ENTER (or click one), q to leave them up,
+                          S again to close them
   F                       toggle follow mode (auto-reload on file change)
                         <MISCELLANEOUS COMMANDS>
   v                       open the file in its own app (macOS only) and
@@ -5656,6 +5676,25 @@ def iterm2_like() -> bool:
     return "iterm" in os.environ.get("LC_TERMINAL", "").lower()
 
 
+def _inline_image(data: bytes, width: int, height: int) -> str:
+    """The escape sequence that draws an encoded image (JPEG/PNG) at the
+    cursor, `width` x `height` pixels, leaving the cursor where it is -
+    iTerm2's inline-image protocol (see iterm2_like()), wrapped for tmux.
+
+    Args:
+        data: the encoded image.
+        width, height: its size in pixels.
+
+    Returns:
+        The escape sequence.
+    """
+    b64 = base64.b64encode(data).decode("ascii")
+    return wrap_for_tmux(
+        f"\x1b]1337;File=inline=1;doNotMoveCursor=1;size={len(data)};"
+        f"width={width}px;height={height}px;preserveAspectRatio=0:{b64}\x07"
+    )
+
+
 def _format_ech_clear(char_w: int, char_h: int) -> str:
     """Erase `char_w` x `char_h` cells at the home position (ECH/CUU)."""
     out = ["\x1b[H"]
@@ -5856,6 +5895,7 @@ class ViewerOptions:
     eol_mark: bool = True  # --no-eol-mark
     line_numbers: bool = False  # -N/--line-numbers
     scrollbar: bool = True  # --no-scrollbar
+    sidebar: bool = False  # --sidebar
     wheel_scroll_step: int = 2  # --wheel-scroll-step
     incremental_scroll: bool = True  # --no-incremental-scroll
     debug: bool = False  # -d/--debug
@@ -5876,6 +5916,7 @@ class ViewerOptions:
             eol_mark=args.eol_mark,
             line_numbers=args.line_numbers,
             scrollbar=args.scrollbar,
+            sidebar=args.sidebar,
             wheel_scroll_step=args.wheel_scroll_step,
             incremental_scroll=args.incremental_scroll,
             debug=args.debug,
@@ -6926,7 +6967,7 @@ class _Links:
         # would frequently land just outside it and miss the click.
         scale_x = page_info["width_pt"] / img.width
         scale_y = page_info["height_pt"] / img.height
-        cell_xmin = (viewer.x_offset + (col - 1) * viewer.cell_w_px) * scale_x
+        cell_xmin = (viewer.x_offset + (col - viewer._image_col0()) * viewer.cell_w_px) * scale_x
         cell_xmax = cell_xmin + viewer.cell_w_px * scale_x
         cell_ymin = (origin + (row - 1) * viewer.cell_h_px) * scale_y
         cell_ymax = cell_ymin + viewer.cell_h_px * scale_y
@@ -7046,6 +7087,13 @@ class _Mouse:
         viewer = self.viewer
         if viewer.overlays.active is not None:
             viewer.overlays.handle_mouse(kind, col, row)
+        elif viewer.sidebar.dragging and kind in ("MOUSE_DRAG", "MOUSE_RELEASE"):
+            viewer.sidebar.handle_mouse(kind, col, row)  # its scrollbar's drag
+        elif (col <= viewer.sidebar.columns() and not viewer.text_mode
+                and kind in ("MOUSE_CLICK", "MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN")):
+            # (A drag or a release there otherwise still ends the page
+            # scrollbar's drag.)
+            viewer.sidebar.handle_mouse(kind, col, row)
         elif kind == "MOUSE_CLICK":
             self.click(col, row)
         elif kind == "MOUSE_DRAG":
@@ -7156,6 +7204,412 @@ class _Mouse:
         viewer.refresh()
 
 
+class _Sidebar:
+    """S/--sidebar: the pages' thumbnails in a column down the left edge
+    of image mode, the page being viewed framed and kept in view (see
+    _follow()), a click on one going to its page and the wheel over them
+    scrolling the column. The page image itself starts right of it (see
+    Viewer._image_col0()).
+
+    Thumbnails are rendered on a thread of their own, only the ones the
+    column shows, into a PageCache of their own - poll(), on every pass
+    of run_viewer()'s input loop, starts that and draws what it has
+    finished - so a long document isn't rendered up front, and turning
+    pages never waits for one.
+
+    Each page gets a slot SIDEBAR_COLS - 1 columns wide: a row for the
+    frame's top edge, the thumbnail's rows (a column's margin either
+    side, for the frame's sides), and a row with its page number (in
+    the frame's bottom edge, for the page being viewed). The column's
+    last column is its own scrollbar, when there are more thumbnails
+    than fit (see _scrollbar_cells()) - just a separator line when
+    there aren't.
+
+    The keys can pick one too (see handle_key()): S puts the column up
+    ready for that, or gets it ready if it's already up, and closes it
+    while it is.
+
+    Attributes:
+        viewer: the Viewer the thumbnails are shown beside.
+        on: whether they're wanted - see columns() for whether they're
+            actually up.
+        first: the page whose thumbnail is at the top.
+        picking: whether the keys are picking a thumbnail (see
+            handle_key()), rather than acting on the page.
+        picked: the page whose thumbnail they've picked.
+    """
+
+    def __init__(self, viewer: Viewer, on: bool) -> None:
+        """Args:
+            viewer: the Viewer the thumbnails are shown beside.
+            on: whether to start with them (--sidebar).
+        """
+        self.viewer = viewer
+        self.on = on
+        self.first = 1
+        self.picking = False
+        self.picked = 1
+        self._followed_page: int | None = None  # see _follow()
+        self._cache: PageCache | None = None  # for this file's handler, made on first use
+        # (page, width) -> the rendered thumbnail, or None if it failed -
+        # filled in by the rendering thread (see poll()).
+        self._images: dict[tuple[int, int], Image.Image | None] = {}
+        self._encoded: dict[tuple[int, int, int], tuple[bytes, int, int]] = {}
+        self._thread: threading.Thread | None = None
+        self._fresh = False  # the thread has finished thumbnails not drawn yet
+        # A press on the column's scrollbar, and the button not up yet -
+        # the drag's latest row, if not acted on yet (see handle_mouse()).
+        self.dragging = False
+        self._drag_row: int | None = None
+        self._drawn: tuple[Any, ...] | None = None  # what escapes() last drew
+
+    def columns(self) -> int:
+        """How many columns the sidebar takes: SIDEBAR_COLS while it's on
+        and the terminal is wide enough (see SIDEBAR_MIN_TERM_COLS), else
+        0. Text mode draws none of it, but keeps the columns reserved,
+        so the page image has the same width whichever mode it's
+        switched back from."""
+        return SIDEBAR_COLS if self.on and self.viewer.cols >= SIDEBAR_MIN_TERM_COLS else 0
+
+    def reset(self) -> None:
+        """Forget every thumbnail, for another file or a reload."""
+        self._cache = None
+        self._images = {}  # a new dict: a thread still running keeps filling the old one
+        self._encoded = {}
+        self._drawn = None
+        self.first = 1
+        self._followed_page = None
+        self.picking = False
+
+    def forget_drawn(self) -> None:
+        """Something else has drawn over the screen - see
+        Viewer._invalidate_screen() - so draw it all afresh next time."""
+        self._drawn = None
+
+    def _layout(self) -> tuple[int, int, int, int]:
+        """The column's geometry, from the terminal's cell size and the
+        current page's shape (a document's pages are mostly all the
+        same one).
+
+        Returns:
+            (thumb_w_px, thumb_rows, slot_rows, slots): a thumbnail's
+            width in pixels and the rows it gets, the rows each page's
+            slot takes, and how many slots fit.
+        """
+        viewer = self.viewer
+        thumb_w_px = (SIDEBAR_COLS - 3) * viewer.cell_w_px
+        img = viewer.img
+        aspect = img.height / img.width if img is not None and img.width else 1.414
+        avail = max(1, viewer.rows - 1)  # the bottom row is the status line
+        thumb_rows = max(1, min(avail - 2, round(thumb_w_px * aspect / viewer.cell_h_px)))
+        slot_rows = thumb_rows + 2
+        return thumb_w_px, thumb_rows, slot_rows, max(1, avail // slot_rows)
+
+    def _follow(self, slots: int) -> None:
+        """Keep the page being viewed in the column - or, while picking
+        one with the keys, the picked one: scroll it into view when it
+        has changed since last time - but not otherwise, so the wheel can
+        scroll the column away from it (see handle_mouse())."""
+        viewer = self.viewer
+        target = self.picked if self.picking else viewer.page
+        if target != self._followed_page:
+            self._followed_page = target
+            if target < self.first:
+                self.first = target
+            elif target >= self.first + slots:
+                self.first = target - slots + 1
+        self.first = max(1, min(self.first, viewer.npages - slots + 1))
+
+    def _visible_pages(self, slots: int) -> range:
+        """The pages the column shows, from self.first."""
+        return range(self.first, min(self.viewer.npages, self.first + slots - 1) + 1)
+
+    def _thumbnail(self, page: int, thumb_w_px: int, box_h_px: int) -> tuple[bytes, int, int] | None:
+        """`page`'s thumbnail, encoded, fitted into thumb_w_px x box_h_px
+        - or None if it isn't rendered (yet, or at all).
+
+        Returns:
+            (data, width, height): the JPEG and its size in pixels.
+        """
+        key = (page, thumb_w_px, box_h_px)
+        if key not in self._encoded:
+            img = self._images.get((page, thumb_w_px))
+            if img is None:
+                return None
+            if img.height > box_h_px:  # a page taller than most: fit the height instead
+                img = img.resize((max(1, round(img.width * box_h_px / img.height)), box_h_px))
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=85)
+            self._encoded[key] = (buf.getvalue(), img.width, img.height)
+        return self._encoded[key]
+
+    def escapes(self, full: bool) -> str:
+        """The escape sequences that draw the column - "" when it isn't
+        up, or when nothing in it has changed since last drawn, unless
+        `full` (the screen was cleared under it).
+
+        Args:
+            full: draw it even if it looks the same as last time.
+
+        Returns:
+            The escape sequences.
+        """
+        viewer = self.viewer
+        cols = self.columns()
+        if not cols or viewer.text_mode:
+            return ""
+        thumb_w_px, thumb_rows, slot_rows, slots = self._layout()
+        self._follow(slots)
+        pages = self._visible_pages(slots)
+        box_h_px = thumb_rows * viewer.cell_h_px
+        ready = tuple(p for p in pages if (p, thumb_w_px) in self._images)
+        framed = self.picked if self.picking else viewer.page
+        state = (self.first, viewer.page, framed, self.picking, thumb_w_px, thumb_rows, viewer.rows, ready)
+        if not full and state == self._drawn:
+            return ""
+        self._drawn = state
+
+        out = [SGR_RESET]
+        width = cols - 1  # the slots', left of the separator
+        bar = self._scrollbar_cells(slots)
+        for row in range(1, max(1, viewer.rows - 1) + 1):
+            # Erase the slots' cells (a thumbnail left from a scroll
+            # included), then the scrollbar's (or separator's).
+            out.append(f"\x1b[{row};1H\x1b[{width}X\x1b[{row};{cols}H{bar[row - 1]}")
+        for i, page in enumerate(pages):
+            top = 1 + i * slot_rows  # the frame's top edge
+            thumb = self._thumbnail(page, thumb_w_px, box_h_px)
+            if thumb is not None:
+                data, w, h = thumb
+                # Centered in its slot, by whole cells.
+                col = 2 + ((SIDEBAR_COLS - 3) * viewer.cell_w_px - w) // 2 // viewer.cell_w_px
+                row = top + 1 + (box_h_px - h) // 2 // viewer.cell_h_px
+                out.append(f"\x1b[{row};{col}H" + _inline_image(data, w, h))
+            number = str(page)
+            bottom = top + thumb_rows + 1
+            if page == framed:
+                inner = width - 2
+                left = (inner - len(number) - 2) // 2
+                right = inner - len(number) - 2 - left
+                color = SIDEBAR_PICK_COLOR if self.picking else SIDEBAR_FRAME_COLOR
+                out.append(color + f"\x1b[{top};1H┏{'━' * inner}┓")
+                for row in range(top + 1, bottom):
+                    out.append(f"\x1b[{row};1H┃\x1b[{row};{width}H┃")
+                out.append(f"\x1b[{bottom};1H┗{'━' * left} {number} {'━' * right}┛" + SGR_RESET)
+            else:
+                # The page being viewed keeps its amber number while
+                # another one is picked.
+                color = SIDEBAR_FRAME_COLOR if page == viewer.page else SIDEBAR_LABEL_COLOR
+                out.append(f"\x1b[{bottom};{1 + (width - len(number)) // 2}H"
+                           + color + number + SGR_RESET)
+        return "".join(out)
+
+    def _scrollbar_cells(self, slots: int) -> list[str]:
+        """The column's last column, one cell per row: a scrollbar like
+        the page's own (see Viewer._scrollbar_column()), its thumb the
+        thumbnails in view out of every page's - or, when they all fit,
+        a plain separator line.
+
+        Args:
+            slots: how many thumbnails fit (see _layout()).
+        """
+        viewer = self.viewer
+        avail = max(1, viewer.rows - 1)
+        if viewer.npages <= slots:
+            return [SIDEBAR_SEPARATOR] * avail
+        return viewer._scrollbar_column(
+            avail, (self.first - 1) / viewer.npages, slots / viewer.npages,
+        )
+
+    def _scroll_to_row(self, row: int) -> None:
+        """A click or drag at `row` on the column's scrollbar: scroll the
+        column so its thumb starts there (the inverse of
+        _scrollbar_cells()), and draw it - the page stays as it is."""
+        viewer = self.viewer
+        _thumb_w_px, _thumb_rows, _slot_rows, slots = self._layout()
+        avail = max(1, viewer.rows - 1)
+        first = 1 + round(max(0, row - 1) / avail * viewer.npages)
+        first = max(1, min(first, viewer.npages - slots + 1))
+        if first != self.first:
+            self.first = first
+            drawn = self.escapes(full=False)
+            sys.stdout.write(SYNC_BEGIN + drawn + SYNC_END)
+            sys.stdout.flush()
+
+    def poll(self) -> None:
+        """run_viewer()'s every pass: draw the thumbnails the rendering
+        thread has finished, and start it on the ones the column shows
+        that aren't rendered yet. Nothing while the column isn't up, or
+        something else has the screen (text mode, a box over the page, a
+        missing file)."""
+        viewer = self.viewer
+        if (not self.columns() or viewer.text_mode or viewer.file_missing
+                or viewer.overlays.active is not None or viewer.img is None):
+            return
+        if self._drag_row is not None:  # the last of a burst of drag events
+            row, self._drag_row = self._drag_row, None
+            self._scroll_to_row(row)
+        if self._fresh:
+            self._fresh = False
+            drawn = self.escapes(full=False)
+            if drawn:
+                sys.stdout.write(SYNC_BEGIN + drawn + SYNC_END)
+                sys.stdout.flush()
+        if self._thread is not None and self._thread.is_alive():
+            return
+        thumb_w_px, _thumb_rows, _slot_rows, slots = self._layout()
+        self._follow(slots)
+        missing = [p for p in self._visible_pages(slots) if (p, thumb_w_px) not in self._images]
+        if not missing:
+            return
+        if self._cache is None:
+            self._cache = PageCache(viewer.tmpdir, viewer.doc_handler, size=4 * slots)
+        self._thread = threading.Thread(
+            target=self._render, args=(self._cache, self._images, missing, thumb_w_px),
+            name="pdfless-thumbnails", daemon=True,
+        )
+        self._thread.start()
+
+    def _render(
+        self, cache: PageCache, images: dict[tuple[int, int], Image.Image | None],
+        pages: list[int], thumb_w_px: int,
+    ) -> None:
+        """The rendering thread's work (see poll()): each of `pages` at
+        thumb_w_px wide, into `images` - the dict of the file it was
+        started for, even if reset() has replaced it since.
+
+        Args:
+            cache: the thumbnails' PageCache.
+            images: where to put them.
+            pages: which to render.
+            thumb_w_px: how wide.
+        """
+        for page in pages:
+            try:
+                img: Image.Image | None = cache.get(page, thumb_w_px, "width")
+            except BaseException:  # SystemExit too - see die(); no thumbnail then
+                img = None
+            images[(page, thumb_w_px)] = img
+            self._fresh = True
+
+    def start_picking(self) -> None:
+        """S with the column up: let the keys pick a thumbnail, starting
+        from the page being viewed (see handle_key())."""
+        self.picking = True
+        self.picked = self.viewer.page
+        self._redraw()
+
+    def stop_picking(self) -> None:
+        """Back to the keys acting on the page, the column staying up."""
+        self.picking = False
+        self._redraw()
+        self.viewer.draw_status()
+
+    def _redraw(self) -> None:
+        """Draw the column now (if anything in it changed), and while
+        picking, say on the status line what the keys do."""
+        drawn = self.escapes(full=False)
+        if drawn:
+            sys.stdout.write(SYNC_BEGIN + drawn + SYNC_END)
+            sys.stdout.flush()
+        if self.picking:
+            self.viewer.draw_status(
+                f"ENTER to go to page {self.picked}, q to stop - {self.picked}/{self.viewer.npages}"
+            )
+
+    def handle_key(self, key: str) -> None:
+        """A key pressed while picking a thumbnail - the same keys as the
+        table of contents and the file list (see _Overlays.handle_key()):
+
+        - ENTER goes to the picked page, and stops picking;
+        - q or ESC stops picking, the column staying up; S closes it;
+        - ^L (or a focus change) repaints the screen;
+        - the usual line/window keys, d/u and g/G/</>/HOME/END move the
+          pick.
+
+        Everything else is swallowed, as the page is waiting underneath."""
+        viewer = self.viewer
+        _thumb_w_px, _thumb_rows, _slot_rows, slots = self._layout()
+        moves = {"g": -viewer.npages, "<": -viewer.npages, "HOME": -viewer.npages,
+                 "G": viewer.npages, ">": viewer.npages, "END": viewer.npages,
+                 "d": slots, "\x04": slots, "u": -slots, "\x15": -slots}
+        # ENTER before the line keys: "\r" is one of FORWARD_LINE_KEYS.
+        if key in ("\r", "\n"):
+            self.picking = False
+            if self.picked != viewer.page:
+                viewer.go_page(self.picked, 0)
+            viewer.refresh()
+        elif key in ("q", "\x1b"):
+            self.stop_picking()
+        elif key == "S":
+            viewer.toggle_sidebar()
+        elif key in ("\x0c", "FOCUS_IN"):
+            viewer._invalidate_screen()
+            viewer.refresh()
+            self._redraw()
+        else:
+            if key in FORWARD_LINE_KEYS:
+                delta = 1
+            elif key in BACKWARD_LINE_KEYS:
+                delta = -1
+            elif key in FORWARD_WINDOW_KEYS:
+                delta = slots
+            elif key in BACKWARD_WINDOW_KEYS:
+                delta = -slots
+            else:
+                delta = moves.get(key, 0)
+            picked = max(1, min(viewer.npages, self.picked + delta))
+            if picked != self.picked:
+                self.picked = picked
+                self._redraw()
+
+    def handle_mouse(self, kind: str, col: int, row: int) -> None:
+        """A mouse event over the column (or a drag its scrollbar
+        started): a click on a thumbnail goes to its page (and stops
+        picking one with the keys, if they were), a click or drag on the
+        scrollbar scrolls the column there, and the wheel scrolls it a
+        page at a time.
+
+        Args:
+            kind: the event (see decode_sgr_mouse()).
+            col, row: the cell it's at.
+        """
+        viewer = self.viewer
+        _thumb_w_px, _thumb_rows, slot_rows, slots = self._layout()
+        if kind == "MOUSE_DRAG":
+            # A drag arrives as a burst of motion events, and each redraw
+            # sends every thumbnail in view - so only the last is acted
+            # on, once the burst lets up (here, or in poll()).
+            self._drag_row = row
+            ready, _, _ = select.select([viewer.fd], [], [], 0)
+            if not ready:
+                self._drag_row = None
+                self._scroll_to_row(row)
+        elif kind == "MOUSE_RELEASE":
+            self.dragging = False
+            if self._drag_row is not None:
+                row, self._drag_row = self._drag_row, None
+                self._scroll_to_row(row)
+        elif kind == "MOUSE_CLICK" and col == self.columns() and viewer.npages > slots:
+            self.dragging = True
+            self._scroll_to_row(row)
+        elif kind == "MOUSE_CLICK":
+            page = self.first + (row - 1) // slot_rows
+            if (row - 1) // slot_rows < slots and page <= viewer.npages:
+                self.picking = False
+                if page != viewer.page:
+                    viewer.go_page(page, 0)
+                viewer.refresh()
+        elif kind in ("MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN"):
+            step = -1 if kind == "MOUSE_WHEEL_UP" else 1
+            first = max(1, min(self.first + step, viewer.npages - slots + 1))
+            if first != self.first:
+                self.first = first
+                drawn = self.escapes(full=False)
+                sys.stdout.write(SYNC_BEGIN + drawn + SYNC_END)
+                sys.stdout.flush()
+
+
 class Viewer:
     def __init__(
         self, files: list[DocumentHandler | str], file_index: int, page: int, tmpdir: str, fd: int,
@@ -7257,6 +7711,9 @@ class Viewer:
         # geometry (avail_height_px, cell sizes, ...) still isn't known
         # this early - that needs self.cache, set up moments from now -
         # but the status line alone doesn't touch any of that.
+        # S/--sidebar - made first: every file switch resets it (see
+        # _set_current_file()), the very first one below included.
+        self.sidebar: _Sidebar = _Sidebar(self, options.sidebar)  # S/--sidebar
         self.rows, self.cols, _, _ = get_term_cells(fd)
         self.page = page
         self._set_current_file()  # sets path/name/npages/cache
@@ -7371,6 +7828,7 @@ class Viewer:
         file switch, a mode toggle)."""
         self._last_viewport_set = False
         self._last_marker_bounds = None
+        self.sidebar.forget_drawn()
 
     def request_resize(self) -> None:
         self.resized = True
@@ -7512,6 +7970,7 @@ class Viewer:
         # (memoized on the handler itself - see RenderedDocument.pages -
         # so a revisit to an already-rendered file is still cheap)
         self.cache = PageCache(self.tmpdir, handler)
+        self.sidebar.reset()
         self._text_pages = None  # the previous file's text
         self._text_page_starts = None
         self._text_separator_lines = frozenset()
@@ -7635,6 +8094,9 @@ class Viewer:
         # so reserving it here is enough to keep the image itself out
         # of that column everywhere else.
         self.base_width_px = width_px - (cell_w if self.scrollbar else 0)
+        # The sidebar's columns likewise - see _image_col0() for where
+        # the page image starts then.
+        self.base_width_px -= self.sidebar.columns() * cell_w
         self.cell_h_px = cell_h
         self.cell_w_px = cell_w
         self.avail_height_px = cell_h * max(1, rows - 1 - self._dump_margin_rows)
@@ -7644,6 +8106,11 @@ class Viewer:
         self._last_char_h = 0
         self._display_rows = None  # stale - self.cols may have changed,
         # which is what wrapping is measured against
+
+    def _image_col0(self) -> int:
+        """The terminal column (1-based) the page image starts at - right
+        of the sidebar, when it's up (see _Sidebar.columns())."""
+        return self.sidebar.columns() + 1
 
     def _page_target(self) -> tuple[int, str]:
         """(target_px, fit) for PageCache.get() at the current fit mode
@@ -8607,6 +9074,32 @@ class Viewer:
         self.refresh()
         self.draw_status("continuous view " + ("on" if self.continuous else "off"))
 
+    def toggle_sidebar(self) -> None:
+        """S: the page thumbnails (see _Sidebar). In image mode, S puts
+        them up with the keys ready to pick one (see
+        _Sidebar.handle_key()), gets the keys ready if they're already
+        up (e.g. by --sidebar), and takes them down while picking; in
+        text mode, which doesn't show them, it just turns them on or off.
+        Their columns are taken from the page's width, so the layout is
+        redone around them, as for the scrollbar (see toggle_scrollbar())."""
+        sidebar = self.sidebar
+        if sidebar.on and not sidebar.picking and not self.text_mode and sidebar.columns():
+            sidebar.start_picking()
+            return
+        sidebar.picking = False
+        sidebar.on = not sidebar.on
+        if sidebar.on and self.cols < SIDEBAR_MIN_TERM_COLS:
+            sidebar.on = False
+            self.draw_status("too narrow a terminal for the page thumbnails")
+            return
+        self._relayout()
+        self._invalidate_screen()
+        self.refresh()
+        if self.text_mode:
+            self.draw_status(f"page thumbnails {'on' if sidebar.on else 'off'} (in image mode)")
+        elif sidebar.on:
+            sidebar.start_picking()
+
     def toggle_scrollbar(self) -> None:
         """Switches the scrollbar on/off - "r" (see run_viewer(), which
         handles it at the top level since it applies in both image mode
@@ -9230,18 +9723,21 @@ class Viewer:
             self._last_char_h = char_h
             return "\x1b[H\x1b[2J"
 
-        out = ["\x1b[H"]
+        # Rows are cleared from the page's first column (right of the
+        # sidebar, if it's up) to the end of the line, the sidebar left be.
+        col0 = self._image_col0()
+        out = [f"\x1b[1;{col0}H"]
         if self._last_viewport_set and crop_h > self._last_viewport_h:
             out.append(_strip_leading_home(_format_ech_clear(char_w, char_h)))
         if prev_char_h > char_h:
             for row in range(char_h, min(prev_char_h, self.rows - 1)):
-                out.append(f"\x1b[{row + 1};1H\x1b[2K")
+                out.append(f"\x1b[{row + 1};{col0}H\x1b[K")
         total_rows = max(1, -(-self.avail_height_px // self.cell_h_px))
         blank_from = char_h
         if prev_char_h > char_h:
             blank_from = max(char_h, prev_char_h)
         for row in range(blank_from, min(self.rows - 1, total_rows)):
-            out.append(f"\x1b[{row + 1};1H\x1b[2K")
+            out.append(f"\x1b[{row + 1};{col0}H\x1b[K")
         self._last_char_h = char_h
         return "".join(out)
 
@@ -9286,12 +9782,7 @@ class Viewer:
             data = self._encode_crop(crop)
             self.encode_cache.put(encode_key, data)
 
-        b64 = base64.b64encode(data).decode("ascii")
-        osc = (
-            f"\x1b]1337;File=inline=1;doNotMoveCursor=1;size={len(data)};"
-            f"width={crop_w}px;height={crop_h}px;"
-            f"preserveAspectRatio=0:{b64}\x07"
-        )
+        image = _inline_image(data, crop_w, crop_h)
 
         full_clear = self._needs_full_clear(crop_w, crop_h)
         self._last_viewport_w = crop_w
@@ -9319,13 +9810,16 @@ class Viewer:
         if self._last_marker_bounds and self._last_marker_bounds != new_bounds:
             out.append(self._format_marker_erase(*self._last_marker_bounds))
         out.extend([
-            "\x1b[H",  # erase leaves the cursor elsewhere; doNotMoveCursor=1
-            # draws the inline image at the current cell, not home.
-            wrap_for_tmux(osc),
+            # Erase leaves the cursor elsewhere; doNotMoveCursor=1 draws
+            # the inline image at the current cell - the page's top-left
+            # one, right of the sidebar if it's up.
+            f"\x1b[1;{self._image_col0()}H",
+            image,
         ])
         if new_bounds:
             out.append(self._format_marker_at_bounds(*new_bounds))
         self._last_marker_bounds = new_bounds
+        out.append(self.sidebar.escapes(full=full_clear))
 
         out.extend(self._scrollbar_column_escapes())
         out.append(self.format_status())
@@ -9398,8 +9892,11 @@ class Viewer:
           it's simplest to just fall back when one's showing.
         - self.incremental_scroll: --no-incremental-scroll's escape
           hatch, for a terminal where the above turns out not to hold.
+        - no sidebar: the scroll region spans the full width, so the
+          thumbnails would scroll along with the page.
         """
         if (not self.incremental_scroll
+                or self.sidebar.columns()
                 or not self._last_viewport_set
                 or os.environ.get("TMUX")
                 or not iterm2_like()
@@ -9448,13 +9945,6 @@ class Viewer:
             data = self._encode_crop(strip)
             self.encode_cache.put(encode_key, data)
 
-        b64 = base64.b64encode(data).decode("ascii")
-        osc = (
-            f"\x1b]1337;File=inline=1;doNotMoveCursor=1;size={len(data)};"
-            f"width={strip.width}px;height={strip.height}px;"
-            f"preserveAspectRatio=0:{b64}\x07"
-        )
-
         self._remember_drawn_position()
 
         # All in one synchronized frame (see SYNC_BEGIN): the scroll
@@ -9469,7 +9959,7 @@ class Viewer:
             "\x1b[r",  # back to a full-screen scroll region right away -
             # nothing past this point should be confined by it.
             f"\x1b[{screen_row};1H",
-            wrap_for_tmux(osc),
+            _inline_image(data, strip.width, strip.height),
         ]
         out.extend(self._scrollbar_column_escapes())
         out.append(self.format_status())
@@ -9771,6 +10261,7 @@ class Viewer:
                 self.npages = len(pages)
                 self.page = max(1, min(self.npages, self.page))
         self.cache.clear()
+        self.sidebar.reset()
         self.search.reset()
         self._mode_switch = None
         self._text_pages = None  # stale too - re-extracted on demand
@@ -9801,8 +10292,10 @@ class Viewer:
 
         col0, col1 = col0 - 1, col1 + 1  # border sits one cell outside the text
         row0, row1 = row0 - 1, row1 + 1
+        left = self._image_col0() - 1  # (0-based) right of the sidebar
+        col0, col1 = col0 + left, col1 + left
 
-        col0, col1 = max(0, int(col0)), min(self.cols - 1, int(col1))
+        col0, col1 = max(left, int(col0)), min(self.cols - 1, int(col1))
         row0, row1 = max(0, int(row0)), min(available_rows - 1, int(row1))
         if col0 > col1 or row0 > row1:
             return None
@@ -10100,6 +10593,8 @@ class Viewer:
             self.overlays.show_outline()
         elif key == "O":
             self.overlays.show_files()
+        elif key == "S":
+            self.toggle_sidebar()
         elif key in ("t", "T"):
             # T is t and C combined into one press/undo - see
             # toggle_clean_text_mode().
@@ -10552,6 +11047,9 @@ class _KeyDispatcher:
         if viewer.overlays.active is not None:
             viewer.overlays.handle_key(key)
             return True
+        if viewer.sidebar.picking:
+            viewer.sidebar.handle_key(key)
+            return True
         if viewer.handle_global_key(key):
             return True
         if key == ":" or (key == "-" and viewer.text_mode):
@@ -10733,6 +11231,7 @@ def run_viewer(
     viewer._schedule_prefetch()
     while True:
         viewer._schedule_page_prefetch()
+        viewer.sidebar.poll()  # thumbnails rendered in the background
         r, _, _ = select.select([fd], [], [], 0.3)
         flush_background_debug()  # -d lines from a background prefetch
         viewer.poll_follow()
@@ -10855,6 +11354,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         dest="scrollbar",
         default=True,
         help="hide the scrollbar",
+    )
+    parser.add_argument(
+        "--sidebar",
+        action="store_true",
+        help="show page thumbnails beside the page in image mode",
     )
     parser.add_argument(
         "--no-incremental-scroll",
