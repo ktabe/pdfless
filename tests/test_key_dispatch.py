@@ -347,3 +347,33 @@ def test_a_dropped_count_leaves_the_status_line(sample_pdf, capsys):
     d.handle("g")
     out = capsys.readouterr().out
     assert out and "number:" not in out
+
+
+def test_the_prompt_comes_back_after_a_resize(sample_pdf, capsys):
+    """A resize (or ^Z and fg) redraws the normal status line - over the
+    search prompt that's still taking the keys, so typing went on
+    unseen."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    d = dispatcher_for(viewer)
+    for key in "/ab":
+        d.handle(key)
+    viewer.refresh()  # what the resize does
+    capsys.readouterr()
+    d.redraw_input()
+    assert "/ab" in capsys.readouterr().out
+    d.handle("\x1b")
+    d.handle(":")
+    d.redraw_input()
+    assert ":" in capsys.readouterr().out
+
+
+def test_half_a_screen_is_at_least_a_line(sample_text):
+    """On a two-row terminal, d/u in text mode moved by 0 rows."""
+    import tempfile
+    lines = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+    lines.write("".join(f"{i}\n" for i in range(50)))
+    lines.close()
+    viewer = make_viewer(pdfless.TextDocument(lines.name), rows=2)
+    before = viewer.text_scroll
+    viewer.handle_key_text("d")
+    assert viewer.text_scroll > before

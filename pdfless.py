@@ -7755,15 +7755,15 @@ class _Sidebar:
         starting from the page being viewed (see handle_key())."""
         self.picking = True
         self.picked = self.viewer.page
-        self._redraw()
+        self.redraw()
 
     def stop_picking(self) -> None:
         """Back to the keys acting on the page, the column staying up."""
         self.picking = False
-        self._redraw()
+        self.redraw()
         self.viewer.draw_status()
 
-    def _redraw(self) -> None:
+    def redraw(self) -> None:
         """Draw the column now (if anything in it changed), and while
         picking, say on the status line what the keys do."""
         drawn = self.escapes(full=False)
@@ -7813,7 +7813,7 @@ class _Sidebar:
         elif key in ("\x0c", "FOCUS_IN"):
             viewer._invalidate_screen()
             viewer.refresh()
-            self._redraw()
+            self.redraw()
         else:
             if key in FORWARD_LINE_KEYS:
                 delta = 1
@@ -7828,7 +7828,7 @@ class _Sidebar:
             picked = max(1, min(viewer.npages, self.picked + delta))
             if picked != self.picked:
                 self.picked = picked
-                self._redraw()
+                self.redraw()
 
     def handle_mouse(self, kind: str, col: int, row: int) -> None:
         """A mouse event over the column (or a drag its scrollbar
@@ -10741,9 +10741,9 @@ class Viewer:
         elif key in BACKWARD_WINDOW_KEYS:
             self.text_scroll_up(avail_rows)
         elif key in ("d", "\x04"):
-            self.text_scroll_down(avail_rows // 2)
+            self.text_scroll_down(max(1, avail_rows // 2))
         elif key in ("u", "\x15"):
-            self.text_scroll_up(avail_rows // 2)
+            self.text_scroll_up(max(1, avail_rows // 2))
         elif key in FORWARD_LINE_KEYS:
             self.text_scroll_down(1)
         elif key in BACKWARD_LINE_KEYS:
@@ -11426,6 +11426,23 @@ class _KeyDispatcher:
             return True
         return self._view_key(key)
 
+    def redraw_input(self) -> None:
+        """Put back on the status line whatever input is under way - the
+        search prompt, a ":"/"-" prefix, a count, picking a thumbnail -
+        after a redraw that replaced it with the normal status line."""
+        viewer = self.viewer
+        if self.search_editor is not None:
+            viewer.draw_search_prompt(
+                self.search_editor.text, self.search_editor.cursor,
+                backward=self.search_backward, multiline=self.search_editor.multiline,
+            )
+        elif self.pending_prefix is not None:
+            viewer.draw_status(self.pending_prefix)
+        elif self.num_buf:
+            viewer.draw_status(f"number: {self.num_buf}")
+        elif viewer.sidebar.picking:
+            viewer.sidebar.redraw()
+
     def _search_prompt_key(self, editor: _LineEditor, key: str) -> None:
         """A key typed at the "/"/"?" prompt: edit the query, or submit
         it (an empty one repeats the last query) or cancel it."""
@@ -11606,6 +11623,10 @@ def run_viewer(
         if viewer.resized:
             try:
                 viewer.refresh()
+                # The redraw put up the normal status line - over the
+                # search prompt, say, still taking the keys (a resize, or
+                # ^Z and fg, can come mid-way).
+                dispatcher.redraw_input()
             except (subprocess.CalledProcessError, OSError):
                 # e.g. a plain text file re-read at the new size
                 _report_unreadable_file(viewer)
