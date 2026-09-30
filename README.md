@@ -347,6 +347,12 @@ Use `--no-cache` to render without reading or writing the cache, or
 
 ## Caveats
 
+### Encrypted PDFs
+
+An encrypted PDF asks for its password when it's opened. Poppler takes the
+password only on its command line, so while pdfless is rendering, other users
+on the same machine can see it (for example with `ps`).
+
 ### tmux
 
 For image display in tmux 3.3 or later, add the following to `~/.tmux.conf`:
