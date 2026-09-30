@@ -117,6 +117,27 @@ SGR_RESET = "\x1b[0m"
 SYNC_BEGIN = "\x1b[?2026h"
 SYNC_END = "\x1b[?2026l"
 
+
+def _sync_begin() -> str:
+    """SYNC_BEGIN - or nothing under tmux. tmux holds a synchronized
+    frame's changes back and then redraws the lines they're on whole,
+    from its own model of the screen - but an inline image passes
+    straight through it (see wrap_for_tmux()) and was never in that
+    model: the redraw erased it again the moment it was shown (it sends
+    "erase to start of line" for every row the scrollbar is on). Without
+    the frame, tmux draws just the cells that changed, and the image
+    stays.
+
+    Returns:
+        The escape sequence to begin a frame with, or "".
+    """
+    return "" if os.environ.get("TMUX") else SYNC_BEGIN
+
+
+def _sync_end() -> str:
+    """SYNC_END - or nothing under tmux, as for _sync_begin()."""
+    return "" if os.environ.get("TMUX") else SYNC_END
+
 # The default status line is split into differently-colored fields so
 # filename/page/loc%/zoom% each stand out, with the trailing key-hints
 # text in a plainer, subdued color.
@@ -7755,7 +7776,7 @@ class _Sidebar:
         if first != self.first:
             self.first = first
             drawn = self.escapes(full=False)
-            sys.stdout.write(SYNC_BEGIN + drawn + SYNC_END)
+            sys.stdout.write(_sync_begin() + drawn + _sync_end())
             sys.stdout.flush()
 
     def poll(self, prompt_open: bool = False) -> None:
@@ -7785,7 +7806,7 @@ class _Sidebar:
             self._fresh = False
             drawn = self.escapes(full=False)
             if drawn:
-                sys.stdout.write(SYNC_BEGIN + drawn + SYNC_END)
+                sys.stdout.write(_sync_begin() + drawn + _sync_end())
                 sys.stdout.flush()
         if self._thread is not None and self._thread.is_alive():
             return
@@ -7882,7 +7903,7 @@ class _Sidebar:
         picking, say on the status line what the keys do."""
         drawn = self.escapes(full=False)
         if drawn:
-            sys.stdout.write(SYNC_BEGIN + drawn + SYNC_END)
+            sys.stdout.write(_sync_begin() + drawn + _sync_end())
             sys.stdout.flush()
         if self.picking:
             self.viewer.draw_status(
@@ -7987,7 +8008,7 @@ class _Sidebar:
             if first != self.first:
                 self.first = first
                 drawn = self.escapes(full=False)
-                sys.stdout.write(SYNC_BEGIN + drawn + SYNC_END)
+                sys.stdout.write(_sync_begin() + drawn + _sync_end())
                 sys.stdout.flush()
 
 
@@ -10299,7 +10320,7 @@ class Viewer:
         # draw_search_prompt(), which doesn't reset it since it's
         # mid-edit) is what a \x1b[2J/ECH fills the newly-blanked cells
         # with - see _draw_text()'s longer version of this comment.
-        out = [SYNC_BEGIN, SGR_RESET, self._format_viewport_clear(crop_w, crop_h, full_clear)]
+        out = [_sync_begin(), SGR_RESET, self._format_viewport_clear(crop_w, crop_h, full_clear)]
         # Erase the previous marker before the new image lands; otherwise
         # box-drawing chars linger on iTerm2 inline-image cells (especially
         # when search is cleared or n/p jumps to another match).
@@ -10319,7 +10340,7 @@ class Viewer:
 
         out.extend(self._scrollbar_column_escapes())
         out.append(self.format_status())
-        out.append(SYNC_END)
+        out.append(_sync_end())
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
@@ -10443,12 +10464,12 @@ class Viewer:
 
         self._remember_drawn_position()
 
-        # All in one synchronized frame (see SYNC_BEGIN): the scroll
+        # All in one synchronized frame (see _sync_begin()): the scroll
         # region spans the full width, so the shift below moves the
         # scrollbar column along with the image - shown on its own, that
         # displaced scrollbar is a visible flicker until it's repainted.
         out = [
-            SYNC_BEGIN,
+            _sync_begin(),
             SGR_RESET,
             f"\x1b[1;{avail_rows}r",
             f"\x1b[{shift}S" if shift > 0 else f"\x1b[{strip_rows}T",
@@ -10459,7 +10480,7 @@ class Viewer:
         ]
         out.extend(self._scrollbar_column_escapes())
         out.append(self.format_status())
-        out.append(SYNC_END)
+        out.append(_sync_end())
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
