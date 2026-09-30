@@ -11236,8 +11236,10 @@ class _KeyDispatcher:
         count and is left for _view_key()."""
         viewer = self.viewer
         # A lone "0" (no pending number) resets the zoom/pan instead of
-        # starting a number entry.
-        if key.isdigit() and not (key == "0" and not self.num_buf):
+        # starting a number entry. ASCII digits only: str.isdigit() takes
+        # "²" (AltGr+2 on a German keyboard) or "①" (an input method) too,
+        # which int() can't read.
+        if key in "0123456789" and len(key) == 1 and not (key == "0" and not self.num_buf):
             self.num_buf += key
             viewer.draw_status(f"number: {self.num_buf}")
             return True

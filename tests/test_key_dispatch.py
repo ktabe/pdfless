@@ -290,3 +290,14 @@ def test_a_count_goes_to_the_key_after_it(sample_pdf, monkeypatch):
     monkeypatch.setattr(viewer, "go_to_text_line", lines.append)
     feed(d, ["1", "2", "g"])
     assert lines == [12]
+
+
+def test_only_ascii_digits_make_a_count(sample_pdf):
+    """"²" (AltGr+2 on a German keyboard) or "①" (from an input method)
+    pass str.isdigit() but not int() - they're just keys that do nothing."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    d = dispatcher_for(viewer)
+    for key in ("²", "①"):
+        assert d.handle(key)
+        assert d.num_buf == ""
+        assert d.handle("j")  # no ValueError from a count of "²"
