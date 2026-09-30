@@ -3,6 +3,7 @@ command line), _collect_files() (which files the viewer opens, and on
 which page) and _open_key_input() (where keys are read from)."""
 
 import os
+import shutil
 
 import pytest
 
@@ -36,6 +37,24 @@ def test_missing_and_unviewable_files_are_skipped(sample_pdf, tmp_path, capsys):
     err = capsys.readouterr().err
     assert f"no such file, skipping: {missing}" in err
     assert f"skipping: {binary}" in err
+
+
+def test_a_directory_stands_for_its_files(sample_pdf, sample_text, tmp_path, capsys):
+    """It was skipped as "no such file"."""
+    folder = tmp_path / "folder"
+    (folder / "sub").mkdir(parents=True)
+    shutil.copy(sample_text, folder / "b.txt")
+    shutil.copy(sample_text, folder / "C.txt")  # after b.txt, as ls has it
+    shutil.copy(sample_pdf, folder / "a.pdf")
+    shutil.copy(sample_pdf, folder / "sub" / "c.pdf")  # not gone into
+    (folder / ".DS_Store").write_bytes(b"\0")  # hidden
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    files, index, _page = pdfless._collect_files([str(empty), str(folder)], str(tmp_path), 1)
+    assert index == 0
+    assert isinstance(files[0], pdfless.PdfDocument) and files[0].path == str(folder / "a.pdf")
+    assert files[1:] == [str(folder / "b.txt"), str(folder / "C.txt")]
+    assert f"no files in directory, skipping: {empty}" in capsys.readouterr().err
 
 
 def test_only_the_first_viewable_file_is_sniffed(sample_pdf, tmp_path):

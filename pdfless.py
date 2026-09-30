@@ -11866,8 +11866,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "files", nargs="*", metavar="file",
-        help="PDF, image, text, or supported document files; read stdin "
-             "if omitted or if \"-\" is given",
+        help="PDF, image, text, or supported document files, or directories "
+             "(the files directly in them); read stdin if omitted or if \"-\" "
+             "is given",
     )
     parser.add_argument(
         "-p", "--page", type=int, default=1,
@@ -11990,6 +11991,27 @@ def _capture_stdin(tmpdir: str) -> str:
     return stdin_path
 
 
+def _directory_files(directory: str) -> list[str]:
+    """The files a directory given on the command line stands for: those
+    directly in it (not in its subdirectories), sorted by name as ls
+    does - ignoring case - and leaving out hidden ones (.DS_Store and
+    the like).
+
+    Args:
+        directory: the directory, as given.
+
+    Returns:
+        Their absolute paths - [] if there are none, or it can't be read.
+    """
+    try:
+        # Ignoring case; names differing only in case keep a fixed order.
+        names = sorted(os.listdir(directory), key=lambda name: (name.casefold(), name))
+    except OSError:
+        return []
+    paths = (os.path.abspath(os.path.join(directory, name)) for name in names if not name.startswith("."))
+    return [path for path in paths if os.path.isfile(path)]
+
+
 def _collect_files(
     paths: list[str], tmpdir: str, page: int, debug: bool = False,
 ) -> tuple[list[DocumentHandler | str], int, int]:
@@ -12000,7 +12022,8 @@ def _collect_files(
 
     Args:
         paths: the files as given on the command line (stdin's already
-            captured to a file - see _capture_stdin()).
+            captured to a file - see _capture_stdin()); a directory
+            among them stands for the files in it (_directory_files()).
         tmpdir: the scratch directory handlers render into.
         page: -p/--page, the page asked to start on.
         debug: -d/--debug, passed on to the sniffing.
@@ -12019,6 +12042,13 @@ def _collect_files(
     # through to the end.
     candidates = []  # [abs_path, ...] - files that at least exist
     for arg in paths:
+        if os.path.isdir(arg):
+            # A directory stands for the files directly in it.
+            inside = _directory_files(arg)
+            if not inside:
+                print(f"pdfless: no files in directory, skipping: {arg}", file=sys.stderr)
+            candidates.extend(inside)
+            continue
         if not os.path.isfile(arg):
             print(f"pdfless: no such file, skipping: {arg}", file=sys.stderr)
             continue
