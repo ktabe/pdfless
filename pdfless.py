@@ -55,6 +55,7 @@ import threading
 import time
 import tty
 import unicodedata
+import urllib.parse
 import webbrowser
 from collections import OrderedDict, deque
 
@@ -67,6 +68,10 @@ from PIL import ExifTags, Image, ImageChops, ImageOps
 # last-resort handler prints them on stderr: straight over the page on
 # screen. It recovers from those on its own, so they're only noise here.
 logging.getLogger("pypdf").setLevel(logging.CRITICAL + 1)
+# Likewise WeasyPrint's (a Markdown file's image it couldn't, or wasn't
+# allowed to, load - see _markdown_url_fetcher()): with no handler set
+# up, Python's last-resort one would print them over the screen.
+logging.getLogger("weasyprint").setLevel(logging.CRITICAL + 1)
 
 # Type aliases for the shapes that travel between functions here. Spelled
 # with typing's generics rather than `X | Y`, since these (unlike the
@@ -940,7 +945,7 @@ def _pdf_render_result(out_pdf: str, ok: bool = True) -> tuple | None:
 
 # Bumped whenever a change to how pdfless renders a document would make
 # an already-cached rendering of it wrong (see _cached_render_dir()) -
-# the cache only checks the source file's own mtime for staleness, so
+# the cache only checks the source file itself for staleness, so
 # without this an entry made before such a fix would keep being served
 # until the file itself changed. Entries under an old version are simply
 # never looked up again, and age out via OFFICE_CACHE_MAX_ENTRIES.
@@ -955,6 +960,10 @@ OFFICE_CACHE_MAX_ENTRIES = 50  # persistent rendered-pages cache (see
 # _office_cache_dir()) - entries beyond this many, least-recently-used
 # first (by atime - see _render_result_cached()), are pruned each time
 # a new one is added.
+
+# --remote-resources: let a Markdown file's images and stylesheets come
+# from the network too - see _markdown_url_fetcher().
+_MARKDOWN_REMOTE_RESOURCES = False
 
 _OFFICE_CACHE_ENABLED = True  # --no-cache flips this off for the whole
 # process - read directly by _render_result_cached() rather than
@@ -1037,7 +1046,9 @@ def _cached_render_dir(path: str, key_suffix: str = '') -> str:
 def _prune_office_cache(cache_dir: str, keep: int = OFFICE_CACHE_MAX_ENTRIES) -> None:
     """Delete the least-recently-used entries (oldest atime - bumped on
     every cache hit by _render_result_cached(), which is the only thing
-    that ever touches atime here) beyond `keep`. Each entry is itself a
+    that ever touches atime here) beyond `keep` - never one this
+    pdfless has used (_CACHE_ENTRIES_IN_USE), as what it shows is read
+    straight from there. Each entry is itself a
     directory (see _cached_render_dir()), so removal is shutil.rmtree()
     rather than a plain unlink. Best-effort: an entry that vanishes or
     fails to stat/remove between listing and pruning (another process's
@@ -1052,12 +1063,15 @@ def _prune_office_cache(cache_dir: str, keep: int = OFFICE_CACHE_MAX_ENTRIES) ->
     entries = []
     for name in names:
         p = os.path.join(cache_dir, name)
+        if p in _CACHE_ENTRIES_IN_USE:
+            continue  # this session's, and read in place - see _render_result_cached()
         try:
             entries.append((os.stat(p).st_atime, p))
         except OSError:
             continue
     entries.sort()
-    for _atime, p in entries[:len(entries) - keep]:
+    in_use = len(names) - len(entries)
+    for _atime, p in entries[:max(0, len(entries) - max(0, keep - in_use))]:
         try:
             shutil.rmtree(p) if os.path.isdir(p) else os.unlink(p)
         except OSError:
@@ -1073,14 +1087,13 @@ def _render_result_cached(
     returning either a ("pdf", pdf_path, npages) tuple or a plain list
     of page image paths, in reading order, or None on failure) only if
     there's no still-fresh persistent cache entry (see
-    _office_cache_dir()) already covering `path` - "fresh" being a
-    plain mtime comparison against `path` itself, the same staleness
-    check -f/--follow already uses elsewhere, applied here to the
-    cache entry directory's own mtime instead of a separately-recorded
-    one: deliberately NOT part of the cache key (see
+    _office_cache_dir()) already covering `path` - "fresh" meaning the
+    entry was rendered from `path` exactly as it is now: its mtime and
+    size, recorded in the entry when that render started (see
+    _source_stamp()). Deliberately NOT part of the cache key (see
     _cached_render_dir()), so this is what actually decides whether a
-    given entry is still good, and updating it (by writing a fresh
-    render) is exactly what makes it good again after an edit. Shared
+    given entry is still good, and writing a fresh render is exactly
+    what makes it good again after an edit. Shared
     by every one of pdfless's own document-to-page-images renderings -
     the cache doesn't care which tool produced a given entry or which
     of the two result shapes it is, only that it's still a fresh
@@ -1098,23 +1111,22 @@ def _render_result_cached(
         return render_fn(), False
 
     entry_dir = _cached_render_dir(path, key_suffix)
-    try:
-        source_mtime = os.path.getmtime(path)
-        cache_mtime = os.path.getmtime(entry_dir)
-    except OSError:
-        cache_mtime = None
-
-    if cache_mtime is not None and cache_mtime >= source_mtime:
+    # Fresh means rendered from the file exactly as it is now - its
+    # mtime (to the nanosecond) and size as recorded when that render
+    # started (see _CACHE_SOURCE_STAMP). Not "the entry is newer than
+    # the file": a save during a long render gave the old content a
+    # newer entry, served ever after, and a copy put back with an older
+    # mtime (cp -p, rsync -t, a restore) matched too.
+    source = _source_stamp(path)
+    if source is not None and source == _read_source_stamp(entry_dir):
         cached = _read_cached_render(entry_dir)
         if cached is not None:
-            # A hit: bump atime only (LRU recency for
-            # _prune_office_cache()) - mtime is left exactly as it is,
-            # since it's what this same comparison will be judged
-            # against next time.
+            # A hit: bump atime (LRU recency for _prune_office_cache()).
             try:
-                os.utime(entry_dir, (time.time(), cache_mtime))
+                os.utime(entry_dir, (time.time(), os.path.getmtime(entry_dir)))
             except OSError:
                 pass
+            _CACHE_ENTRIES_IN_USE.add(entry_dir)
             return cached, True
         # Present but unusable (corrupt/incomplete, or left behind by
         # an older cache format) - fall through and re-render, which
@@ -1123,9 +1135,43 @@ def _render_result_cached(
     result = render_fn()
     if not result:
         return None, False
-    _publish_cached_render(entry_dir, result)
-    _prune_office_cache(os.path.dirname(entry_dir))
+    if source is not None:
+        # Stamped with the file as it was when the render started: if
+        # it's been saved since, the entry is stale on the next look.
+        _publish_cached_render(entry_dir, result, source)
+        _CACHE_ENTRIES_IN_USE.add(entry_dir)
+        _prune_office_cache(os.path.dirname(entry_dir))
     return result, False
+
+
+# Written into every cache entry (see _publish_cached_render()): the
+# source file's "<mtime in ns> <size>" when its render started.
+_CACHE_SOURCE_STAMP = "source"
+
+# Cache entries this pdfless has used - a render shown from one is read
+# in place (see _read_cached_render()), and a file visited earlier can be
+# gone back to - so _prune_office_cache() leaves them be.
+_CACHE_ENTRIES_IN_USE: set[str] = set()
+
+
+def _source_stamp(path: str) -> str | None:
+    """`path`'s mtime (in ns) and size, as a cache entry records them (see
+    _render_result_cached()) - None if it can't be read."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return f"{st.st_mtime_ns} {st.st_size}"
+
+
+def _read_source_stamp(entry_dir: str) -> str | None:
+    """The source stamp a cache entry was written with, or None (none
+    yet, or an entry from before they were recorded - stale either way)."""
+    try:
+        with open(os.path.join(entry_dir, _CACHE_SOURCE_STAMP), "r", encoding="ascii") as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _read_cached_render(entry_dir: str) -> RenderResult | None:
@@ -1148,7 +1194,7 @@ def _read_cached_render(entry_dir: str) -> RenderResult | None:
     return [os.path.join(entry_dir, n) for n in names] if names else None
 
 
-def _publish_cached_render(entry_dir: str, result: RenderResult) -> None:
+def _publish_cached_render(entry_dir: str, result: RenderResult, source: str) -> None:
     """Copy `result` (render_fn()'s return value - see
     _render_result_cached()) into entry_dir, atomically: built up in a
     temp directory alongside it (same filesystem as entry_dir, unlike
@@ -1157,10 +1203,14 @@ def _publish_cached_render(entry_dir: str, result: RenderResult) -> None:
     then moved into place with one directory rename, so no reader ever
     sees a partially-written cache entry. Best-effort: any OSError here
     just leaves the cache without this entry, since the render itself
-    already succeeded and that's what actually matters to the caller."""
+    already succeeded and that's what actually matters to the caller.
+    `source` is the source file's stamp (see _source_stamp()), written
+    alongside."""
     tmp_dir = entry_dir + f".tmp{os.getpid()}"
     try:
         os.makedirs(tmp_dir, exist_ok=True)
+        with open(os.path.join(tmp_dir, _CACHE_SOURCE_STAMP), "w", encoding="ascii") as f:
+            f.write(source)
         if isinstance(result, tuple):  # ("pdf", pdf_path, npages) - see RenderResult
             shutil.copyfile(result[1], os.path.join(tmp_dir, "document.pdf"))
         else:
@@ -3020,7 +3070,9 @@ class DocumentHandler:
         instead, since a PDF has no fixed native pixel size at all."""
         native = self._native_page_image(cache, page)
         native_dim = native.width if fit == "width" else native.height
-        key = (page, round(target_px))
+        # The fit is part of it: a width target at one zoom can equal a
+        # height target at another, and they're different sizes.
+        key = (page, round(target_px), fit)
         cached = cache._cached(key)
         if cached is not None:
             return cached
@@ -5148,6 +5200,34 @@ def markdown_heading_lines(lines: Sequence[str]) -> list[int]:
     return headings
 
 
+def _markdown_url_fetcher() -> Any:
+    """What WeasyPrint loads a Markdown file's images and stylesheets
+    with: only local ones (file:, and data: for inline images) - an
+    <img src="https://..."> (a README's badges, say) would otherwise mean
+    network requests just from looking at the file, and a wait of up to
+    WeasyPrint's timeout for each one that doesn't answer - unless
+    --remote-resources asked for them.
+
+    Returns:
+        A url_fetcher for weasyprint.HTML(), or None for its default
+        (anything goes).
+    """
+    if _MARKDOWN_REMOTE_RESOURCES:
+        return None
+    import weasyprint
+
+    allowed = {"file", "data"}
+    if hasattr(weasyprint, "URLFetcher"):  # newer WeasyPrint; older has default_url_fetcher()
+        return weasyprint.URLFetcher(allowed_protocols=allowed)
+
+    def fetch(url: str, *args: Any, **kwargs: Any) -> Any:
+        if url.split(":", 1)[0].lower() not in allowed:
+            raise ValueError(f"not loaded (see --remote-resources): {url}")
+        return weasyprint.default_url_fetcher(url, *args, **kwargs)
+
+    return fetch
+
+
 class MarkdownDocument(_RawTextView, RenderedDocument):
     """A Markdown file, rendered to a real PDF via the `markdown` +
     `weasyprint` Python libraries (see _render_markdown_pdf() below) - no
@@ -5309,7 +5389,7 @@ img { max-width: 100%; height: auto; }
         # loaded from there.
         base_url = os.path.dirname(os.path.abspath(self.path)) + "/"
         try:
-            HTML(string=html, base_url=base_url).write_pdf(out_pdf)
+            HTML(string=html, base_url=base_url, url_fetcher=_markdown_url_fetcher()).write_pdf(out_pdf)
         except Exception:
             # WeasyPrint can raise a variety of its own exception types for
             # a malformed document/CSS - none of them worth the whole
@@ -5877,7 +5957,7 @@ class PageCache:
     def __init__(self, tmpdir: str, handler: DocumentHandler, size: int = CACHE_SIZE) -> None:
         self.tmpdir = tmpdir
         self.size = size
-        self._cache: OrderedDict[tuple[int, int], Image.Image] = OrderedDict()  # (page, dpi_or_px_rounded) -> PIL.Image
+        self._cache: OrderedDict[tuple[Any, ...], Image.Image] = OrderedDict()  # (page, dpi) or (page, px, fit) -> PIL.Image
         self._native_images: dict[int, Image.Image] = {}  # page -> PIL.Image, loaded once each - see
         # DocumentHandler._native_page_image(): for kind == "image"
         # there's only ever page 1, but kind == "office" has one source
@@ -5952,7 +6032,7 @@ class PageCache:
             img = self._served.get(request)
             return img is not None and any(v is img for v in self._cache.values())
 
-    def _cached(self, key: tuple[int, int]) -> Image.Image | None:
+    def _cached(self, key: tuple[Any, ...]) -> Image.Image | None:
         """A previously-computed page image for `key`, or None - shared
         LRU bookkeeping used by every DocumentHandler.get_page_image()."""
         with self._lock:
@@ -5982,7 +6062,7 @@ class PageCache:
             if self._current_generation():
                 self._native_images[page] = img
 
-    def _store(self, key: tuple[int, int], img: Image.Image) -> None:
+    def _store(self, key: tuple[Any, ...], img: Image.Image) -> None:
         with self._lock:
             # Rendered for a generation clear() has since thrown away
             # (see __init__): hand it back to its caller, but don't keep it.
@@ -7042,6 +7122,11 @@ class _Search:
         )
 
 
+# What a click on a PDF's link opens (see _Links.activate()) - anything
+# else (file:, an app's own scheme, ...) is only shown.
+_OPENABLE_LINK_SCHEMES = frozenset({"http", "https", "mailto"})
+
+
 class _Links:
     """A PDF's hyperlinks, and the back/forward history of the jumps
     internal links and the table of contents make: a click on a link
@@ -7162,6 +7247,13 @@ class _Links:
         left from (see push_history())."""
         viewer = self.viewer
         if link["kind"] == "uri":
+            scheme = urllib.parse.urlsplit(link["uri"]).scheme.lower()
+            if scheme not in _OPENABLE_LINK_SCHEMES:
+                # A document's link to a local file, an app, or some app's
+                # own URL scheme isn't followed just because it was
+                # clicked - only shown.
+                viewer.draw_status(f"not opened (only http, https and mailto links are): {link['uri']}")
+                return
             try:
                 opened = webbrowser.open(link["uri"])
             except webbrowser.Error:
@@ -7712,15 +7804,15 @@ class _Sidebar:
         starting from the page being viewed (see handle_key())."""
         self.picking = True
         self.picked = self.viewer.page
-        self._redraw()
+        self.redraw()
 
     def stop_picking(self) -> None:
         """Back to the keys acting on the page, the column staying up."""
         self.picking = False
-        self._redraw()
+        self.redraw()
         self.viewer.draw_status()
 
-    def _redraw(self) -> None:
+    def redraw(self) -> None:
         """Draw the column now (if anything in it changed), and while
         picking, say on the status line what the keys do."""
         drawn = self.escapes(full=False)
@@ -7770,7 +7862,7 @@ class _Sidebar:
         elif key in ("\x0c", "FOCUS_IN"):
             viewer._invalidate_screen()
             viewer.refresh()
-            self._redraw()
+            self.redraw()
         else:
             if key in FORWARD_LINE_KEYS:
                 delta = 1
@@ -7785,7 +7877,7 @@ class _Sidebar:
             picked = max(1, min(viewer.npages, self.picked + delta))
             if picked != self.picked:
                 self.picked = picked
-                self._redraw()
+                self.redraw()
 
     def handle_mouse(self, kind: str, col: int, row: int) -> None:
         """A mouse event over the column (or a drag its scrollbar
@@ -7981,6 +8073,9 @@ class Viewer:
         # the separator row just above its first line - or None when it
         # isn't (one page's text at a time, or a non-paginated handler).
         self._text_page_starts: list[int] | None = None
+        # (page, text_scroll) of the last go-to in that view - see
+        # _sync_text_page().
+        self._text_page_gone_to: tuple[int, int] | None = None
         self._text_separator_lines: frozenset[int] = frozenset()
         self._text_max_page_lines = 0  # the -N gutter's width, per page
         self.overlays: _Overlays = _Overlays(self)  # the help and the table of contents
@@ -8233,9 +8328,16 @@ class Viewer:
             render_scale=self.office_render_scale, progress=progress,
         )
         if not pages:
-            pages = self.doc_handler._render_error_placeholder(
-                self.tmpdir, "Quick Look rendering failed - see -d/--debug for details",
-            )
+            missing = [tool for tool in ("pdfinfo", "pdftoppm") if shutil.which(tool) is None]
+            if missing:
+                # Only a PDF given on the command line checks for poppler
+                # up front (see check_deps()), but this document is shown
+                # through a PDF of its own - LibreOffice's, Chrome's or
+                # WeasyPrint's - so it needs it too.
+                message = f"needs poppler's {' and '.join(missing)} ({POPPLER_INSTALL_HINT})"
+            else:
+                message = "rendering failed - see -d/--debug for details"
+            pages = self.doc_handler._render_error_placeholder(self.tmpdir, message)
             self.doc_handler.pages = pages  # remember the placeholder too - don't retry every revisit
         self.npages = len(pages)
 
@@ -8600,13 +8702,20 @@ class Viewer:
         # sits as a fraction of the page's width, then put it back there
         # once the resized image is in. _load_page() only clamps
         # x_offset now, so this is what decides where a zoom lands.
+        # The same for the height - a zoom otherwise kept the scroll in
+        # pixels, so at 50% down a page, + left you 43% down, and every
+        # further + or - drifted further from what was being read.
         center_frac = (self.x_offset + self.crop_width / 2) / max(1, self.img.width)
+        shown_h = min(self.avail_height_px, self.img.height)
+        middle_frac = (self.scroll + shown_h / 2) / max(1, self.img.height)
         self.zoom = new_zoom
         self._load_page()
         self.x_offset = max(0, min(
             self.img.width - self.crop_width,
             round(center_frac * self.img.width - self.crop_width / 2),
         ))
+        shown_h = min(self.avail_height_px, self.img.height)
+        self.scroll = self._clamp_image_scroll(round(middle_frac * self.img.height - shown_h / 2))
 
     def reset_view(self) -> None:
         """"0": back to the untouched view of this page - zoom 1 and the
@@ -8780,12 +8889,25 @@ class Viewer:
         assumes an already-entered alternate screen: clears the
         viewport, writes the status line, etc.)."""
         if self.resized:
+            # Where text mode is reading, to put back at the new size: a
+            # new width re-splits every wrapped line, so the row number
+            # text_scroll holds stops meaning the same place (the same as
+            # _relayout() does for a toggle) - and at the very top (the
+            # border's row, say), the top it stays.
+            loaded = self.text_mode and bool(self.text_lines)
+            at_top = self.text_scroll <= self.text_scroll_min
+            top_line = self._top_text_line() if loaded else 0
             self._recompute_geometry()
             self.resized = False
-            if self.doc_handler.starts_in_text_mode():
-                self._load_text_page()  # (re)read the file - it's always "page 1"
+            if loaded:
+                # (Not read again: a resize, or ^Z and fg - see
+                # _suspend() - isn't a change to the file; -f/--follow
+                # is what notices those.)
+                self._scroll_to_text_line(top_line)
+                if at_top:
+                    self.text_scroll = self.text_scroll_min
             elif self.text_mode:
-                self._clamp_text_scroll()
+                self._load_text_page()  # the first time: read it
             else:
                 self._load_page()
 
@@ -9108,9 +9230,23 @@ class Viewer:
         """In the continuous text view, keep self.page following the
         page at the top of the screen (for the status line, n/p, and
         which page image mode comes back to) - a no-op otherwise, where
-        self.page only ever changes by loading a different page."""
-        if self._text_page_starts is not None:
-            self.page = self._text_page_of_line(self._top_text_line())
+        self.page only ever changes by loading a different page.
+
+        A page shorter than the screen near the end can never be at the
+        top, though - the text stops scrolling before that - so it would
+        never be the current one: n or > to it would snap back to the
+        page before, and G, <N>g and t would all act on that one. So a
+        page just gone to stays the current one until the view moves on
+        (see _go_to_page_continuous_text()), and at the very end of text
+        that scrolls at all, the last page is."""
+        if self._text_page_starts is None:
+            return
+        if self._text_page_gone_to == (self.page, self.text_scroll):
+            return
+        if self.text_scroll_max > self.text_scroll_min and self.text_scroll >= self.text_scroll_max:
+            self.page = self.npages
+            return
+        self.page = self._text_page_of_line(self._top_text_line())
 
     def _load_text_page(self) -> None:
         if self._text_continuous():
@@ -9611,6 +9747,9 @@ class Viewer:
         else:
             target = self._text_row_for_line(min(max(start, end - 1), start + scroll))
         self._set_text_scroll(target)
+        # The page stays the current one while the view stays here, even
+        # if it can't be at the top (see _sync_text_page()).
+        self._text_page_gone_to = (page, self.text_scroll)
 
     def go_to_text_line(self, n: int) -> None:
         """Jump to line `n` (1-based) within the current page's text -
@@ -10246,10 +10385,14 @@ class Viewer:
     def status_segments(self) -> list[tuple[str, str]]:
         """The default status line, as (text, color) fields in order."""
         if self.text_mode:
+            # Measured from text_scroll_min (-1 while the border's row
+            # shows), and held to 0-100: <N>g can put a line at the top
+            # past text_scroll_max (see go_to_text_line()).
+            span = self.text_scroll_max - self.text_scroll_min
             pct = (
                 100
-                if self.text_scroll_max == 0
-                else int(100 * self.text_scroll / self.text_scroll_max)
+                if span <= 0
+                else max(0, min(100, int(100 * (self.text_scroll - self.text_scroll_min) / span)))
             )
             mode_field = " text "
         elif self.continuous:
@@ -10647,9 +10790,9 @@ class Viewer:
         elif key in BACKWARD_WINDOW_KEYS:
             self.text_scroll_up(avail_rows)
         elif key in ("d", "\x04"):
-            self.text_scroll_down(avail_rows // 2)
+            self.text_scroll_down(max(1, avail_rows // 2))
         elif key in ("u", "\x15"):
-            self.text_scroll_up(avail_rows // 2)
+            self.text_scroll_up(max(1, avail_rows // 2))
         elif key in FORWARD_LINE_KEYS:
             self.text_scroll_down(1)
         elif key in BACKWARD_LINE_KEYS:
@@ -11332,6 +11475,23 @@ class _KeyDispatcher:
             return True
         return self._view_key(key)
 
+    def redraw_input(self) -> None:
+        """Put back on the status line whatever input is under way - the
+        search prompt, a ":"/"-" prefix, a count, picking a thumbnail -
+        after a redraw that replaced it with the normal status line."""
+        viewer = self.viewer
+        if self.search_editor is not None:
+            viewer.draw_search_prompt(
+                self.search_editor.text, self.search_editor.cursor,
+                backward=self.search_backward, multiline=self.search_editor.multiline,
+            )
+        elif self.pending_prefix is not None:
+            viewer.draw_status(self.pending_prefix)
+        elif self.num_buf:
+            viewer.draw_status(f"number: {self.num_buf}")
+        elif viewer.sidebar.picking:
+            viewer.sidebar.redraw()
+
     def _search_prompt_key(self, editor: _LineEditor, key: str) -> None:
         """A key typed at the "/"/"?" prompt: edit the query, or submit
         it (an empty one repeats the last query) or cancel it."""
@@ -11430,6 +11590,9 @@ class _KeyDispatcher:
                 viewer.go_to_text_line(count)
                 viewer.refresh()
                 return True
+            # Dropped: take "number: N" off the status line, which g/G
+            # itself only redraws if it moves the view.
+            viewer.draw_status()
         elif viewer.handle_count_key(key, count):
             self.num_buf = ""
             return True
@@ -11509,6 +11672,10 @@ def run_viewer(
         if viewer.resized:
             try:
                 viewer.refresh()
+                # The redraw put up the normal status line - over the
+                # search prompt, say, still taking the keys (a resize, or
+                # ^Z and fg, can come mid-way).
+                dispatcher.redraw_input()
             except (subprocess.CalledProcessError, OSError):
                 # e.g. a plain text file re-read at the new size
                 _report_unreadable_file(viewer)
@@ -11648,6 +11815,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "(default: %(default)s)",
     )
     parser.add_argument(
+        "--remote-resources",
+        action="store_true",
+        help="let a Markdown file load images and styles from the network",
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="render without using the persistent cache",
@@ -11760,9 +11932,9 @@ def _collect_files(
 
 
 def _open_key_input(reading_stdin: bool) -> tuple[int, int | None]:
-    """The terminal to read keys and mouse events from - stdin, unless
-    stdin is the document itself (pdfless as $PAGER) - exiting via
-    die() if there's no usable one.
+    """The terminal to read keys and mouse events from - stdin if it's
+    one, otherwise /dev/tty - exiting via die() if there's no usable
+    one.
 
     Args:
         reading_stdin: whether the document came in on stdin.
@@ -11771,19 +11943,18 @@ def _open_key_input(reading_stdin: bool) -> tuple[int, int | None]:
         (fd, fd_to_close): the terminal's fd, and the same fd again if
         it was opened here (/dev/tty) for the caller to close when
         done, or None if it's stdin's own."""
-    if reading_stdin:
-        # stdin's own fd has been drained (see _capture_stdin()) and
-        # is never read again - /dev/tty is the real keyboard now, the
-        # same trick less(1)/most(1) use to double as $PAGER.
-        try:
-            fd = os.open("/dev/tty", os.O_RDWR)
-        except OSError as e:
-            die(f"can't open /dev/tty for keyboard input: {e}")
-        return fd, fd
-    if not sys.stdin.isatty():
-        die("stdin must be a terminal (or pipe something into "
-            "pdfless, or pass \"-\", to page it)")
-    return sys.stdin.fileno(), None
+    if not reading_stdin and sys.stdin.isatty():
+        return sys.stdin.fileno(), None
+    # Either stdin was the document (pdfless as $PAGER - drained, see
+    # _capture_stdin(), and never read again), or it's no terminal at
+    # all: `find ... | xargs pdfless` (BSD xargs gives the command
+    # /dev/null for stdin), `pdfless a.pdf < /dev/null`. Either way
+    # /dev/tty is the real keyboard, the same trick less(1)/most(1) use.
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError as e:
+        die(f"can't open /dev/tty for keyboard input: {e}")
+    return fd, fd
 
 
 def _leave_viewer_screen(viewer: Viewer | None, keep: bool) -> None:
@@ -11826,6 +11997,9 @@ def main() -> None:
     if args.no_cache:
         global _OFFICE_CACHE_ENABLED
         _OFFICE_CACHE_ENABLED = False
+    if args.remote_resources:
+        global _MARKDOWN_REMOTE_RESOURCES
+        _MARKDOWN_REMOTE_RESOURCES = True
 
     # Reading from stdin - no file given at all, or "-" given in its
     # place - lets pdfless work as $PAGER: git/man/etc. invoke $PAGER

@@ -129,6 +129,7 @@ With no filename, or with `-` as the filename, `pdfless` reads standard input.
 | `-c`, `--continuous` | Scroll through pages continuously, so the bottom of one page and the top of the next can be on screen together. In text mode, a paginated document (PDF, or a format rendered to PDF) is shown as one run of text with a separator line between pages. Toggle at any time with `c`. |
 | `--no-incremental-scroll` | Redraw the full page image on every scroll. |
 | `-d`, `--debug` | Print debugging information to standard error. |
+| `--remote-resources` | Let a Markdown file load images and stylesheets from the network. By default only local files (such as a relative-path image) are loaded, so viewing a file never makes network requests. |
 | `--no-cache` | Render afresh without reading or writing the persistent cache. |
 | `--clear-cache` | Delete the persistent cache and exit without opening any files. |
 
@@ -241,7 +242,7 @@ plain images and previews without extractable text. While a search is active,
 | `S` | Show or hide page thumbnails down the left edge (image mode, in a terminal at least 60 columns wide). The page being viewed is framed. Click a thumbnail to go to its page; the mouse wheel over them, or their own scrollbar on the right of them, scrolls them. |
 | `s` | Move to the page thumbnails (showing them if needed) to pick one: move with `j`/`k`, press `ENTER` to go to that page (`t`/`T`: in text mode), or `q`/`s` to go back to the page with the thumbnails left up. |
 | `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-f`/`--follow` is specified. |
-| Click a PDF link | Open a URL in the system browser or follow an internal link. |
+| Click a PDF link | Open a URL in the system browser (`http`, `https` and `mailto` links only; others are just shown on the status line) or follow an internal link. |
 | `[` / `]` | Go back / forward through the positions internal links and the table of contents (`o`) jumped from. |
 | `o`, `TAB` | Show the table of contents (a PDF's bookmarks, or a document's headings), with the current section selected. Move with `j`/`k` or the mouse wheel, then press `ENTER` or click an entry to jump there. Press `q` to close it. |
 | Click or drag the scrollbar | Jump to a document position in image mode. In text mode, the scrollbar is display-only. |
@@ -345,6 +346,12 @@ Use `--no-cache` to render without reading or writing the cache, or
 `--clear-cache` to delete it and exit. The cache directory is shown in `--help`.
 
 ## Caveats
+
+### Encrypted PDFs
+
+An encrypted PDF asks for its password when it's opened. Poppler takes the
+password only on its command line, so while pdfless is rendering, other users
+on the same machine can see it (for example with `ps`).
 
 ### tmux
 

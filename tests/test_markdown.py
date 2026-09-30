@@ -222,3 +222,41 @@ def test_a_markdown_file_that_isnt_utf8_still_has_a_text_mode(tmp_path):
     sjis = tmp_path / "sjis.md"
     sjis.write_bytes("# 見出し\n".encode("cp932"))
     assert "見出し" not in classify(str(sjis), tmp_path).extract_text(1)[0]
+
+
+@requires_markdown_rendering
+def test_a_markdown_file_loads_nothing_from_the_network_unless_asked(sample_image, tmp_path, monkeypatch):
+    """An <img> from the network (a README's badges) meant requests just
+    from viewing the file - and a wait for each that didn't answer. Local
+    images still load; --remote-resources lets the others through."""
+    import http.server
+    import shutil
+    import threading
+
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        shutil.copy(sample_image, tmp_path / "local.png")
+        path = tmp_path / "doc.md"
+        path.write_text(
+            f"# Doc\n\n![local](local.png)\n\n![remote](http://127.0.0.1:{server.server_port}/badge.svg)\n"
+        )
+        for remote, expected in ((False, []), (True, ["/badge.svg"])):
+            monkeypatch.setattr(pdfless, "_MARKDOWN_REMOTE_RESOURCES", remote)
+            requests.clear()
+            handler = classify(str(path), tmp_path)
+            assert handler.build_pages(str(tmp_path))
+            assert requests == expected
+    finally:
+        server.shutdown()

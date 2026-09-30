@@ -56,13 +56,39 @@ def test_nothing_viewable_exits(tmp_path, capsys):
     assert "no valid PDF" in capsys.readouterr().err
 
 
-def test_keys_need_a_terminal_on_stdin(monkeypatch, capsys):
-    """Unless the document came in on stdin, stdin is where keys come from."""
+def test_keys_come_from_dev_tty_when_stdin_isnt_a_terminal(monkeypatch):
+    """`find . -name '*.pdf' | xargs pdfless` (BSD xargs gives the command
+    /dev/null for stdin) or `pdfless a.pdf < /dev/null` used to exit
+    with "stdin must be a terminal"; less(1) reads /dev/tty then."""
+    opened = []
+    real_open = os.open
+
+    def fake_open(path, flags, *args):
+        if path == "/dev/tty":
+            opened.append(path)
+            return 99
+        return real_open(path, flags, *args)
+
     r, w = os.pipe()
     try:
         monkeypatch.setattr(pdfless.sys, "stdin", os.fdopen(r))
+        monkeypatch.setattr(pdfless.os, "open", fake_open)
+        assert pdfless._open_key_input(reading_stdin=False) == (99, 99)
+    finally:
+        os.close(w)
+    assert opened == ["/dev/tty"]
+
+
+def test_no_terminal_at_all_exits(monkeypatch, capsys):
+    def no_tty(path, flags, *args):
+        raise OSError("Device not configured")
+
+    r, w = os.pipe()
+    try:
+        monkeypatch.setattr(pdfless.sys, "stdin", os.fdopen(r))
+        monkeypatch.setattr(pdfless.os, "open", no_tty)
         with pytest.raises(SystemExit):
             pdfless._open_key_input(reading_stdin=False)
     finally:
         os.close(w)
-    assert "stdin must be a terminal" in capsys.readouterr().err
+    assert "can't open /dev/tty" in capsys.readouterr().err

@@ -334,3 +334,59 @@ def test_w_toggles_wrapping_in_text_mode(sample_text):
     viewer.handle_key_text("s")  # no longer wrapping's
     assert viewer.text_wrap is not wrap
     assert "S" in pdfless._PREFIX_BINDINGS["-"] and "s" not in pdfless._PREFIX_BINDINGS["-"]
+
+
+def test_a_dropped_count_leaves_the_status_line(sample_pdf, capsys):
+    """In image mode <N>g drops the count and is plain g - which, at the
+    top of the page already, doesn't redraw: "number: 10" stayed up."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    d = dispatcher_for(viewer)
+    d.handle("1")
+    d.handle("0")
+    capsys.readouterr()
+    d.handle("g")
+    out = capsys.readouterr().out
+    assert out and "number:" not in out
+
+
+def test_the_prompt_comes_back_after_a_resize(sample_pdf, capsys):
+    """A resize (or ^Z and fg) redraws the normal status line - over the
+    search prompt that's still taking the keys, so typing went on
+    unseen."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    d = dispatcher_for(viewer)
+    for key in "/ab":
+        d.handle(key)
+    viewer.refresh()  # what the resize does
+    capsys.readouterr()
+    d.redraw_input()
+    assert "/ab" in capsys.readouterr().out
+    d.handle("\x1b")
+    d.handle(":")
+    d.redraw_input()
+    assert ":" in capsys.readouterr().out
+
+
+def test_half_a_screen_is_at_least_a_line(sample_text):
+    """On a two-row terminal, d/u in text mode moved by 0 rows."""
+    import tempfile
+    lines = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+    lines.write("".join(f"{i}\n" for i in range(50)))
+    lines.close()
+    viewer = make_viewer(pdfless.TextDocument(lines.name), rows=2)
+    before = viewer.text_scroll
+    viewer.handle_key_text("d")
+    assert viewer.text_scroll > before
+
+
+def test_only_web_and_mail_links_are_opened(sample_pdf, monkeypatch, capsys):
+    """A PDF's /URI link went to webbrowser.open() whatever its scheme -
+    file:, a .app, some app's own URL scheme."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    opened = []
+    monkeypatch.setattr(pdfless.webbrowser, "open", lambda uri: opened.append(uri) or True)
+    for uri in ("https://example.com/", "mailto:a@example.com", "file:///etc/passwd",
+                "x-apple.systempreferences:com.apple.preference", "javascript:alert(1)"):
+        viewer.links.activate({"kind": "uri", "uri": uri})
+    assert opened == ["https://example.com/", "mailto:a@example.com"]
+    assert "not opened" in capsys.readouterr().out

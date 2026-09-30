@@ -667,3 +667,20 @@ def test_a_failed_gpu_screenshot_is_retried_without_it(tmp_path, monkeypatch):
     monkeypatch.setattr(pdfless, "run_subprocess", fake)
     pdfless._capture_html_screenshot("chrome", str(tmp_path / "a.html"), 100, 100, str(out_png), 1.0)
     assert len(calls) == 2 and "--disable-gpu" in calls[1]
+
+
+def test_a_render_failure_without_poppler_says_so(sample_md, tmp_path, monkeypatch):
+    """Only a PDF on the command line checks for poppler up front, but a
+    Markdown/SVG/LibreOffice document is shown through a PDF too - and
+    without poppler it failed as "Quick Look rendering failed"."""
+    handler = classify(sample_md, tmp_path)
+    monkeypatch.setattr(handler, "ensure_pages", lambda *a, **k: None)
+    real_which = pdfless.shutil.which
+    monkeypatch.setattr(pdfless.shutil, "which", lambda tool: None if tool == "pdftoppm" else real_which(tool))
+    messages = []
+    real_placeholder = handler._render_error_placeholder
+    monkeypatch.setattr(handler, "_render_error_placeholder", lambda d, m: messages.append(m) or real_placeholder(d, m))
+    _master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 800, 480))
+    pdfless.Viewer([handler], 0, 1, str(tmp_path), slave, "width")
+    assert messages and "poppler's pdftoppm" in messages[0]
