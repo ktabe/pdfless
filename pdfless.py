@@ -67,6 +67,10 @@ from PIL import ExifTags, Image, ImageChops, ImageOps
 # last-resort handler prints them on stderr: straight over the page on
 # screen. It recovers from those on its own, so they're only noise here.
 logging.getLogger("pypdf").setLevel(logging.CRITICAL + 1)
+# Likewise WeasyPrint's (a Markdown file's image it couldn't, or wasn't
+# allowed to, load - see _markdown_url_fetcher()): with no handler set
+# up, Python's last-resort one would print them over the screen.
+logging.getLogger("weasyprint").setLevel(logging.CRITICAL + 1)
 
 # Type aliases for the shapes that travel between functions here. Spelled
 # with typing's generics rather than `X | Y`, since these (unlike the
@@ -955,6 +959,10 @@ OFFICE_CACHE_MAX_ENTRIES = 50  # persistent rendered-pages cache (see
 # _office_cache_dir()) - entries beyond this many, least-recently-used
 # first (by atime - see _render_result_cached()), are pruned each time
 # a new one is added.
+
+# --remote-resources: let a Markdown file's images and stylesheets come
+# from the network too - see _markdown_url_fetcher().
+_MARKDOWN_REMOTE_RESOURCES = False
 
 _OFFICE_CACHE_ENABLED = True  # --no-cache flips this off for the whole
 # process - read directly by _render_result_cached() rather than
@@ -5191,6 +5199,34 @@ def markdown_heading_lines(lines: Sequence[str]) -> list[int]:
     return headings
 
 
+def _markdown_url_fetcher() -> Any:
+    """What WeasyPrint loads a Markdown file's images and stylesheets
+    with: only local ones (file:, and data: for inline images) - an
+    <img src="https://..."> (a README's badges, say) would otherwise mean
+    network requests just from looking at the file, and a wait of up to
+    WeasyPrint's timeout for each one that doesn't answer - unless
+    --remote-resources asked for them.
+
+    Returns:
+        A url_fetcher for weasyprint.HTML(), or None for its default
+        (anything goes).
+    """
+    if _MARKDOWN_REMOTE_RESOURCES:
+        return None
+    import weasyprint
+
+    allowed = {"file", "data"}
+    if hasattr(weasyprint, "URLFetcher"):  # newer WeasyPrint; older has default_url_fetcher()
+        return weasyprint.URLFetcher(allowed_protocols=allowed)
+
+    def fetch(url: str, *args: Any, **kwargs: Any) -> Any:
+        if url.split(":", 1)[0].lower() not in allowed:
+            raise ValueError(f"not loaded (see --remote-resources): {url}")
+        return weasyprint.default_url_fetcher(url, *args, **kwargs)
+
+    return fetch
+
+
 class MarkdownDocument(_RawTextView, RenderedDocument):
     """A Markdown file, rendered to a real PDF via the `markdown` +
     `weasyprint` Python libraries (see _render_markdown_pdf() below) - no
@@ -5352,7 +5388,7 @@ img { max-width: 100%; height: auto; }
         # loaded from there.
         base_url = os.path.dirname(os.path.abspath(self.path)) + "/"
         try:
-            HTML(string=html, base_url=base_url).write_pdf(out_pdf)
+            HTML(string=html, base_url=base_url, url_fetcher=_markdown_url_fetcher()).write_pdf(out_pdf)
         except Exception:
             # WeasyPrint can raise a variety of its own exception types for
             # a malformed document/CSS - none of them worth the whole
@@ -11766,6 +11802,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "(default: %(default)s)",
     )
     parser.add_argument(
+        "--remote-resources",
+        action="store_true",
+        help="let a Markdown file load images and styles from the network",
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="render without using the persistent cache",
@@ -11943,6 +11984,9 @@ def main() -> None:
     if args.no_cache:
         global _OFFICE_CACHE_ENABLED
         _OFFICE_CACHE_ENABLED = False
+    if args.remote_resources:
+        global _MARKDOWN_REMOTE_RESOURCES
+        _MARKDOWN_REMOTE_RESOURCES = True
 
     # Reading from stdin - no file given at all, or "-" given in its
     # place - lets pdfless work as $PAGER: git/man/etc. invoke $PAGER

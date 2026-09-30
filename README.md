@@ -129,6 +129,7 @@ With no filename, or with `-` as the filename, `pdfless` reads standard input.
 | `-c`, `--continuous` | Scroll through pages continuously, so the bottom of one page and the top of the next can be on screen together. In text mode, a paginated document (PDF, or a format rendered to PDF) is shown as one run of text with a separator line between pages. Toggle at any time with `c`. |
 | `--no-incremental-scroll` | Redraw the full page image on every scroll. |
 | `-d`, `--debug` | Print debugging information to standard error. |
+| `--remote-resources` | Let a Markdown file load images and stylesheets from the network. By default only local files (such as a relative-path image) are loaded, so viewing a file never makes network requests. |
 | `--no-cache` | Render afresh without reading or writing the persistent cache. |
 | `--clear-cache` | Delete the persistent cache and exit without opening any files. |
 
