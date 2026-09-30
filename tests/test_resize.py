@@ -63,3 +63,48 @@ def test_the_top_stays_the_top(sample_pdf):
     assert viewer.text_scroll == viewer.text_scroll_min  # the border's row
     resized(viewer, slave, 40, 90)
     assert viewer.text_scroll == viewer.text_scroll_min
+
+
+def continuous_text_viewer(sample_pdf, rows=50):
+    """The continuous text view of the 7-page sample, on a screen taller
+    than its last page's text - which can never be scrolled to the top."""
+    _master, slave = pty.openpty()
+    resize(slave, rows, 100)
+    viewer = pdfless.Viewer(
+        [pdfless.PdfDocument(sample_pdf)], 0, 1, tempfile.mkdtemp(), slave, "width",
+        options=pdfless.ViewerOptions(continuous=True),
+    )
+    viewer.refresh()
+    assert viewer.enter_text_mode()
+    viewer.refresh()
+    return viewer
+
+
+def test_a_short_last_page_can_be_the_current_one(sample_pdf):
+    """It used to snap back to page 6: > and n left "page 6/7", and G at
+    the end scrolled backwards, to page 6's bottom."""
+    viewer = continuous_text_viewer(sample_pdf)
+    viewer.handle_count_key(">", None)
+    viewer.refresh()
+    assert viewer.page == 7
+    end = viewer.text_scroll
+    viewer.handle_key_text("G")
+    viewer.refresh()
+    assert viewer.page == 7 and viewer.text_scroll == end  # not back up
+
+    viewer.go_to_page_text(6, 0)
+    viewer.refresh()
+    assert viewer.page == 6
+    viewer.handle_key_text("n")
+    viewer.refresh()
+    assert viewer.page == 7
+
+
+def test_scrolling_back_from_the_end_follows_the_top_again(sample_pdf):
+    viewer = continuous_text_viewer(sample_pdf)
+    viewer.handle_count_key(">", None)
+    viewer.refresh()
+    for _ in range(3):
+        viewer.handle_key_text("k")
+    viewer.refresh()
+    assert viewer.page == viewer._text_page_of_line(viewer._top_text_line())

@@ -7981,6 +7981,9 @@ class Viewer:
         # the separator row just above its first line - or None when it
         # isn't (one page's text at a time, or a non-paginated handler).
         self._text_page_starts: list[int] | None = None
+        # (page, text_scroll) of the last go-to in that view - see
+        # _sync_text_page().
+        self._text_page_gone_to: tuple[int, int] | None = None
         self._text_separator_lines: frozenset[int] = frozenset()
         self._text_max_page_lines = 0  # the -N gutter's width, per page
         self.overlays: _Overlays = _Overlays(self)  # the help and the table of contents
@@ -9121,9 +9124,23 @@ class Viewer:
         """In the continuous text view, keep self.page following the
         page at the top of the screen (for the status line, n/p, and
         which page image mode comes back to) - a no-op otherwise, where
-        self.page only ever changes by loading a different page."""
-        if self._text_page_starts is not None:
-            self.page = self._text_page_of_line(self._top_text_line())
+        self.page only ever changes by loading a different page.
+
+        A page shorter than the screen near the end can never be at the
+        top, though - the text stops scrolling before that - so it would
+        never be the current one: n or > to it would snap back to the
+        page before, and G, <N>g and t would all act on that one. So a
+        page just gone to stays the current one until the view moves on
+        (see _go_to_page_continuous_text()), and at the very end of text
+        that scrolls at all, the last page is."""
+        if self._text_page_starts is None:
+            return
+        if self._text_page_gone_to == (self.page, self.text_scroll):
+            return
+        if self.text_scroll_max > self.text_scroll_min and self.text_scroll >= self.text_scroll_max:
+            self.page = self.npages
+            return
+        self.page = self._text_page_of_line(self._top_text_line())
 
     def _load_text_page(self) -> None:
         if self._text_continuous():
@@ -9624,6 +9641,9 @@ class Viewer:
         else:
             target = self._text_row_for_line(min(max(start, end - 1), start + scroll))
         self._set_text_scroll(target)
+        # The page stays the current one while the view stays here, even
+        # if it can't be at the top (see _sync_text_page()).
+        self._text_page_gone_to = (page, self.text_scroll)
 
     def go_to_text_line(self, n: int) -> None:
         """Jump to line `n` (1-based) within the current page's text -
