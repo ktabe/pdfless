@@ -6972,6 +6972,12 @@ class _Links:
         self.back: list[tuple[int, int, int]] = []
         self.forward: list[tuple[int, int, int]] = []
 
+    def forget_index(self) -> None:
+        """Drop the links (they're read again on the next click), keeping
+        the history - for a reload of the same file (see Viewer.reload()),
+        whose pages, and links, may have changed."""
+        self.index = None
+
     def reset(self) -> None:
         """Drop the links and the history, for a switch to another file."""
         self.index = None
@@ -10400,6 +10406,7 @@ class Viewer:
         self.cache.clear()
         self.sidebar.reset()
         self.search.reset()
+        self.links.forget_index()  # the pages (and their links) may have changed
         self._mode_switch = None
         self._text_pages = None  # stale too - re-extracted on demand
         self.overlays.forget_outline()  # the outline may have changed too
