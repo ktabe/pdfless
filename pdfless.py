@@ -940,7 +940,7 @@ def _pdf_render_result(out_pdf: str, ok: bool = True) -> tuple | None:
 
 # Bumped whenever a change to how pdfless renders a document would make
 # an already-cached rendering of it wrong (see _cached_render_dir()) -
-# the cache only checks the source file's own mtime for staleness, so
+# the cache only checks the source file itself for staleness, so
 # without this an entry made before such a fix would keep being served
 # until the file itself changed. Entries under an old version are simply
 # never looked up again, and age out via OFFICE_CACHE_MAX_ENTRIES.
@@ -1037,7 +1037,9 @@ def _cached_render_dir(path: str, key_suffix: str = '') -> str:
 def _prune_office_cache(cache_dir: str, keep: int = OFFICE_CACHE_MAX_ENTRIES) -> None:
     """Delete the least-recently-used entries (oldest atime - bumped on
     every cache hit by _render_result_cached(), which is the only thing
-    that ever touches atime here) beyond `keep`. Each entry is itself a
+    that ever touches atime here) beyond `keep` - never one this
+    pdfless has used (_CACHE_ENTRIES_IN_USE), as what it shows is read
+    straight from there. Each entry is itself a
     directory (see _cached_render_dir()), so removal is shutil.rmtree()
     rather than a plain unlink. Best-effort: an entry that vanishes or
     fails to stat/remove between listing and pruning (another process's
@@ -1052,12 +1054,15 @@ def _prune_office_cache(cache_dir: str, keep: int = OFFICE_CACHE_MAX_ENTRIES) ->
     entries = []
     for name in names:
         p = os.path.join(cache_dir, name)
+        if p in _CACHE_ENTRIES_IN_USE:
+            continue  # this session's, and read in place - see _render_result_cached()
         try:
             entries.append((os.stat(p).st_atime, p))
         except OSError:
             continue
     entries.sort()
-    for _atime, p in entries[:len(entries) - keep]:
+    in_use = len(names) - len(entries)
+    for _atime, p in entries[:max(0, len(entries) - max(0, keep - in_use))]:
         try:
             shutil.rmtree(p) if os.path.isdir(p) else os.unlink(p)
         except OSError:
@@ -1073,14 +1078,13 @@ def _render_result_cached(
     returning either a ("pdf", pdf_path, npages) tuple or a plain list
     of page image paths, in reading order, or None on failure) only if
     there's no still-fresh persistent cache entry (see
-    _office_cache_dir()) already covering `path` - "fresh" being a
-    plain mtime comparison against `path` itself, the same staleness
-    check -f/--follow already uses elsewhere, applied here to the
-    cache entry directory's own mtime instead of a separately-recorded
-    one: deliberately NOT part of the cache key (see
+    _office_cache_dir()) already covering `path` - "fresh" meaning the
+    entry was rendered from `path` exactly as it is now: its mtime and
+    size, recorded in the entry when that render started (see
+    _source_stamp()). Deliberately NOT part of the cache key (see
     _cached_render_dir()), so this is what actually decides whether a
-    given entry is still good, and updating it (by writing a fresh
-    render) is exactly what makes it good again after an edit. Shared
+    given entry is still good, and writing a fresh render is exactly
+    what makes it good again after an edit. Shared
     by every one of pdfless's own document-to-page-images renderings -
     the cache doesn't care which tool produced a given entry or which
     of the two result shapes it is, only that it's still a fresh
@@ -1098,23 +1102,22 @@ def _render_result_cached(
         return render_fn(), False
 
     entry_dir = _cached_render_dir(path, key_suffix)
-    try:
-        source_mtime = os.path.getmtime(path)
-        cache_mtime = os.path.getmtime(entry_dir)
-    except OSError:
-        cache_mtime = None
-
-    if cache_mtime is not None and cache_mtime >= source_mtime:
+    # Fresh means rendered from the file exactly as it is now - its
+    # mtime (to the nanosecond) and size as recorded when that render
+    # started (see _CACHE_SOURCE_STAMP). Not "the entry is newer than
+    # the file": a save during a long render gave the old content a
+    # newer entry, served ever after, and a copy put back with an older
+    # mtime (cp -p, rsync -t, a restore) matched too.
+    source = _source_stamp(path)
+    if source is not None and source == _read_source_stamp(entry_dir):
         cached = _read_cached_render(entry_dir)
         if cached is not None:
-            # A hit: bump atime only (LRU recency for
-            # _prune_office_cache()) - mtime is left exactly as it is,
-            # since it's what this same comparison will be judged
-            # against next time.
+            # A hit: bump atime (LRU recency for _prune_office_cache()).
             try:
-                os.utime(entry_dir, (time.time(), cache_mtime))
+                os.utime(entry_dir, (time.time(), os.path.getmtime(entry_dir)))
             except OSError:
                 pass
+            _CACHE_ENTRIES_IN_USE.add(entry_dir)
             return cached, True
         # Present but unusable (corrupt/incomplete, or left behind by
         # an older cache format) - fall through and re-render, which
@@ -1123,9 +1126,43 @@ def _render_result_cached(
     result = render_fn()
     if not result:
         return None, False
-    _publish_cached_render(entry_dir, result)
-    _prune_office_cache(os.path.dirname(entry_dir))
+    if source is not None:
+        # Stamped with the file as it was when the render started: if
+        # it's been saved since, the entry is stale on the next look.
+        _publish_cached_render(entry_dir, result, source)
+        _CACHE_ENTRIES_IN_USE.add(entry_dir)
+        _prune_office_cache(os.path.dirname(entry_dir))
     return result, False
+
+
+# Written into every cache entry (see _publish_cached_render()): the
+# source file's "<mtime in ns> <size>" when its render started.
+_CACHE_SOURCE_STAMP = "source"
+
+# Cache entries this pdfless has used - a render shown from one is read
+# in place (see _read_cached_render()), and a file visited earlier can be
+# gone back to - so _prune_office_cache() leaves them be.
+_CACHE_ENTRIES_IN_USE: set[str] = set()
+
+
+def _source_stamp(path: str) -> str | None:
+    """`path`'s mtime (in ns) and size, as a cache entry records them (see
+    _render_result_cached()) - None if it can't be read."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return f"{st.st_mtime_ns} {st.st_size}"
+
+
+def _read_source_stamp(entry_dir: str) -> str | None:
+    """The source stamp a cache entry was written with, or None (none
+    yet, or an entry from before they were recorded - stale either way)."""
+    try:
+        with open(os.path.join(entry_dir, _CACHE_SOURCE_STAMP), "r", encoding="ascii") as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _read_cached_render(entry_dir: str) -> RenderResult | None:
@@ -1148,7 +1185,7 @@ def _read_cached_render(entry_dir: str) -> RenderResult | None:
     return [os.path.join(entry_dir, n) for n in names] if names else None
 
 
-def _publish_cached_render(entry_dir: str, result: RenderResult) -> None:
+def _publish_cached_render(entry_dir: str, result: RenderResult, source: str) -> None:
     """Copy `result` (render_fn()'s return value - see
     _render_result_cached()) into entry_dir, atomically: built up in a
     temp directory alongside it (same filesystem as entry_dir, unlike
@@ -1157,10 +1194,14 @@ def _publish_cached_render(entry_dir: str, result: RenderResult) -> None:
     then moved into place with one directory rename, so no reader ever
     sees a partially-written cache entry. Best-effort: any OSError here
     just leaves the cache without this entry, since the render itself
-    already succeeded and that's what actually matters to the caller."""
+    already succeeded and that's what actually matters to the caller.
+    `source` is the source file's stamp (see _source_stamp()), written
+    alongside."""
     tmp_dir = entry_dir + f".tmp{os.getpid()}"
     try:
         os.makedirs(tmp_dir, exist_ok=True)
+        with open(os.path.join(tmp_dir, _CACHE_SOURCE_STAMP), "w", encoding="ascii") as f:
+            f.write(source)
         if isinstance(result, tuple):  # ("pdf", pdf_path, npages) - see RenderResult
             shutil.copyfile(result[1], os.path.join(tmp_dir, "document.pdf"))
         else:
@@ -3020,7 +3061,9 @@ class DocumentHandler:
         instead, since a PDF has no fixed native pixel size at all."""
         native = self._native_page_image(cache, page)
         native_dim = native.width if fit == "width" else native.height
-        key = (page, round(target_px))
+        # The fit is part of it: a width target at one zoom can equal a
+        # height target at another, and they're different sizes.
+        key = (page, round(target_px), fit)
         cached = cache._cached(key)
         if cached is not None:
             return cached
@@ -5877,7 +5920,7 @@ class PageCache:
     def __init__(self, tmpdir: str, handler: DocumentHandler, size: int = CACHE_SIZE) -> None:
         self.tmpdir = tmpdir
         self.size = size
-        self._cache: OrderedDict[tuple[int, int], Image.Image] = OrderedDict()  # (page, dpi_or_px_rounded) -> PIL.Image
+        self._cache: OrderedDict[tuple[Any, ...], Image.Image] = OrderedDict()  # (page, dpi) or (page, px, fit) -> PIL.Image
         self._native_images: dict[int, Image.Image] = {}  # page -> PIL.Image, loaded once each - see
         # DocumentHandler._native_page_image(): for kind == "image"
         # there's only ever page 1, but kind == "office" has one source
@@ -5952,7 +5995,7 @@ class PageCache:
             img = self._served.get(request)
             return img is not None and any(v is img for v in self._cache.values())
 
-    def _cached(self, key: tuple[int, int]) -> Image.Image | None:
+    def _cached(self, key: tuple[Any, ...]) -> Image.Image | None:
         """A previously-computed page image for `key`, or None - shared
         LRU bookkeeping used by every DocumentHandler.get_page_image()."""
         with self._lock:
@@ -5982,7 +6025,7 @@ class PageCache:
             if self._current_generation():
                 self._native_images[page] = img
 
-    def _store(self, key: tuple[int, int], img: Image.Image) -> None:
+    def _store(self, key: tuple[Any, ...], img: Image.Image) -> None:
         with self._lock:
             # Rendered for a generation clear() has since thrown away
             # (see __init__): hand it back to its caller, but don't keep it.
