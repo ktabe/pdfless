@@ -3700,8 +3700,9 @@ class PdfDocument(DocumentHandler):
             found: dict[tuple[int, int], tuple[float, float, float, float]] = {}
             for view in views:
                 order = view.get("order")
+                starts = [w[0] for w in view["words"]]
                 for pos, match_end in PdfDocument._view_spans(pattern, view, across_lines):
-                    hit = PdfDocument._match_box(view["words"], pos, match_end)
+                    hit = PdfDocument._match_box(view["words"], pos, match_end, starts)
                     if hit is None:
                         continue  # a line break (see _gap_box())
                     word_idx, local_start, box = hit
@@ -3745,23 +3746,38 @@ class PdfDocument(DocumentHandler):
     @staticmethod
     def _match_box(
         words: list[tuple[int, int, float, float, float, float]], pos: int, match_end: int,
+        starts: list[int] | None = None,
     ) -> tuple[int, int, tuple[float, float, float, float]] | None:
         """Where a match at text[pos:match_end] is on the page.
 
         Args:
             words: the (start, end, xMin, yMin, xMax, yMax) of each word
-                in the text searched.
+                in the text searched - in order, as the text is.
             pos, match_end: the match's offsets in that text.
+            starts: each word's start (words[i][0]) - passed in when
+                there are many matches to box on the same page, rather
+                than made again for every one.
 
         Returns:
             (index of the first word it touches, its offset in that word,
             (xMin, yMin, xMax, yMax) - the union of every word it
             touches), or - touching no word at all - _gap_box().
         """
+        if starts is None:
+            starts = [w[0] for w in words]
         box = None
         first = None
-        for word_idx, (word_start, word_end, xmin, ymin, xmax, ymax) in enumerate(words):
-            if word_start < match_end and word_end > pos:
+        # Only the words from the one the match starts in (or the one
+        # before it, for a match in the space after a word) - the words
+        # are in text order, so bisect finds it, rather than a walk over
+        # the whole page for every match (a common letter on a page of
+        # a thousand words is a thousand matches).
+        begin = max(0, bisect.bisect_right(starts, pos) - 1)
+        for word_idx in range(begin, len(words)):
+            word_start, word_end, xmin, ymin, xmax, ymax = words[word_idx]
+            if word_start >= match_end:
+                break
+            if word_end > pos:
                 # poppler often lumps a whole run of CJK text (with no
                 # spaces to split on) into a single <word>, sometimes
                 # spanning most of a line. Highlighting that whole word
@@ -3784,12 +3800,13 @@ class PdfDocument(DocumentHandler):
                     box[2] = max(box[2], sub_xmax)
                     box[3] = max(box[3], ymax)
         if box is None or first is None:
-            return PdfDocument._gap_box(words, pos, match_end)
+            return PdfDocument._gap_box(words, pos, match_end, starts)
         return first[0], first[1], (box[0], box[1], box[2], box[3])
 
     @staticmethod
     def _gap_box(
         words: list[tuple[int, int, float, float, float, float]], pos: int, match_end: int,
+        starts: list[int] | None = None,
     ) -> tuple[int, int, tuple[float, float, float, float]] | None:
         """_match_box() for a match that touches no word: only the space
         joining two words (a search for " "), which isn't in the PDF
@@ -3797,14 +3814,16 @@ class PdfDocument(DocumentHandler):
         the same printed line.
 
         Args:
-            words, pos, match_end: as for _match_box().
+            words, pos, match_end, starts: as for _match_box().
 
         Returns:
             (index of the word after the gap, -1 - so it sorts ahead of
             any match inside that word, (xMin, yMin, xMax, yMax) of the
             gap), or None if the gap is a line break.
         """
-        k = bisect.bisect_right([w[0] for w in words], pos)  # the first word after it
+        if starts is None:
+            starts = [w[0] for w in words]
+        k = bisect.bisect_right(starts, pos)  # the first word after it
         if not 0 < k < len(words) or not (words[k - 1][1] <= pos and match_end <= words[k][0]):
             return None
         _s, _e, _xmin, p_ymin, p_xmax, p_ymax = words[k - 1]
