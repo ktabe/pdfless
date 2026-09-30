@@ -8128,6 +8128,7 @@ class Viewer:
         # instead of panning across them (h/l/H/L) - see
         # _default_text_wrap(); no border while wrapped (see
         # _draw_text_wrapped()), regardless of text_border
+        self._line_rows: list[int] = []  # built alongside _display_rows - see _ensure_display_rows()
         self._display_rows: list[tuple[int, int, int]] | None = None  # lazily built by _ensure_display_rows(),
         # only while text_wrap is on - [(line_idx, start, end), ...], one
         # entry per on-screen row
@@ -9236,10 +9237,9 @@ class Viewer:
         if not last:
             return self._row_for_line(line_idx)
         rows = self._ensure_display_rows()
-        row = self._row_for_line(line_idx)
-        while row + 1 < len(rows) and rows[row + 1][0] == line_idx:
-            row += 1
-        return row
+        if 0 <= line_idx < len(self._line_rows) - 1:
+            return self._line_rows[line_idx + 1] - 1
+        return max(0, len(rows) - 1)
 
     def _text_page_top_row(self, page: int) -> int:
         """Where to scroll to put `page`'s top at the top of the screen
@@ -9825,9 +9825,8 @@ class Viewer:
         highlighting, <N>g) target the right scroll position once
         wrapping has split that line across one or more screen rows."""
         rows = self._ensure_display_rows()
-        for row, (li, _start, _end) in enumerate(rows):
-            if li == line_idx:
-                return row
+        if 0 <= line_idx < len(self._line_rows) - 1:
+            return self._line_rows[line_idx]
         return max(0, len(rows) - 1)
 
     @staticmethod
@@ -9842,18 +9841,29 @@ class Viewer:
         width = max(1, width)
         if not line:
             return [(0, 0)]
+        n = len(line)
+        if line.isascii():
+            # Every character one column (text mode's lines have no
+            # control characters left - see display_safe()): fixed-width
+            # pieces, no measuring at all.
+            return [(start, min(start + width, n)) for start in range(0, n, width)]
+        if sum(map(char_width, line)) <= width:
+            return [(0, n)]  # most lines: one row, measured in one go
+        # Walked by index, a column count carried along - not measuring
+        # the rest of the line afresh for every row, which on a line
+        # megabytes long (minified JSON, say) took seconds.
         segments = []
         start = 0
-        n = len(line)
-        while start < n:
-            piece = truncate_to_width(line[start:], width)
-            if not piece:
-                # a single character wider than the whole available
-                # width - it still has to go somewhere
-                piece = line[start:start + 1]
-            end = start + len(piece)
-            segments.append((start, end))
-            start = end
+        used = 0
+        for i, ch in enumerate(line):
+            w = char_width(ch)
+            if used + w > width and i > start:
+                segments.append((start, i))
+                start, used = i, 0
+            used += w
+            # (A single character wider than the whole width still goes
+            # somewhere: it starts a piece, and it alone makes it.)
+        segments.append((start, n))
         return segments
 
     def _ensure_display_rows(self) -> list[tuple[int, int, int]]:
@@ -9875,11 +9885,18 @@ class Viewer:
             - self._line_number_gutter_width()
         )
         width = max(1, width)
-        rows = []
+        rows: list[tuple[int, int, int]] = []
+        # Where each line's rows start (and, last, where they end) - so
+        # finding a line's row (see _row_for_line()) is a lookup rather
+        # than a walk over every row.
+        line_rows = []
         for i, line in enumerate(self.text_lines):
+            line_rows.append(len(rows))
             for start, end in self._wrap_line_segments(line, width):
                 rows.append((i, start, end))
+        line_rows.append(len(rows))
         self._display_rows = rows
+        self._line_rows = line_rows
         return rows
 
     @staticmethod
