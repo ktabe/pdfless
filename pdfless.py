@@ -1528,6 +1528,26 @@ def _rasterize_broken_img_sources(
     return _patch(html_path)
 
 
+def _open_screenshot(path: str) -> Image.Image | None:
+    """A screenshot Chrome was to write, opened and loaded - None if it
+    didn't (it can exit 0 without one) or wrote something that isn't
+    an image, for the caller to report as a failed render rather than
+    crash on.
+
+    Args:
+        path: the PNG's path.
+
+    Returns:
+        The image, or None.
+    """
+    try:
+        img = Image.open(path)
+        img.load()
+        return img
+    except OSError:  # FileNotFoundError, PIL's UnidentifiedImageError, a truncated file
+        return None
+
+
 def _capture_html_screenshot(
     chrome: str, html_path: str, width: int, height: int, out_png: str, render_scale: float,
 ) -> None:
@@ -1543,9 +1563,13 @@ def _capture_html_screenshot(
     if max(physical_w, physical_h) < OfficeVariant.OFFICE_GPU_SAFE_PHYSICAL_PX:
         try:
             run_subprocess(base_args, capture_output=True, check=True, timeout=8)
-            return
-        except subprocess.TimeoutExpired:
-            pass  # bigger than expected for this content; fall through
+            if os.path.isfile(out_png):
+                return
+            # Exited cleanly without a screenshot: try again without the GPU.
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            # Bigger than expected for this content, or the GPU path
+            # itself failed: fall through to the software renderer.
+            pass
     run_subprocess(
         [base_args[0], "--disable-gpu", *base_args[1:]],
         capture_output=True, check=True, timeout=30,
@@ -2071,8 +2095,9 @@ class ExcelWorkbook(OfficeVariant):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return None
         try:
-            trimmed = Image.open(out_png)
-            trimmed.load()
+            trimmed = _open_screenshot(out_png)
+            if trimmed is None:
+                return None
             return self._save_pages(trimmed, [0, trimmed.height], tmpdir, debug, progress)
         finally:
             if os.path.exists(out_png):
@@ -2116,8 +2141,9 @@ class SlideDeck(OfficeVariant):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return None
         try:
-            trimmed = Image.open(out_png)
-            trimmed.load()
+            trimmed = _open_screenshot(out_png)
+            if trimmed is None:
+                return None
             if continuous or not self.confident:
                 bounds = [0, trimmed.height]
             else:
@@ -2259,8 +2285,9 @@ class FlowingText(OfficeVariant):
                         )
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
                     return None
-                img = Image.open(out_png)
-                img.load()
+                img = _open_screenshot(out_png)
+                if img is None:
+                    return None
                 trimmed, cut_off = _trim_trailing_blank_rows(img, _sample_background_color(img))
                 if not cut_off or capture_height >= self.OFFICE_MAX_CAPTURE_HEIGHT:
                     break

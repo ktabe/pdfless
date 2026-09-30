@@ -638,3 +638,32 @@ def test_an_svg_with_a_hash_in_its_name_renders(sample_svg, tmp_path):
     handler = classify(str(path), tmp_path)
     assert handler.build_pages(str(tmp_path))
     assert handler._pdf_delegate is not None
+
+
+def test_a_screenshot_chrome_didnt_write_is_no_image(tmp_path, sample_image):
+    """Chrome can exit 0 without writing its screenshot: that's a failed
+    render (the placeholder), not a crash."""
+    assert pdfless._open_screenshot(str(tmp_path / "missing.png")) is None
+    garbage = tmp_path / "garbage.png"
+    garbage.write_bytes(b"not an image")
+    assert pdfless._open_screenshot(str(garbage)) is None
+    assert pdfless._open_screenshot(sample_image).size > (0, 0)
+
+
+def test_a_failed_gpu_screenshot_is_retried_without_it(tmp_path, monkeypatch):
+    """Only a timeout used to fall back to --disable-gpu: a GPU crash
+    (a non-zero exit) failed the whole render."""
+    import subprocess
+    out_png = tmp_path / "shot.png"
+    calls = []
+
+    def fake(args, **kwargs):
+        calls.append(args)
+        if "--disable-gpu" not in args:
+            raise subprocess.CalledProcessError(1, args)
+        out_png.write_bytes(b"png")
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(pdfless, "run_subprocess", fake)
+    pdfless._capture_html_screenshot("chrome", str(tmp_path / "a.html"), 100, 100, str(out_png), 1.0)
+    assert len(calls) == 2 and "--disable-gpu" in calls[1]
