@@ -460,7 +460,7 @@ Keys:
   T                       toggle plain-text view already cleared for
                           copying, same as t and C together
   B                       (text mode) toggle a border around the page
-  s -S                    (text mode) toggle wrapping long lines
+  W -S                    (text mode) toggle wrapping long lines
   E                       (text mode) toggle marking an end-of-line (↵)
   # -N                    (text mode) toggle a line-number gutter
   C                       (text mode) clear the way for a select-and-
@@ -471,10 +471,11 @@ Keys:
   c                       toggle continuous view (pages one after
                           another, instead of one page at a time)
   r                       toggle the scrollbar
-  S                       page thumbnails down the left edge (image
-                          mode): pick one with j/k and go to its page
-                          with ENTER (t/T: in text mode) or click one;
-                          q to leave them up, S again to close them
+  S                       show / hide page thumbnails down the left
+                          edge (image mode): click one to go to its page
+  s                       move to the thumbnails: pick one with j/k, go
+                          to its page with ENTER (t/T: in text mode), q
+                          or s to go back to the page
   F                       toggle follow mode (auto-reload on file change)
                         <MISCELLANEOUS COMMANDS>
   v                       open the file in its own app (macOS only) and
@@ -7378,9 +7379,8 @@ class _Sidebar:
     than fit (see _scrollbar_cells()) - just a separator line when
     there aren't.
 
-    The keys can pick one too (see handle_key()): S puts the column up
-    ready for that, or gets it ready if it's already up, and closes it
-    while it is.
+    The keys can pick one too (see handle_key()): s moves them to the
+    column (putting it up first if it isn't), and S shows or hides it.
 
     Attributes:
         viewer: the Viewer the thumbnails are shown beside.
@@ -7708,8 +7708,8 @@ class _Sidebar:
             self._fresh = True
 
     def start_picking(self) -> None:
-        """S with the column up: let the keys pick a thumbnail, starting
-        from the page being viewed (see handle_key())."""
+        """s (see Viewer.focus_sidebar()): let the keys pick a thumbnail,
+        starting from the page being viewed (see handle_key())."""
         self.picking = True
         self.picked = self.viewer.page
         self._redraw()
@@ -7738,7 +7738,7 @@ class _Sidebar:
 
         - ENTER goes to the picked page, and stops picking;
         - t or T goes to it in text mode (see Viewer.handle_global_key());
-        - q or ESC stops picking, the column staying up; S closes it;
+        - q, ESC or s stops picking, the column staying up; S closes it;
         - ^L (or a focus change) repaints the screen;
         - the usual line/window keys, d/u and g/G/</>/HOME/END move the
           pick.
@@ -7759,6 +7759,8 @@ class _Sidebar:
             self.stop_picking()
         elif key == "S":
             viewer.toggle_sidebar()
+        elif key == "s":
+            self.stop_picking()  # back to the page, the column staying up
         elif key in ("t", "T"):
             # Into text mode (T: cleared for copying) at the picked page.
             self.picking = False
@@ -9184,8 +9186,8 @@ class Viewer:
 
     def toggle_text_wrap(self) -> None:
         """Switches between soft-wrapping long lines and panning across
-        them (h/l/H/L) - "s", or the less(1)-style "-S" (see
-        run_viewer()'s dash_pending handling). Keeps your place across
+        them (h/l/H/L) - "W", or the less(1)-style "-S" (see
+        _PREFIX_BINDINGS). Keeps your place across
         the switch: the two modes scroll in different units (a display
         row, once wrapping has split a line across several, vs. the raw
         text_lines index), so what carries over is the line currently at
@@ -9317,17 +9319,11 @@ class Viewer:
         self.draw_status("continuous view " + ("on" if self.continuous else "off"))
 
     def toggle_sidebar(self) -> None:
-        """S: the page thumbnails (see _Sidebar). In image mode, S puts
-        them up with the keys ready to pick one (see
-        _Sidebar.handle_key()), gets the keys ready if they're already
-        up (e.g. by --sidebar), and takes them down while picking; in
-        text mode, which doesn't show them, it just turns them on or off.
-        Their columns are taken from the page's width, so the layout is
-        redone around them, as for the scrollbar (see toggle_scrollbar())."""
+        """S: show or hide the page thumbnails (see _Sidebar) - in text
+        mode too, which doesn't show them, for when it's left. Their
+        columns are taken from the page's width, so the layout is redone
+        around them, as for the scrollbar (see toggle_scrollbar())."""
         sidebar = self.sidebar
-        if sidebar.on and not sidebar.picking and not self.text_mode and sidebar.columns():
-            sidebar.start_picking()
-            return
         if sidebar.on and not sidebar.columns():
             # On, but the terminal has been narrowed since: say why
             # there's nothing to see, rather than just turning it off.
@@ -9345,8 +9341,20 @@ class Viewer:
         self.refresh()
         if self.text_mode:
             self.draw_status(f"page thumbnails {'on' if sidebar.on else 'off'} (in image mode)")
-        elif sidebar.on:
-            sidebar.start_picking()
+
+    def focus_sidebar(self) -> None:
+        """s: move the keys to the page thumbnails, to pick one (see
+        _Sidebar.handle_key()) - putting them up first if they aren't.
+        Image mode only, as text mode doesn't show them."""
+        sidebar = self.sidebar
+        if self.text_mode:
+            self.draw_status("the page thumbnails are in image mode (t to go back to it)")
+            return
+        if not sidebar.columns():
+            self.toggle_sidebar()  # (or says why it can't)
+            if not sidebar.columns():
+                return
+        sidebar.start_picking()
 
     def toggle_scrollbar(self) -> None:
         """Switches the scrollbar on/off - "r" (see run_viewer(), which
@@ -10621,9 +10629,10 @@ class Viewer:
             # Same idea as "B" above - uppercase, since lowercase "e"
             # is already FORWARD_LINE_KEYS (and stays that way here).
             self.toggle_eol_mark()
-        elif key == "s":
-            # The primary way to toggle wrap - "-S" (see run_viewer()'s
-            # dash_pending) is kept only for less(1) compatibility.
+        elif key == "W":
+            # The primary way to toggle wrap - uppercase, like B/E/C, and
+            # clear of less(1)'s own "w" (back a window); "-S" (see
+            # _PREFIX_BINDINGS) is kept for less(1) compatibility.
             self.toggle_text_wrap()
         elif key == "C":
             self.toggle_copy_mode()
@@ -10846,6 +10855,8 @@ class Viewer:
             self.overlays.show_files()
         elif key == "S":
             self.toggle_sidebar()
+        elif key == "s":
+            self.focus_sidebar()
         elif key in ("t", "T"):
             # T is t and C combined into one press/undo - see
             # toggle_clean_text_mode().
@@ -11059,7 +11070,7 @@ def _toggle_and_refresh(toggle: Callable[[Viewer], None]) -> Callable[[Viewer], 
 # plus pdfless's own :h for the help screen (F1 is the primary way in).
 # "-" (text mode only - it's zoom-out in image mode) is less(1)'s own
 # runtime "-<option-letter>" toggle syntax, kept only for
-# -S/--chop-long-lines and -N/--line-numbers compatibility; "s"/"#"
+# -S/--chop-long-lines and -N/--line-numbers compatibility; "W"/"#"
 # alone are the primary keys for those.
 _PREFIX_BINDINGS: dict[str, dict[str, Callable[[Viewer], Any]]] = {
     ":": {
@@ -11070,7 +11081,6 @@ _PREFIX_BINDINGS: dict[str, dict[str, Callable[[Viewer], Any]]] = {
     },
     "-": {
         "S": _toggle_and_refresh(Viewer.toggle_text_wrap),
-        "s": _toggle_and_refresh(Viewer.toggle_text_wrap),
         "N": _toggle_and_refresh(Viewer.toggle_line_numbers),
         "n": _toggle_and_refresh(Viewer.toggle_line_numbers),
     },
