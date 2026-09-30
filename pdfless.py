@@ -1191,6 +1191,12 @@ _SOFFICE_SPREADSHEET_PDF_FILTER = (
 _SOFFICE_SPREADSHEET_TIMEOUT = 180
 
 
+# Held while soffice runs - see _convert_via_soffice(): one profile,
+# one conversion at a time (a background prefetch and a jump to another
+# document can otherwise start two).
+_SOFFICE_LOCK = threading.Lock()
+
+
 def _convert_via_soffice(
     soffice: str, path: str, tmpdir: str, timeout: int = 60, debug: bool = False,
 ) -> str | None:
@@ -1209,10 +1215,14 @@ def _convert_via_soffice(
     glyph-resolution bug), while running without it renders correctly,
     including over SSH.
 
-    -env:UserInstallation points at a profile directory scoped to this
-    `tmpdir` (unique per render), so concurrent soffice invocations
-    (e.g. two files opened around the same time) don't collide over a
-    shared user profile lock.
+    -env:UserInstallation points at a profile directory of pdfless's own
+    in `tmpdir` - kept for the session, as making one takes soffice a
+    few seconds - and conversions take turns with it (see _SOFFICE_LOCK):
+    a second soffice on a profile in use just hands its request to the
+    first and produces nothing. Each conversion writes into a directory
+    of its own, so two documents with the same name (report.docx and
+    report.pptx, or a/x.docx and b/x.docx) can't overwrite, or be
+    mistaken for, each other's PDF.
 
     A spreadsheet (_SOFFICE_SPREADSHEET_EXTENSIONS) is exported one page
     per sheet (see _SOFFICE_SPREADSHEET_PDF_FILTER), with at least
@@ -1222,28 +1232,30 @@ def _convert_via_soffice(
     is reported to stderr - see below for why that's not rare (soffice
     routinely exits 0 without one)."""
     profile_dir = os.path.join(tmpdir, "soffice-profile")
+    outdir = tempfile.mkdtemp(prefix="soffice-out-", dir=tmpdir)
     name = os.path.basename(path)
     convert_to = "pdf"
     if path.lower().endswith(_SOFFICE_SPREADSHEET_EXTENSIONS):
         convert_to = _SOFFICE_SPREADSHEET_PDF_FILTER
         timeout = max(timeout, _SOFFICE_SPREADSHEET_TIMEOUT)
     try:
-        result = run_subprocess(
-            [
-                soffice,
-                f"-env:UserInstallation=file://{profile_dir}",
-                "--convert-to", convert_to,
-                "--outdir", tmpdir,
-                path,
-            ],
-            capture_output=True, timeout=timeout,
-        )
+        with _SOFFICE_LOCK:
+            result = run_subprocess(
+                [
+                    soffice,
+                    f"-env:UserInstallation={pathlib.Path(profile_dir).as_uri()}",
+                    "--convert-to", convert_to,
+                    "--outdir", outdir,
+                    path,
+                ],
+                capture_output=True, timeout=timeout,
+            )
     except (subprocess.TimeoutExpired, OSError) as e:
         if debug:
             _debug_log(f"{name}: soffice failed to run: {e}")
         return None
     base = os.path.splitext(os.path.basename(path))[0]
-    out_pdf = os.path.join(tmpdir, f"{base}.pdf")
+    out_pdf = os.path.join(outdir, f"{base}.pdf")
     if os.path.isfile(out_pdf):
         return out_pdf
     if debug:

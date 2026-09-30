@@ -10,6 +10,7 @@ actually rendering.
 """
 
 import fcntl
+import os
 import pty
 import struct
 import termios
@@ -583,3 +584,27 @@ def test_find_chrome_never_picks_vivaldi_from_path(monkeypatch):
         lambda name: "/usr/bin/" + name if name.startswith("vivaldi") else None,
     )
     assert pdfless.find_chrome() is None
+
+
+@requires_soffice
+def test_same_named_documents_get_pdfs_of_their_own(sample_twopage_docx, sample_twoslide_pptx, tmp_path):
+    """Regression test: every soffice conversion used to write into the
+    one session directory, so report.docx and report.pptx - both
+    report.pdf - overwrote each other's, and the first one opened then
+    showed the second."""
+    import shutil
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    shutil.copy(sample_twopage_docx, docs / "report.docx")
+    shutil.copy(sample_twoslide_pptx, docs / "report.pptx")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    texts = []
+    for name in ("report.docx", "report.pptx"):
+        handler = classify(str(docs / name), scratch)
+        handler.build_pages(str(scratch))
+        texts.append((handler._pdf_delegate.path, "\n".join(handler.extract_text(1))))
+    (docx_pdf, docx_text), (pptx_pdf, pptx_text) = texts
+    assert docx_pdf != pptx_pdf
+    assert os.path.isfile(docx_pdf) and os.path.isfile(pptx_pdf)
+    assert docx_text != pptx_text
