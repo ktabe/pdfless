@@ -8279,9 +8279,16 @@ class Viewer:
             render_scale=self.office_render_scale, progress=progress,
         )
         if not pages:
-            pages = self.doc_handler._render_error_placeholder(
-                self.tmpdir, "Quick Look rendering failed - see -d/--debug for details",
-            )
+            missing = [tool for tool in ("pdfinfo", "pdftoppm") if shutil.which(tool) is None]
+            if missing:
+                # Only a PDF given on the command line checks for poppler
+                # up front (see check_deps()), but this document is shown
+                # through a PDF of its own - LibreOffice's, Chrome's or
+                # WeasyPrint's - so it needs it too.
+                message = f"needs poppler's {' and '.join(missing)} ({POPPLER_INSTALL_HINT})"
+            else:
+                message = "rendering failed - see -d/--debug for details"
+            pages = self.doc_handler._render_error_placeholder(self.tmpdir, message)
             self.doc_handler.pages = pages  # remember the placeholder too - don't retry every revisit
         self.npages = len(pages)
 
