@@ -8780,12 +8780,25 @@ class Viewer:
         assumes an already-entered alternate screen: clears the
         viewport, writes the status line, etc.)."""
         if self.resized:
+            # Where text mode is reading, to put back at the new size: a
+            # new width re-splits every wrapped line, so the row number
+            # text_scroll holds stops meaning the same place (the same as
+            # _relayout() does for a toggle) - and at the very top (the
+            # border's row, say), the top it stays.
+            loaded = self.text_mode and bool(self.text_lines)
+            at_top = self.text_scroll <= self.text_scroll_min
+            top_line = self._top_text_line() if loaded else 0
             self._recompute_geometry()
             self.resized = False
-            if self.doc_handler.starts_in_text_mode():
-                self._load_text_page()  # (re)read the file - it's always "page 1"
+            if loaded:
+                # (Not read again: a resize, or ^Z and fg - see
+                # _suspend() - isn't a change to the file; -f/--follow
+                # is what notices those.)
+                self._scroll_to_text_line(top_line)
+                if at_top:
+                    self.text_scroll = self.text_scroll_min
             elif self.text_mode:
-                self._clamp_text_scroll()
+                self._load_text_page()  # the first time: read it
             else:
                 self._load_page()
 
