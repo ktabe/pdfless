@@ -4484,6 +4484,12 @@ class RenderedDocument(DocumentHandler):
         return super().get_page_image(cache, page, target_px, fit)
 
 
+# Quick Look previews made this session (see
+# OfficeDocument._generate_ql_preview()), by (file, scratch directory):
+# the file's stamp when made (see _source_stamp()), and the preview.
+_QL_PREVIEWS: dict[tuple[str, str], tuple[str, tuple[str, int | None, int | None, bool, str | None]]] = {}
+
+
 class OfficeDocument(RenderedDocument):
     """Anything this Mac's Quick Look generators can preview (Word,
     Excel, PowerPoint, Keynote, Pages, ...) via qlmanage + a local
@@ -4554,6 +4560,15 @@ class OfficeDocument(RenderedDocument):
         here (no Preview.html either way)."""
         if shutil.which("qlmanage") is None:
             return None
+        # The one made for this very file, unchanged since, if there is
+        # one: sniff()'s probe (see _probe_preview()) makes it, and the
+        # render right after wants the same - qlmanage takes a good part
+        # of a second each time.
+        memo_key = (os.path.abspath(path), tmpdir)
+        stamp = _source_stamp(path)
+        memo = _QL_PREVIEWS.get(memo_key)
+        if memo is not None and memo[0] == stamp and os.path.isfile(memo[1][0]):
+            return memo[1]
         outdir = tempfile.mkdtemp(dir=tmpdir, prefix="qlpreview-")
         name = os.path.basename(path)
         try:
@@ -4600,7 +4615,10 @@ class OfficeDocument(RenderedDocument):
             page_element_xpath = props.get("PageElementXPath") or None
         except (OSError, ValueError):
             pass
-        return html_path, width, height, should_not_scale, page_element_xpath
+        preview = (html_path, width, height, should_not_scale, page_element_xpath)
+        if stamp is not None:
+            _QL_PREVIEWS[memo_key] = (stamp, preview)
+        return preview
 
     @staticmethod
     def _probe_preview(path: str, tmpdir: str, debug: bool = False) -> bool:
