@@ -11467,6 +11467,9 @@ class _KeyDispatcher:
                 viewer.go_to_text_line(count)
                 viewer.refresh()
                 return True
+            # Dropped: take "number: N" off the status line, which g/G
+            # itself only redraws if it moves the view.
+            viewer.draw_status()
         elif viewer.handle_count_key(key, count):
             self.num_buf = ""
             return True

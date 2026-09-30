@@ -334,3 +334,16 @@ def test_w_toggles_wrapping_in_text_mode(sample_text):
     viewer.handle_key_text("s")  # no longer wrapping's
     assert viewer.text_wrap is not wrap
     assert "S" in pdfless._PREFIX_BINDINGS["-"] and "s" not in pdfless._PREFIX_BINDINGS["-"]
+
+
+def test_a_dropped_count_leaves_the_status_line(sample_pdf, capsys):
+    """In image mode <N>g drops the count and is plain g - which, at the
+    top of the page already, doesn't redraw: "number: 10" stayed up."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf))
+    d = dispatcher_for(viewer)
+    d.handle("1")
+    d.handle("0")
+    capsys.readouterr()
+    d.handle("g")
+    out = capsys.readouterr().out
+    assert out and "number:" not in out
