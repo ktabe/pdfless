@@ -92,6 +92,7 @@ pdfless document.pdf           # Open a PDF
 pdfless image.png              # Open an image
 pdfless notes.txt              # Open a text file
 pdfless report.pdf chart.png   # Open multiple files
+pdfless slides/                # Open the files in a directory
 pdfless -p 10 document.pdf     # Start on page 10
 pdfless -h slides.pdf          # Fit each page to the terminal height
 pdfless -f document.pdf        # Reload when the file changes
@@ -105,6 +106,7 @@ Press `+` / `-` to zoom, `/` to search, `t` to switch to text mode,
 and `q` to quit. `F1` or `:h` opens the keyboard help.
 
 With multiple files open, use `:n` / `:p` (or `}` / `{`) to switch files, or `O` to pick one from a list.
+A directory stands for the files directly in it, sorted by name (ignoring case, as `ls` does); hidden files and subdirectories are left out.
 With no filename, or with `-` as the filename, `pdfless` reads standard input.
 
 ### Options

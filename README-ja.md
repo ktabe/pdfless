@@ -89,6 +89,7 @@ pdfless document.pdf           # PDFを開く
 pdfless image.png              # 画像を開く
 pdfless notes.txt              # テキストファイルを開く
 pdfless report.pdf chart.png   # 複数のファイルを開く
+pdfless slides/                # ディレクトリ内のファイルを開く
 pdfless -p 10 document.pdf     # 10ページ目から表示
 pdfless -h slides.pdf          # 各ページをターミナルの高さに合わせて表示
 pdfless -f document.pdf        # ファイルの更新時に再読み込み
@@ -102,6 +103,7 @@ cat document.pdf | pdfless     # 標準入力から読み込む
 `F1`または`:h`でキー操作のヘルプを表示します．
 
 複数のファイルを開いている場合は，`:n` / `:p`（または`}` / `{`）でファイルを切り替えます．`O`で一覧から選ぶこともできます．
+ディレクトリを指定すると，その直下のファイルを名前順（`ls`と同じく大文字・小文字を区別しない）に開きます．隠しファイルとサブディレクトリは含みません．
 ファイル名を省略するか，ファイル名として`-`を指定すると，標準入力から読み込みます．
 
 ### オプション

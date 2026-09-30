@@ -104,15 +104,46 @@ def test_piped_input_is_listed_as_stdin(sample_text, tmp_path, monkeypatch):
     assert viewer.overlays._files_lines()[0] == ("* (stdin)", "1")
 
 
-def test_a_file_that_cant_be_opened_is_reported(sample_pdf, tmp_path, monkeypatch):
-    binary = tmp_path / "data.bin"
-    binary.write_bytes(bytes(range(256)) * 4)
-    viewer = make_viewer([pdfless.PdfDocument(sample_pdf), str(binary)], monkeypatch)
+def opened_second(viewer, monkeypatch):
+    """Open the second file from the list; the status line's last word."""
+    said = []
+    monkeypatch.setattr(viewer, "draw_status", said.append)
     viewer.handle_global_key("O")
     viewer.overlays.handle_key("j")
     viewer.overlays.handle_key("\r")
+    return said[-1]
+
+
+def test_a_file_that_cant_be_opened_is_reported(sample_pdf, tmp_path, monkeypatch):
+    """It said "no such file" - for a file right there."""
+    binary = tmp_path / "data.bin"
+    binary.write_bytes(bytes(range(256)) * 4)
+    monkeypatch.setattr(pdfless, "_sniff_file", lambda *args, **kwargs: None)  # (not Quick Look's either)
+    viewer = make_viewer([pdfless.PdfDocument(sample_pdf), str(binary)], monkeypatch)
+    said = opened_second(viewer, monkeypatch)
     assert viewer.overlays.active is None
     assert viewer.file_index == 0  # still on the PDF
+    assert said == f"data.bin: {pdfless.NOT_DISPLAYABLE}"
+
+
+def test_a_broken_file_says_what_is_wrong(sample_pdf, tmp_path, monkeypatch):
+    broken = tmp_path / "broken.pdf"
+    broken.write_bytes(b"%PDF-1.4 and then nothing")
+
+    def unusable(*args, **kwargs):
+        raise pdfless.UnusableFile("not a valid PDF")
+
+    monkeypatch.setattr(pdfless, "_sniff_file", unusable)
+    viewer = make_viewer([pdfless.PdfDocument(sample_pdf), str(broken)], monkeypatch)
+    assert opened_second(viewer, monkeypatch) == "broken.pdf: not a valid PDF"
+
+
+def test_a_file_gone_since_the_start_is_no_such_file(sample_pdf, tmp_path, monkeypatch):
+    gone = tmp_path / "gone.pdf"
+    shutil.copy(sample_pdf, gone)
+    viewer = make_viewer([pdfless.PdfDocument(sample_pdf), str(gone)], monkeypatch)
+    gone.unlink()
+    assert opened_second(viewer, monkeypatch) == "gone.pdf: no such file"
 
 
 def test_truncating_keeps_the_end():
