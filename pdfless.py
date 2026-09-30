@@ -708,7 +708,7 @@ class _ProgressLine:
         if not self.enabled:
             return
         with self._lock:
-            text = truncate_to_width(f"pdfless: {text}", self._stderr_cols())
+            text = truncate_to_width(f"pdfless: {display_safe(text)}", self._stderr_cols())
             pad = max(0, self._last_width - display_width(text))
             sys.stderr.write("\r" + text + " " * pad)
             sys.stderr.flush()
@@ -2324,15 +2324,43 @@ def is_password_protected_ooxml_or_visio(path: str) -> bool:
         return False
 
 
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Control characters that mustn't reach the terminal as they are: C0
+# (but tab, newline and carriage return), DEL, and the C1 range - a
+# terminal may take U+009B as CSI, say.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
 def _caret_notation(match: re.Match[str]) -> str:
     """"^X" caret notation for one C0 control character or DEL (e.g.
     "\\x0c" (^L) or "\\x1b" (^[)) - XORing the byte with 0x40 maps the
     whole range (0x00-0x1f, plus 0x7f) to the right letter/symbol in one
-    step, the same trick a terminal's own ^-echoing uses."""
-    return "^" + chr(ord(match.group()) ^ 0x40)
+    step, the same trick a terminal's own ^-echoing uses. A C1 one
+    (U+0080-U+009F) has no caret form, so it's shown as its code, "<9B>",
+    as less(1) does."""
+    code = ord(match.group())
+    return f"<{code:02X}>" if code >= 0x80 else "^" + chr(code ^ 0x40)
+
+
+def display_safe(text: str, tab_width: int = 8) -> str:
+    """`text` made safe to write to the terminal: control characters in
+    caret notation (see _caret_notation()) - so a document can't send
+    escape sequences of its own (setting the clipboard with OSC 52,
+    say) - and tabs expanded, as the renderer's column math knows
+    nothing of tab stops.
+
+    Args:
+        text: text from a document (its extracted text, a title, a file
+            name, ...).
+        tab_width: the tab stops' spacing.
+
+    Returns:
+        The text, as it's to be shown.
+    """
+    if "\t" in text:
+        text = text.expandtabs(tab_width)
+    if _CONTROL_CHAR_RE.search(text):
+        text = _CONTROL_CHAR_RE.sub(_caret_notation, text)
+    return text
 
 
 def read_plain_text_lines(path: str, tab_width: int = 8) -> list[str]:
@@ -6249,7 +6277,7 @@ class _Overlays:
         each entry's title indented by its level, with its page number
         (if it has one) flush right."""
         return [
-            ("  " * e["level"] + e["title"], str(e["page"]) if e["page"] is not None else "")
+            ("  " * e["level"] + display_safe(e["title"]), str(e["page"]) if e["page"] is not None else "")
             for e in self._ensure_outline()
         ]
 
@@ -6337,7 +6365,7 @@ class _Overlays:
                 name = "(stdin)"  # see _capture_stdin()
             else:
                 name = os.path.relpath(path)
-            rows.append(("* " if i == viewer.file_index else "  ", name, str(i + 1)))
+            rows.append(("* " if i == viewer.file_index else "  ", display_safe(name), str(i + 1)))
         # How wide the box gets for the whole paths (capped by the
         # terminal's width) - then each path cut to fit in it beside
         # its mark and number, and a space before the number.
@@ -8963,7 +8991,12 @@ class Viewer:
             # document - fetched once per file and kept (see __init__),
             # since toggling t or c shouldn't have to wait for it again.
             if self._text_pages is None:
-                self._text_pages = self.doc_handler.extract_text_pages(self.npages)
+                pages = self.doc_handler.extract_text_pages(self.npages)
+                # Made safe to show - see display_safe().
+                self._text_pages = (
+                    [[display_safe(line) for line in lines] for lines in pages]
+                    if pages is not None else None
+                )
             if self._text_pages is not None:
                 self._build_continuous_text(self._text_pages)
                 self._display_rows = None
@@ -8982,7 +9015,10 @@ class Viewer:
         # than trying to cache it, since nothing else calls this often
         # enough for that to matter (see enter_text_mode()/reload(),
         # the only other places that ask for this same text).
-        self.text_lines = self.doc_handler.extract_text(self.page) or []
+        # Made safe to show: a PDF's or an Office document's text (via
+        # pdftotext or textutil) can carry escape sequences - see
+        # display_safe().
+        self.text_lines = [display_safe(line) for line in self.doc_handler.extract_text(self.page) or []]
         self._display_rows = None  # stale - built fresh from the new text_lines
         self.text_scroll = 0
         self.text_x_offset = 0
@@ -10124,7 +10160,7 @@ class Viewer:
             # image view's own page count is (a Markdown file rendered
             # to 15 PDF pages is still just its one raw source).
             page, npages = 1, 1
-        segments = [(f" {self.name} ", STATUS_COLOR_FILENAME)]
+        segments = [(f" {display_safe(self.name)} ", STATUS_COLOR_FILENAME)]
         if len(self.files) > 1:
             segments.append((
                 f" file {self.file_index + 1}/{len(self.files)} ",
@@ -10143,7 +10179,9 @@ class Viewer:
     def format_status(self, text: str | None = None) -> str:
         """Return escape sequence for the status line (no write)."""
         if text is not None:
-            status = pad_to_width(truncate_to_width(f" {text} ", self.cols), self.cols)
+            # A message can carry a file name or a document's text (see
+            # display_safe()).
+            status = pad_to_width(truncate_to_width(f" {display_safe(text)} ", self.cols), self.cols)
             return (
                 f"\x1b[{self.rows};1H{STATUS_COLOR_ON}\x1b[2K"
                 f"{status}{SGR_RESET}"
