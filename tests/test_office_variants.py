@@ -14,7 +14,6 @@ import os
 import pty
 import struct
 import termios
-import tempfile
 
 import pdfless
 from PIL import Image

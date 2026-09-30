@@ -15,7 +15,7 @@ from conftest import FIXTURES_DIR, requires_soffice
 from test_search import make_viewer
 
 sys.path.insert(0, FIXTURES_DIR)
-from make_sample_search_variants import ROWS, WRAPPED, WRAPPED_QUERIES  # noqa: E402
+from make_sample_search_variants import ROWS, WRAPPED_QUERIES  # noqa: E402
 
 NFD = lambda s: unicodedata.normalize("NFD", s)  # noqa: E731
 

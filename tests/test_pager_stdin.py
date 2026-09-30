@@ -9,8 +9,6 @@ tty - the same trick less(1)/most(1) use."""
 
 import time
 
-from conftest import PtySession
-
 
 def assert_no_crash(session, keys, wait=0.5, initial_wait=3):
     time.sleep(initial_wait)

@@ -5959,25 +5959,6 @@ def _inline_image(data: bytes, width: int, height: int) -> str:
     )
 
 
-def _format_ech_clear(char_w: int, char_h: int) -> str:
-    """Erase `char_w` x `char_h` cells at the home position (ECH/CUU)."""
-    out = ["\x1b[H"]
-    for i in range(char_h):
-        out.append(f"\x1b[{char_w}X")
-        if i < char_h - 1:
-            out.append("\x1b[1B")
-    if char_h > 0:
-        out.append(f"\x1b[{char_h}A")
-    return "".join(out)
-
-
-def _strip_leading_home(s: str) -> str:
-    home = "\x1b[H"
-    if s.startswith(home):
-        return s[len(home):]
-    return s
-
-
 def _image_bytes(img: Image.Image) -> int:
     """Roughly how much memory `img`'s pixels take - one byte per band
     per pixel, true of the RGB/RGBA/L images PageCache holds."""
@@ -6233,7 +6214,7 @@ class _Overlays:
         self.files_scroll = 0
         self._outline: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_outline()
         # The entry last jumped to, and where that left the view (see
-        # _view_position()) - so reopening before moving on selects it.
+        # Viewer._view_spot()) - so reopening before moving on selects it.
         self._jumped: tuple[int, tuple[bool, int, int]] | None = None
 
     def forget_outline(self) -> None:
@@ -6402,7 +6383,7 @@ class _Overlays:
         # headings are right there: the last one above where reading is.
         headings = self._source_heading_lines()
         self.outline_sel = 0
-        if self._jumped is not None and self._jumped[1] == self._view_position():
+        if self._jumped is not None and self._jumped[1] == self.viewer._view_spot():
             # Still where the last jump left it: that entry, even when
             # another one starts on the same page, or (near the end of
             # the text) on the same screen.
@@ -6562,14 +6543,8 @@ class _Overlays:
         else:
             self.viewer.links.push_history()
             self.viewer.go_to_link_target(entry["page"], entry["top_pt"])
-        self._jumped = (index, self._view_position())
+        self._jumped = (index, self.viewer._view_spot())
         self.viewer.refresh()
-
-    def _view_position(self) -> tuple[bool, int, int]:
-        """Where the view is: the mode, the page, and how far it's
-        scrolled - for telling whether it has moved since a jump."""
-        viewer = self.viewer
-        return viewer.text_mode, viewer.page, viewer.text_scroll if viewer.text_mode else viewer.scroll
 
     def show_files(self) -> None:
         """O: put up the files given on the command line as a box over
@@ -8436,10 +8411,6 @@ class Viewer:
             self.doc_handler.pages = pages  # remember the placeholder too - don't retry every revisit
         self.npages = len(pages)
 
-    @property
-    def is_pdf(self) -> bool:
-        return isinstance(self.doc_handler, PdfDocument)
-
     def next_file(self) -> None:
         self.go_to_file(self.file_index + 1, "no next file", step=1)
 
@@ -10245,7 +10216,6 @@ class Viewer:
         return buf.getvalue()
 
     def _format_viewport_clear(self, crop_w: int, crop_h: int, full_clear: bool) -> str:
-        char_w = max(1, -(-crop_w // self.cell_w_px))
         char_h = max(1, -(-crop_h // self.cell_h_px))
         prev_char_h = self._last_char_h or char_h
 
@@ -10255,18 +10225,14 @@ class Viewer:
 
         # Rows are cleared from the page's first column (right of the
         # sidebar, if it's up) to the end of the line, the sidebar left be.
+        # (A taller viewport than last time never gets here - see
+        # _needs_full_clear().) Every row below the image, down to the
+        # last row the previous one reached or the viewport's own last
+        # row, whichever is further.
         col0 = self._image_col0()
         out = [f"\x1b[1;{col0}H"]
-        if self._last_viewport_set and crop_h > self._last_viewport_h:
-            out.append(_strip_leading_home(_format_ech_clear(char_w, char_h)))
-        if prev_char_h > char_h:
-            for row in range(char_h, min(prev_char_h, self.rows - 1)):
-                out.append(f"\x1b[{row + 1};{col0}H\x1b[K")
         total_rows = max(1, -(-self.avail_height_px // self.cell_h_px))
-        blank_from = char_h
-        if prev_char_h > char_h:
-            blank_from = max(char_h, prev_char_h)
-        for row in range(blank_from, min(self.rows - 1, total_rows)):
+        for row in range(char_h, min(self.rows - 1, max(prev_char_h, total_rows))):
             out.append(f"\x1b[{row + 1};{col0}H\x1b[K")
         self._last_char_h = char_h
         return "".join(out)
@@ -10699,7 +10665,7 @@ class Viewer:
         Chrome's --print-to-pdf as a real PDF link annotation, so this
         lets it be treated exactly like a real PDF's hyperlinks
         wherever this is used), or None if neither applies."""
-        if isinstance(self.doc_handler, PdfDocument):  # i.e. self.is_pdf
+        if isinstance(self.doc_handler, PdfDocument):
             return self.doc_handler
         return getattr(self.doc_handler, "_pdf_delegate", None)
 
@@ -10774,7 +10740,7 @@ class Viewer:
         both keyed off content that's now stale, so both get dropped;
         any in-progress search is cleared too, since its match list may
         no longer correspond to anything in the new file."""
-        if isinstance(self.doc_handler, PdfDocument):  # i.e. self.is_pdf
+        if isinstance(self.doc_handler, PdfDocument):
             self.doc_handler.forget_page_sizes()
             self.npages = self.doc_handler.page_count()
             self.page = max(1, min(self.npages, self.page))
