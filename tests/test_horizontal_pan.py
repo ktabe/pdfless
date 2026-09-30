@@ -82,6 +82,20 @@ def test_zoom_stays_centered_on_what_was_on_screen(sample_pdf):
     assert viewer.x_offset > 0  # i.e. not pinned to the left edge
 
 
+def test_zoom_keeps_the_middle_of_the_window_vertically_too(sample_pdf):
+    """It used to keep the scroll in pixels: from halfway down a page, +
+    landed nearer the top, and each + or - drifted further."""
+    viewer = make_viewer(pdfless.PdfDocument(sample_pdf), fit="width")
+    viewer.go_page(2, 0)
+    viewer.scroll = viewer.scroll_max // 2
+    shown = min(viewer.avail_height_px, viewer.img.height)
+    middle = (viewer.scroll + shown / 2) / viewer.img.height
+    for zoom in (1.5, 2.0, 1.25, 1.0):
+        viewer.set_zoom(zoom)
+        shown = min(viewer.avail_height_px, viewer.img.height)
+        assert abs((viewer.scroll + shown / 2) / viewer.img.height - middle) < 0.01
+
+
 def zoom_pct(viewer):
     for text, _color in viewer.status_segments():
         if "zoom" in text:

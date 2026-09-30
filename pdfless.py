@@ -8603,13 +8603,20 @@ class Viewer:
         # sits as a fraction of the page's width, then put it back there
         # once the resized image is in. _load_page() only clamps
         # x_offset now, so this is what decides where a zoom lands.
+        # The same for the height - a zoom otherwise kept the scroll in
+        # pixels, so at 50% down a page, + left you 43% down, and every
+        # further + or - drifted further from what was being read.
         center_frac = (self.x_offset + self.crop_width / 2) / max(1, self.img.width)
+        shown_h = min(self.avail_height_px, self.img.height)
+        middle_frac = (self.scroll + shown_h / 2) / max(1, self.img.height)
         self.zoom = new_zoom
         self._load_page()
         self.x_offset = max(0, min(
             self.img.width - self.crop_width,
             round(center_frac * self.img.width - self.crop_width / 2),
         ))
+        shown_h = min(self.avail_height_px, self.img.height)
+        self.scroll = self._clamp_image_scroll(round(middle_frac * self.img.height - shown_h / 2))
 
     def reset_view(self) -> None:
         """"0": back to the untouched view of this page - zoom 1 and the
