@@ -280,3 +280,29 @@ def test_s_in_text_mode_says_the_thumbnails_are_in_image_mode(sample_pdf, monkey
     viewer.handle_global_key("s")
     assert not viewer.sidebar.picking
     assert "in image mode" in capsys.readouterr().out
+
+
+def test_a_thumbnail_cut_off_at_the_bottom_shows_its_top(sample_pdf, monkeypatch):
+    """The rows under the last whole thumbnail used to stay empty; they
+    show the top of the next one now, cut off at the status line."""
+    viewer = make_viewer(sample_pdf, monkeypatch, rows=34)
+    _w, thumb_rows, slot_rows, slots = viewer.sidebar._layout()
+    left = (viewer.rows - 1) - slots * slot_rows
+    assert left >= 2  # (room for the next one's frame top and a row of it)
+    assert list(viewer.sidebar._shown_pages(slot_rows, slots)) == list(range(1, slots + 2))
+    render_thumbnails(viewer)
+    drawn = viewer.sidebar.escapes(full=True)
+    heights = [int(h) for h in re.findall(r"height=(\d+)px", drawn)]
+    assert len(heights) == slots + 1
+    assert heights[-1] < heights[0]  # the cut-off one: only what fits
+    assert heights[-1] <= (left - 1) * viewer.cell_h_px
+
+    viewer.mouse.handle("MOUSE_CLICK", 5, viewer.rows - 1)  # on the cut-off one
+    assert viewer.page == slots + 1
+
+
+def test_no_cut_off_thumbnail_without_room_for_it(sample_pdf, monkeypatch):
+    viewer = make_viewer(sample_pdf, monkeypatch)  # 30 rows: one row left over
+    _w, _rows, slot_rows, slots = viewer.sidebar._layout()
+    assert (viewer.rows - 1) - slots * slot_rows < 2
+    assert list(viewer.sidebar._shown_pages(slot_rows, slots)) == list(range(1, slots + 1))
