@@ -4,7 +4,6 @@ RenderedDocument, rendered off the main thread, and switching to it
 while that's still under way waits for it instead of rendering twice."""
 
 import fcntl
-import os
 import pty
 import struct
 import tempfile

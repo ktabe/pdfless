@@ -268,7 +268,7 @@ def test_drag_only_follows_a_press_that_started_on_the_scrollbar(sample_pdf):
 
 
 def test_drag_acts_only_on_where_the_pointer_ended_up(sample_pdf):
-    """handle_drag() just records - the page only changes when the burst
+    """_Mouse.drag() just records - the page only changes when the burst
     of motion events is flushed, so a drag doesn't rasterize every page
     it passes over."""
     viewer = make_image_viewer(pdfless.PdfDocument(sample_pdf), rows=22, cols=40)

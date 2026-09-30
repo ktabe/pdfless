@@ -22,8 +22,6 @@ tests below cover main()'s wiring end-to-end - that FOCUS_ON/FOCUS_OFF
 are actually sent, that FOCUS_IN triggers a redraw, and that FOCUS_OUT
 does not."""
 
-import time
-
 import pdfless
 
 
@@ -37,24 +35,17 @@ def test_decode_csi_key_recognizes_focus_events():
 
 def test_startup_enables_focus_reporting(pty_session, sample_pdf):
     session = pty_session([sample_pdf])
-    time.sleep(1)
-    out = session.read_all(1.0).decode(errors="replace")
-    assert "\x1b[?1004h" in out
-    session.send(b"q")
+    assert b"\x1b[?1004h" in session.ready()
+    session.quit()
 
 
 def test_focus_in_redraws_without_crashing(pty_session, sample_pdf):
     session = pty_session([sample_pdf])
-    time.sleep(3)
-    session.read_all(0.5)  # drop the startup paint
+    session.ready()
 
-    session.send(b"\x1b[I", wait=0.5)
-    out = session.read_all(0.5).decode(errors="replace")
-    assert "Traceback" not in out
-    assert "\x1b]1337;File=" in out  # the image was re-sent
-
-    session.send(b"q")
-    assert "Traceback" not in session.read_all().decode(errors="replace")
+    session.send(b"\x1b[I")
+    assert b"\x1b]1337;File=" in session.ready()  # the image was re-sent
+    session.quit()
 
 
 def test_focus_out_does_not_redraw(pty_session, sample_pdf):
@@ -62,13 +53,8 @@ def test_focus_out_does_not_redraw(pty_session, sample_pdf):
     docstring for why that would actually misplace the image into
     whichever pane is gaining focus instead."""
     session = pty_session([sample_pdf])
-    time.sleep(3)
-    session.read_all(0.5)  # drop the startup paint
+    session.ready()
 
-    session.send(b"\x1b[O", wait=0.5)
-    out = session.read_all(0.5).decode(errors="replace")
-    assert "Traceback" not in out
-    assert "\x1b]1337;File=" not in out  # no redraw happened
-
-    session.send(b"q")
-    assert "Traceback" not in session.read_all().decode(errors="replace")
+    session.send(b"\x1b[O")
+    assert b"\x1b]1337;File=" not in session.read_all(0.5)  # no redraw happened
+    session.quit()

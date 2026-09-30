@@ -117,7 +117,7 @@ With no filename, or with `-` as the filename, `pdfless` reads standard input.
 | `-h`, `--fit-height` | Fit pages to the terminal height instead of its width. |
 | `-k`, `--keep` | Leave the last page on screen when quitting. |
 | `-f`, `--follow` | Start in follow mode: check the current file for changes every 3 seconds and reload it, preserving the page and display mode. |
-| `-F`, `--quit-if-one-screen` | Print a single-page document fit to height and quit immediately; in text mode, quit if no scrolling is needed. Otherwise start normally. |
+| `-F`, `--quit-if-one-screen` | Print a single-page document fit to height and quit immediately; in text mode, quit if no scrolling is needed. Otherwise start normally. Applies only when one file is given. |
 | `-N`, `--line-numbers` | Show line numbers in text mode. |
 | `-S`, `--chop-long-lines` | Pan across long lines instead of wrapping them in text mode. |
 | `-B`, `--no-border` | Hide page borders in text mode. |
@@ -177,6 +177,7 @@ The status line shows `follow` while the mode is active.
 | `?pattern` `Enter` | Search backward. |
 | `/` `Enter` / `?` `Enter` | Repeat the previous pattern forward / backward. |
 | `N` / `P` | Next / previous match. |
+| `q`, `Esc` | While a search is active, clear it (a second `q` quits). |
 
 While entering a search pattern with `/` or `?`, use the following keys to
 edit the input. These bindings apply only while the search prompt is active.
@@ -192,6 +193,7 @@ edit the input. These bindings apply only while the search prompt is active.
 | `^D`, `Delete` | Delete the character to the right of the cursor. |
 | `^H`, `Backspace` | Delete the character to the left of the cursor. |
 | `^T` | Toggle whether a regular expression may match across line breaks (shown as `Multi-line` in the prompt). |
+| `Esc`, `^C` | Cancel the search. |
 
 Search is case-insensitive and supports
 [Python regular expressions](https://docs.python.org/3/library/re.html).
@@ -232,10 +234,10 @@ plain images and previews without extractable text. While a search is active,
 | --- | --- |
 | `t` | Toggle text mode: extracted text for supported documents, raw source for Markdown, or image information and metadata for image files. The view stays at the same place in the document. |
 | `T` | Toggle text mode with a clean display for copying, combining the functions of `t` and `C`. |
-| `B` | Toggle page borders in text mode (on by default, except for plain text files, which never show one). Borders are hidden while lines wrap. |
+| `B` | Toggle page borders in text mode (on by default, except for a plain text file and a Markdown file's source, which start without one). Borders are hidden while lines wrap. |
 | `W`, `-S` | Toggle line wrapping in text mode. Plain text wraps by default; other formats do not. |
 | `E` | Toggle end-of-line markers in text mode (shown by default). |
-| `#`, `-N` | Toggle line numbers in text mode (hidden by default). |
+| `#`, `-N`, `-n` | Toggle line numbers in text mode (hidden by default). |
 | `C` | Toggle a clean text display for copying, restoring previous settings on the second press. |
 | `c` | Toggle continuous view (`-c`/`--continuous`) in image or text mode while keeping the current position. |
 | `r` | Toggle the scrollbar (shown by default). |
@@ -250,6 +252,7 @@ plain images and previews without extractable text. While a search is active,
 | `v` | Open the file in its default app (macOS only) and switch follow mode on, so an edit made there is picked up automatically. |
 | `^L` | Redraw the screen. |
 | `F1`, `:h` | Show keyboard help; press `q` to close it. |
+| `^Z` | Suspend pdfless; `fg` in the shell brings it back. |
 | `q`, `:q`, `^C` | Quit. |
 
 #### Copying text
@@ -339,7 +342,8 @@ neither LibreOffice nor Quick Look can render one without its password.
 
 Rendered output is saved in a persistent cache to reduce loading time when
 reopening the same file. Caching is supported for Word, Excel, PowerPoint,
-RTF, Keynote, Pages, and SVG. When the source file changes, the output is
+RTF, Keynote, Pages, Numbers, OpenDocument, Visio, WMF, and SVG (not for
+Markdown, which renders quickly). When the source file changes, the output is
 rendered again and the cache is updated automatically.
 
 Use `--no-cache` to render without reading or writing the cache, or

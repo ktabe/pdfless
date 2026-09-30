@@ -17,10 +17,13 @@ that raster in memory and redrawing the screen - the same "redraw on
 each keypress" approach less(1) uses internally, since a terminal has
 no way to scroll just part of an inline image.
 
-Plain images and text files are supported directly, and (macOS only,
-given a local Chrome/Chromium install) anything else this Mac's Quick
-Look generators can preview - Word, Excel, PowerPoint, Keynote, Pages,
-... - via qlmanage + a headless-Chrome screenshot of its HTML preview.
+Plain images and text files are supported directly; so are Markdown
+(rendered with WeasyPrint), SVG (with a headless Chrome/Chromium), and
+office documents - Word, Excel, PowerPoint and OpenDocument through
+LibreOffice when it's installed, and on macOS anything this Mac's Quick
+Look generators can preview (Keynote, Pages, ...) through qlmanage and
+a headless Chrome/Chromium. Every one of them that renders to a PDF is
+then shown, searched and followed like one.
 """
 
 from __future__ import annotations
@@ -439,6 +442,8 @@ Keys:
                           string always may)
   / ENTER  ? ENTER        repeat the last search pattern, forward / back
   N P                     jump to next / previous search match
+  q ESC                   (while a search is active) clear the search,
+                          rather than quit
                             <CHANGING FILES>
   :n :p  { }              next / previous file, when more than one was
                           given on the command line
@@ -447,17 +452,19 @@ Keys:
   O                       list the files: pick one with j/k and open it
                           with ENTER
                                <ZOOMING>
-  + -                     zoom in / out
+  + = -                   zoom in / out
   0                       reset zoom and pan
   m M                     fit page to terminal height / width
                            <MOUSE OPERATIONS>
   mouse click             (page image, not text mode) on the scrollbar,
-                          jump to the position clicked; otherwise open
-                          a PDF hyperlink under the pointer
+                          jump to the position clicked (drag it to
+                          follow the pointer); otherwise open a
+                          hyperlink under the pointer
   mouse wheel             scroll up / down
                                 <LINKS>
   [ ]                     back / forward, through the positions internal
-                          links (and o below) have jumped from (PDF only)
+                          links (and o below) have jumped from (image
+                          mode)
   o TAB                   table of contents (bookmarks, headings): pick
                           an entry with j/k and jump to it with ENTER
                                <TOGGLES>
@@ -487,7 +494,8 @@ Keys:
                           switch follow mode on
   ^L                      redraw the screen
   F1 :h                   show this help (q to close it)
-  q :q                    quit\
+  ^Z                      suspend (fg to come back)
+  q :q ^C                 quit\
 """
 
 FORWARD_LINE_KEYS = {"e", "\x05", "j", "\x0e", "\r", "DOWN"}
@@ -858,7 +866,7 @@ def find_soffice() -> str | None:
     Chrome --print-to-pdf pipeline (real page breaks, correctly
     rendered embedded pictures of any format, no reliance on Quick
     Look at all) - or None if it isn't installed. Optional: callers
-    (see OfficeDocument._try_soffice_pages()) always fall back to the
+    (see RenderedDocument._try_soffice_pages()) always fall back to the
     qlmanage/Chrome pipeline when this returns None."""
     for path in SOFFICE_CANDIDATES:
         if os.path.isfile(path) and os.access(path, os.X_OK):
@@ -1257,7 +1265,7 @@ def _convert_via_soffice(
     `soffice --convert-to pdf`, natively - no Quick Look/Chrome
     involved at all - returning the output PDF's path, or None on any
     failure (timeout, non-zero exit, or no output file), so callers
-    (see OfficeDocument._try_soffice_pages()) can always fall back to
+    (see RenderedDocument._try_soffice_pages()) can always fall back to
     the qlmanage/Chrome pipeline.
 
     Deliberately does NOT pass --headless: confirmed by hand that
@@ -4666,9 +4674,9 @@ class OfficeDocument(RenderedDocument):
 
     def _cache_key_suffix(self, render_scale: float) -> str:
         """build_pages()'s persistent-cache key suffix (see
-        _cached_render_dir()), or None for no persistent caching. A
-        screenshot-sliced render bakes in -s/--rendering-scale's pixel
-        resolution, so it's part of the key here."""
+        _cached_render_dir()). A screenshot-sliced render bakes in
+        -s/--rendering-scale's pixel resolution, so it's part of the key
+        here."""
         return f":scale={render_scale}"
 
     def _soffice_pages_if_eligible(
@@ -4784,8 +4792,10 @@ class OfficeDocument(RenderedDocument):
         local Chrome/Chromium. `path` isn't necessarily self.path -
         RtfOfficeDocument renders a converted .docx instead (see its
         build_pages()). Returns a list of PNG file paths (one per page,
-        in reading order), or None if qlmanage has no generator for
-        this file or no Chrome is installed. With debug=True
+        in reading order) - or ("pdf", pdf_path, npages) when it went
+        through a real PDF (LibreOffice, or Chrome's --print-to-pdf) -
+        or None if qlmanage has no generator for this file or no Chrome
+        is installed. With debug=True
         (-d/--debug), prints each stage's wall-clock time (and which
         browser got used) to stderr, plus a total at the end.
         `render_scale` is the device-pixel-ratio to rasterize at
@@ -5949,25 +5959,6 @@ def _inline_image(data: bytes, width: int, height: int) -> str:
     )
 
 
-def _format_ech_clear(char_w: int, char_h: int) -> str:
-    """Erase `char_w` x `char_h` cells at the home position (ECH/CUU)."""
-    out = ["\x1b[H"]
-    for i in range(char_h):
-        out.append(f"\x1b[{char_w}X")
-        if i < char_h - 1:
-            out.append("\x1b[1B")
-    if char_h > 0:
-        out.append(f"\x1b[{char_h}A")
-    return "".join(out)
-
-
-def _strip_leading_home(s: str) -> str:
-    home = "\x1b[H"
-    if s.startswith(home):
-        return s[len(home):]
-    return s
-
-
 def _image_bytes(img: Image.Image) -> int:
     """Roughly how much memory `img`'s pixels take - one byte per band
     per pixel, true of the RGB/RGBA/L images PageCache holds."""
@@ -6223,7 +6214,7 @@ class _Overlays:
         self.files_scroll = 0
         self._outline: list[dict[str, Any]] | None = None  # lazily built, via PdfDocument.build_outline()
         # The entry last jumped to, and where that left the view (see
-        # _view_position()) - so reopening before moving on selects it.
+        # Viewer._view_spot()) - so reopening before moving on selects it.
         self._jumped: tuple[int, tuple[bool, int, int]] | None = None
 
     def forget_outline(self) -> None:
@@ -6392,7 +6383,7 @@ class _Overlays:
         # headings are right there: the last one above where reading is.
         headings = self._source_heading_lines()
         self.outline_sel = 0
-        if self._jumped is not None and self._jumped[1] == self._view_position():
+        if self._jumped is not None and self._jumped[1] == self.viewer._view_spot():
             # Still where the last jump left it: that entry, even when
             # another one starts on the same page, or (near the end of
             # the text) on the same screen.
@@ -6552,14 +6543,8 @@ class _Overlays:
         else:
             self.viewer.links.push_history()
             self.viewer.go_to_link_target(entry["page"], entry["top_pt"])
-        self._jumped = (index, self._view_position())
+        self._jumped = (index, self.viewer._view_spot())
         self.viewer.refresh()
-
-    def _view_position(self) -> tuple[bool, int, int]:
-        """Where the view is: the mode, the page, and how far it's
-        scrolled - for telling whether it has moved since a jump."""
-        viewer = self.viewer
-        return viewer.text_mode, viewer.page, viewer.text_scroll if viewer.text_mode else viewer.scroll
 
     def show_files(self) -> None:
         """O: put up the files given on the command line as a box over
@@ -7003,7 +6988,8 @@ class _Search:
     def match_bbox_px(self, match: BBoxMatch) -> tuple[float, float, float, float]:
         """Pixel bounding box (in its own page's image, at the current
         zoom - self.viewer.img when it's on the current page) of a
-        (page, xMin, yMin, xMax, yMax) search match, in points."""
+        (page, xMin, yMin, xMax, yMax) search match, whose own
+        coordinates are in points."""
         page, xmin_pt, ymin_pt, xmax_pt, ymax_pt = match
         img = self.viewer.img if page == self.viewer.page else self.viewer._page_image(page)
         assert self.index is not None  # a bbox match came from it
@@ -8029,12 +8015,16 @@ class Viewer:
         # what keeps startup with a large batch of files from decoding
         # every single one of them just to show the first.
         self.file_index = file_index
-        self._handler_cache: dict[int, DocumentHandler | None] = {}
+        self._handler_cache: dict[int, DocumentHandler | None] = {}  # file_index -> DocumentHandler | None,
+        # populated by _classify() the first time each lazy (path-string)
+        # entry above is actually visited - None means that one turned
+        # out not to be a usable file at all.
         # Background preparation of the file after the one on screen (see
         # _schedule_prefetch()): each index it was started for, with an
         # Event set once it's finished, and the thread doing it (at most
         # one at a time).
         self._prefetching: dict[int, threading.Event] = {}
+        self._prefetch_thread: threading.Thread | None = None
         # And of the page next to the one(s) on screen (see
         # _schedule_page_prefetch()): the thread doing it (at most one at
         # a time), and which way pages were last turned (+1/-1), so the
@@ -8042,10 +8032,6 @@ class Viewer:
         self._page_prefetch_thread: threading.Thread | None = None
         self._page_direction = 1
         self._page_direction_from = 1  # the page that direction was last judged from
-        self._prefetch_thread: threading.Thread | None = None  # file_index -> DocumentHandler | None,
-        # populated by _classify() the first time each lazy (path-string)
-        # entry above is actually visited - None means that one turned
-        # out not to be a usable file at all.
         self.tmpdir = tmpdir
         self.follow = options.follow  # -f/--follow, or toggled at runtime with F
         # (see toggle_follow()) - poll_follow() reloads the file whenever
@@ -8424,10 +8410,6 @@ class Viewer:
             pages = self.doc_handler._render_error_placeholder(self.tmpdir, message)
             self.doc_handler.pages = pages  # remember the placeholder too - don't retry every revisit
         self.npages = len(pages)
-
-    @property
-    def is_pdf(self) -> bool:
-        return isinstance(self.doc_handler, PdfDocument)
 
     def next_file(self) -> None:
         self.go_to_file(self.file_index + 1, "no next file", step=1)
@@ -10234,7 +10216,6 @@ class Viewer:
         return buf.getvalue()
 
     def _format_viewport_clear(self, crop_w: int, crop_h: int, full_clear: bool) -> str:
-        char_w = max(1, -(-crop_w // self.cell_w_px))
         char_h = max(1, -(-crop_h // self.cell_h_px))
         prev_char_h = self._last_char_h or char_h
 
@@ -10244,18 +10225,14 @@ class Viewer:
 
         # Rows are cleared from the page's first column (right of the
         # sidebar, if it's up) to the end of the line, the sidebar left be.
+        # (A taller viewport than last time never gets here - see
+        # _needs_full_clear().) Every row below the image, down to the
+        # last row the previous one reached or the viewport's own last
+        # row, whichever is further.
         col0 = self._image_col0()
         out = [f"\x1b[1;{col0}H"]
-        if self._last_viewport_set and crop_h > self._last_viewport_h:
-            out.append(_strip_leading_home(_format_ech_clear(char_w, char_h)))
-        if prev_char_h > char_h:
-            for row in range(char_h, min(prev_char_h, self.rows - 1)):
-                out.append(f"\x1b[{row + 1};{col0}H\x1b[K")
         total_rows = max(1, -(-self.avail_height_px // self.cell_h_px))
-        blank_from = char_h
-        if prev_char_h > char_h:
-            blank_from = max(char_h, prev_char_h)
-        for row in range(blank_from, min(self.rows - 1, total_rows)):
+        for row in range(char_h, min(self.rows - 1, max(prev_char_h, total_rows))):
             out.append(f"\x1b[{row + 1};{col0}H\x1b[K")
         self._last_char_h = char_h
         return "".join(out)
@@ -10688,7 +10665,7 @@ class Viewer:
         Chrome's --print-to-pdf as a real PDF link annotation, so this
         lets it be treated exactly like a real PDF's hyperlinks
         wherever this is used), or None if neither applies."""
-        if isinstance(self.doc_handler, PdfDocument):  # i.e. self.is_pdf
+        if isinstance(self.doc_handler, PdfDocument):
             return self.doc_handler
         return getattr(self.doc_handler, "_pdf_delegate", None)
 
@@ -10763,7 +10740,7 @@ class Viewer:
         both keyed off content that's now stale, so both get dropped;
         any in-progress search is cleared too, since its match list may
         no longer correspond to anything in the new file."""
-        if isinstance(self.doc_handler, PdfDocument):  # i.e. self.is_pdf
+        if isinstance(self.doc_handler, PdfDocument):
             self.doc_handler.forget_page_sizes()
             self.npages = self.doc_handler.page_count()
             self.page = max(1, min(self.npages, self.page))

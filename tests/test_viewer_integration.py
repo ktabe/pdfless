@@ -16,23 +16,22 @@ import time
 
 from conftest import requires_office_support, requires_macos
 
-
-def assert_no_crash(session, keys, wait=0.5, initial_wait=3):
-    time.sleep(initial_wait)
-    for k in keys:
-        session.send(k, wait=wait)
-    out = session.read_all().decode(errors="replace")
-    assert "Traceback" not in out, out
+# Rendering an office document can take a while (LibreOffice, or Quick
+# Look + Chrome) - how long to wait for its first frame.
+OFFICE_TIMEOUT = 90
 
 
 def test_plain_text_file_opens_without_crashing(pty_session, sample_text):
     session = pty_session([sample_text])
-    assert_no_crash(session, [b"q"])
+    session.ready()
+    session.quit()
 
 
 def test_rtf_file_opens_without_crashing(pty_session, sample_rtf):
+    """(Through LibreOffice where it's installed, else as plain text.)"""
     session = pty_session([sample_rtf])
-    assert_no_crash(session, [b"q"])
+    session.ready(OFFICE_TIMEOUT)
+    session.quit()
 
 
 def test_plain_text_file_survives_a_resize(pty_session, sample_text):
@@ -40,28 +39,48 @@ def test_plain_text_file_survives_a_resize(pty_session, sample_text):
     resize (refresh()'s SIGWINCH path) - make sure that doesn't crash
     either, not just the very first load."""
     session = pty_session([sample_text])
-    time.sleep(3)
+    session.ready()
     os.kill(session.pid, signal.SIGWINCH)
-    time.sleep(0.5)
-    session.send(b"q")
-    out = session.read_all().decode(errors="replace")
-    assert "Traceback" not in out
+    session.ready()  # redrawn
+    session.quit()
 
 
 def test_pdf_text_mode_toggle_and_search(pty_session, sample_pdf):
     session = pty_session([sample_pdf])
-    assert_no_crash(session, [b"t", b"/", b"Lorem\r", b"n", b"t", b"q"])
+    session.ready()
+    session.send(b"t")
+    session.ready()
+    session.send(b"/Lorem\r")
+    session.wait_for(b"match 1/")
+    session.send(b"n")
+    session.wait_for(b"match 2/")
+    session.send(b"t")
+    session.ready()
+    session.quit(b"qq")  # (the first q clears the search)
 
 
-def test_image_file_refuses_text_mode_and_search(pty_session, sample_image):
+def test_image_file_text_mode_and_search_prompt(pty_session, sample_image):
+    """An image's text mode shows its information (size, EXIF, ...), and
+    the search prompt opens there and is cancelled with ESC."""
     session = pty_session([sample_image])
-    assert_no_crash(session, [b"t", b"/", b"q"])
+    session.ready()
+    session.send(b"t")
+    assert b"PNG" in session.ready()
+    session.send(b"/")
+    session.wait_for(b"\x1b[?25h")  # the prompt, with the cursor shown in it
+    session.send(b"\x1b")
+    session.ready()
+    session.quit()
 
 
 @requires_office_support
 def test_docx_office_text_mode_toggle(pty_session, sample_docx):
     session = pty_session([sample_docx])
-    assert_no_crash(session, [b"t", b"t", b"q"], wait=1.0, initial_wait=6)
+    session.ready(OFFICE_TIMEOUT)
+    for _ in range(2):
+        session.send(b"t")
+        session.ready()
+    session.quit()
 
 
 @requires_office_support
@@ -72,7 +91,11 @@ def test_rtf_office_text_mode_toggle(pty_session, sample_rtf):
     into/out of text mode work end-to-end, not just the plain-text
     fallback path."""
     session = pty_session([sample_rtf])
-    assert_no_crash(session, [b"t", b"t", b"q"], wait=1.0, initial_wait=6)
+    session.ready(OFFICE_TIMEOUT)
+    for _ in range(2):
+        session.send(b"t")
+        session.ready()
+    session.quit()
 
 
 def test_f_key_toggles_follow_mode_and_its_status_indicator(pty_session, sample_pdf):
@@ -81,43 +104,29 @@ def test_f_key_toggles_follow_mode_and_its_status_indicator(pty_session, sample_
     status line shows a " follow " segment (status_segments()) only
     while it's active, regardless of how it got turned on."""
     session = pty_session([sample_pdf])
-    time.sleep(3)
-    assert b" follow " not in session.read_all(0.5)  # off by default (startup paint)
+    assert b" follow " not in session.ready()  # off by default (startup paint)
 
     session.send(b"F")
-    assert b" follow " in session.read_all(0.5)
+    assert b" follow " in session.ready()
 
     session.send(b"F")
-    assert b" follow " not in session.read_all(0.5)
-    session.send(b"q")
+    assert b" follow " not in session.ready()
+    session.quit()
 
 
 def test_lowercase_f_flag_still_enables_follow_at_startup(pty_session, sample_pdf):
     """-F was renamed to -f (see the new -F/--quit-if-one-screen, real
     less(1)'s own flag) - -f must still turn follow on at startup."""
     session = pty_session(["-f", sample_pdf])
-    time.sleep(3)
-    assert b" follow " in session.read_all(0.5)
-    session.send(b"q")
+    assert b" follow " in session.ready()
+    session.quit()
 
 
-def _drain_until_exit(session, deadline_seconds=5):
-    """Poll os.waitpid(WNOHANG) while draining the pty, same as
-    test_colon_q_quits() - draining is required even when not asserting
-    on the output, since a big enough write (e.g. an inline image) can
-    fill the pty buffer and block the child in write(), which would
-    otherwise wedge it before it ever reaches exit(). Returns (exited,
-    captured_bytes)."""
-    deadline = time.monotonic() + deadline_seconds
-    captured = b""
-    exited = False
-    while time.monotonic() < deadline:
-        captured += session.read_all(0.2)
-        pid, _status = os.waitpid(session.pid, os.WNOHANG)
-        if pid != 0:
-            exited = True
-            break
-    return exited, captured
+def _drain_until_exit(session, deadline_seconds=10):
+    """Wait for pdfless to exit by itself (see PtySession.exited()) -
+    (whether it did, with status 0, and everything it wrote)."""
+    code, out = session.exited(deadline_seconds)
+    return code == 0, out
 
 
 def test_quit_if_one_screen_dumps_a_single_page_image_and_exits(pty_session, sample_image):
@@ -204,14 +213,13 @@ def test_quit_if_one_screen_leaves_a_margin_row_for_its_own_trailing_newline(
     assert b"\x1b[?1049h" not in out
 
     session = pty_session(["-F", make(39)])
-    time.sleep(3)
-    assert os.waitpid(session.pid, os.WNOHANG) == (0, 0), (
+    out = session.ready()
+    assert session.proc.poll() is None, (
         "39 lines should no longer auto-dump - it would scroll its own "
         "first line out of view the instant the trailing \\r\\n is written"
     )
-    out = session.read_all(0.5)
     assert b"\x1b[?1049h" in out  # started up interactively instead
-    session.send(b"q")
+    session.quit()
 
 
 @requires_office_support
@@ -229,7 +237,7 @@ def test_quit_if_one_screen_shows_progress_then_a_clean_dump(pty_session, sample
     followed it - see Viewer._dump_margin_rows for that separate,
     already-fixed bug)."""
     session = pty_session(["-F", sample_docx])
-    exited, out = _drain_until_exit(session, deadline_seconds=10)
+    exited, out = _drain_until_exit(session, deadline_seconds=OFFICE_TIMEOUT)
     assert exited, "pdfless did not exit on its own under -F for a single-page docx"
     assert b"\x1b[?1049h" not in out
     assert b"converting via LibreOffice" in out  # progress is now visible...
@@ -247,11 +255,10 @@ def test_quit_if_one_screen_does_not_exit_for_a_multipage_pdf(pty_session, sampl
     all - lorem_ipsum.pdf is 7 pages, so this should start up exactly
     like a normal interactive session (no -F), needing an explicit quit."""
     session = pty_session(["-F", sample_pdf])
-    time.sleep(3)
-    assert os.waitpid(session.pid, os.WNOHANG) == (0, 0)
-    out = session.read_all(0.5)
+    out = session.ready()
+    assert session.proc.poll() is None
     assert b"\x1b[?1049h" in out  # did enter the alternate screen normally
-    session.send(b"q")
+    session.quit()
 
 
 def test_quit_if_one_screen_does_not_exit_for_a_long_text_file(pty_session, tmp_path):
@@ -262,11 +269,10 @@ def test_quit_if_one_screen_does_not_exit_for_a_long_text_file(pty_session, tmp_
     long_text = tmp_path / "long.txt"
     long_text.write_text("\n".join(f"line {i}" for i in range(500)) + "\n")
     session = pty_session(["-F", str(long_text)])
-    time.sleep(3)
-    assert os.waitpid(session.pid, os.WNOHANG) == (0, 0)
-    out = session.read_all(0.5)
+    out = session.ready()
+    assert session.proc.poll() is None
     assert b"\x1b[?1049h" in out
-    session.send(b"q")
+    session.quit()
 
 
 @requires_macos
@@ -279,9 +285,8 @@ def test_v_opens_the_file_externally_and_turns_on_follow_mode(
     one on PATH instead - a script that just records the path it was
     given - for the pdfless subprocess's own subprocess.Popen(["open",
     ...]) call to find via PATH lookup instead of the genuine
-    /usr/bin/open. monkeypatching os.environ here (before pty.fork(),
-    inside the pty_session fixture) is inherited by the forked child,
-    since it duplicates the parent's memory before exec()ing."""
+    /usr/bin/open. monkeypatching os.environ here (before the
+    pty_session fixture starts it) is inherited by the child."""
     marker = tmp_path / "opened.txt"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -291,16 +296,19 @@ def test_v_opens_the_file_externally_and_turns_on_follow_mode(
     monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
 
     session = pty_session([sample_pdf])
-    time.sleep(3)
-    assert b" follow " not in session.read_all(0.5)  # off by default (startup paint)
+    assert b" follow " not in session.ready()  # off by default (startup paint)
 
-    session.send(b"O", wait=1.0)  # no longer an alias for "v"
+    session.send(b"O")  # no longer an alias for "v" (the file list, here one file)
+    session.wait_for(b"only one file")
     assert not marker.exists()
 
-    session.send(b"v", wait=1.0)
-    assert b" follow " in session.read_all(0.5)
+    session.send(b"v")
+    session.wait_for(b" follow ")
+    deadline = time.monotonic() + 10
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)  # the fake open runs on its own
     assert marker.read_text().strip() == sample_pdf
-    session.send(b"q")
+    session.quit()
 
 
 def test_f1_and_colon_h_both_open_the_help(pty_session, sample_text):
@@ -308,25 +316,22 @@ def test_f1_and_colon_h_both_open_the_help(pty_session, sample_text):
     as ESC O P by most terminals and ESC [ 1 1 ~ by the rest - with
     ":h" as a second way in."""
     session = pty_session([sample_text])
-    time.sleep(3)
-    session.read_all(0.5)  # drop the startup paint
+    session.ready()
 
     for keys in (b"\x1bOP", b"\x1b[11~", b":h"):
         session.send(keys)
-        out = session.read_all(0.5).decode(errors="replace")
-        assert "q to close help" in out, keys  # the help box's own status line
+        session.wait_for(b"q to close help")  # the help box's own status line
         session.send(b"q")  # close it again
-    session.send(b"q")
-    assert "Traceback" not in session.read_all().decode(errors="replace")
+        session.ready()
+    session.quit()
 
 
 def test_question_mark_opens_a_backward_search_prompt(pty_session, sample_text):
     session = pty_session([sample_text])
-    time.sleep(3)
-    session.read_all(0.5)
+    session.ready()
 
     session.send(b"?")
-    out = session.read_all(0.5).decode(errors="replace")
+    out = session.wait_for(b"\x1b[?25h").decode(errors="replace")  # the cursor, shown at the prompt
     assert "q to close help" not in out  # no longer the help key
     # The prompt: the line cleared, then its own "?" echoed at column 1
     # (after the ^T reminder drawn at the right end).
@@ -335,49 +340,31 @@ def test_question_mark_opens_a_backward_search_prompt(pty_session, sample_text):
     assert out.rstrip().endswith("\x1b[?25h")  # then the real cursor is shown at the prompt
 
     session.send(b"line\r")
-    assert_no_crash(session, [b"q"], initial_wait=0)
+    session.wait_for(b"match ")
+    session.quit(b"qq")  # (the first q clears the search)
 
 
 def test_colon_q_quits(pty_session, sample_text):
     """less(1) users reach for ":q" out of habit - it should quit just
     like the plain "q" key, not just cancel the colon-command prompt."""
     session = pty_session([sample_text])
-    time.sleep(3)
-    session.read_all(0.5)
-
-    session.send(b":q", wait=0)
-    deadline = time.monotonic() + 5
-    exited = False
-    while time.monotonic() < deadline:
-        # Keep draining the pty's master side while polling - otherwise
-        # the terminal-reset escapes pdfless writes on its way out can
-        # fill the pty buffer and block the child inside write(),
-        # keeping it from ever reaching the exit() that follows (and
-        # hanging this check regardless of whether ":q" itself worked).
-        session.read_all(0.2)
-        pid, _status = os.waitpid(session.pid, os.WNOHANG)
-        if pid != 0:
-            exited = True
-            break
-    assert exited, "pdfless did not exit after \":q\""
+    session.ready()
+    session.quit(b":q")
 
 
 def test_empty_search_pattern_repeats_the_last_one(pty_session, sample_text):
     """An empty "/"/"?" (just Enter) should re-run the previous search
     pattern, less(1)-style, rather than doing nothing."""
     session = pty_session([sample_text])
-    time.sleep(3)
-    session.read_all(0.5)
+    session.ready()
 
     session.send(b"/line\r")
-    session.read_all(0.5)
+    session.wait_for(b"match 1/")
 
     session.send(b"/\r")
-    out = session.read_all(0.5).decode(errors="replace")
+    out = session.wait_for(b"match ").decode(errors="replace")
     assert "no previous search pattern" not in out
-    assert "Traceback" not in out
-
-    assert_no_crash(session, [b"q"], initial_wait=0)
+    session.quit(b"qq")  # (the first q clears the search)
 
 
 def test_encrypted_pdf_as_first_file_prompts_and_unlocks(pty_session, sample_encrypted_pdf):
@@ -388,28 +375,22 @@ def test_encrypted_pdf_as_first_file_prompts_and_unlocks(pty_session, sample_enc
     see test_navigating_to_encrypted_pdf_prompts_on_status_line below
     for that side."""
     session = pty_session([sample_encrypted_pdf])
-    time.sleep(2)
-    out = session.read_all(1).decode(errors="replace")
-    assert "Password" in out
-    session.send(b"secret123\r", wait=1.5)
-    out = session.read_all(1).decode(errors="replace")
-    assert "Traceback" not in out
-    assert "\x1b[?1049h" in out  # entered the alternate screen - unlocked and showing normally
-    assert_no_crash(session, [b"q"], initial_wait=0)
+    session.wait_for(b"Password")
+    session.send(b"secret123\r")
+    out = session.ready()
+    assert b"\x1b[?1049h" in out  # entered the alternate screen - unlocked and showing normally
+    session.quit()
 
 
 def test_encrypted_pdf_wrong_password_then_retry_succeeds(pty_session, sample_encrypted_pdf):
     session = pty_session([sample_encrypted_pdf])
-    time.sleep(2)
-    session.read_all(1)
-    session.send(b"nope\r", wait=1)
-    out = session.read_all(1).decode(errors="replace")
-    assert "incorrect password" in out.lower()
-    session.send(b"secret123\r", wait=1.5)
-    out = session.read_all(1).decode(errors="replace")
-    assert "Traceback" not in out
-    assert "\x1b[?1049h" in out
-    assert_no_crash(session, [b"q"], initial_wait=0)
+    session.wait_for(b"Password")
+    session.send(b"nope\r")
+    session.wait_for(b"ncorrect password")
+    session.wait_for(b"Password")  # asked again - only then is echo off
+    session.send(b"secret123\r")
+    assert b"\x1b[?1049h" in session.ready()
+    session.quit()
 
 
 def test_navigating_to_encrypted_pdf_prompts_on_status_line_and_unlocks(
@@ -419,19 +400,14 @@ def test_navigating_to_encrypted_pdf_prompts_on_status_line_and_unlocks(
     encrypted PDF reached via :n prompts on the status line instead
     (see PdfDocument._ensure_unlocked()/_prompt_pdf_password_raw)."""
     session = pty_session([sample_pdf, sample_encrypted_pdf])
-    time.sleep(3)
-    session.read_all(0.5)
+    session.ready()
 
-    session.send(b":n", wait=1)
-    out = session.read_all(1).decode(errors="replace")
-    assert "Password" in out
+    session.send(b":n")
+    session.wait_for(b"Password")
 
-    session.send(b"secret123\r", wait=1.5)
-    out = session.read_all(1).decode(errors="replace")
-    assert "Traceback" not in out
-    assert os.path.basename(sample_encrypted_pdf) in out
-
-    assert_no_crash(session, [b"q"], initial_wait=0)
+    session.send(b"secret123\r")
+    session.wait_for(os.path.basename(sample_encrypted_pdf).encode())
+    session.quit()
 
 
 def test_navigating_to_encrypted_pdf_cancel_is_skipped_by_next_file(
@@ -442,16 +418,11 @@ def test_navigating_to_encrypted_pdf_cancel_is_skipped_by_next_file(
     stepping past it to the next file in the list, rather than
     getting stuck or crashing."""
     session = pty_session([sample_pdf, sample_encrypted_pdf, sample_image])
-    time.sleep(3)
-    session.read_all(0.5)
+    session.ready()
 
-    session.send(b":n", wait=1)
-    out = session.read_all(1).decode(errors="replace")
-    assert "Password" in out
+    session.send(b":n")
+    session.wait_for(b"Password")
 
-    session.send(b"\x1b", wait=1.5)  # Esc cancels
-    out = session.read_all(1).decode(errors="replace")
-    assert "Traceback" not in out
-    assert os.path.basename(sample_image) in out
-
-    assert_no_crash(session, [b"q"], initial_wait=0)
+    session.send(b"\x1b")  # Esc cancels
+    session.wait_for(os.path.basename(sample_image).encode())
+    session.quit()
