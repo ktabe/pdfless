@@ -3762,18 +3762,30 @@ class PdfDocument(DocumentHandler):
         # zlib compression would be pure overhead - and it's most of
         # pdftoppm's run time (e.g. ~700ms of ~770ms for a 1600px-wide
         # page), far more than writing/reading the bigger raw file.
-        prefix = os.path.join(cache.tmpdir, f"page-{page}-{round(dpi)}")
-        run_subprocess(
-            [
-                "pdftoppm", *self._password_args(self.password), "-r", str(dpi),
-                "-f", str(page), "-l", str(page),
-                "-singlefile", self.path, prefix,
-            ],
-            check=True,
-        )
-        img = Image.open(prefix + ".ppm")
-        img.load()
-        os.unlink(prefix + ".ppm")
+        #
+        # Into a directory of its own: renders run on more than one thread
+        # (the page prefetch, the thumbnails) and for more than one file
+        # (a prefetch for the one just left can still be running), and
+        # one named for the page and DPI alone would have two of them
+        # writing - and reading back - the same file.
+        workdir = tempfile.mkdtemp(prefix="page-", dir=cache.tmpdir)
+        prefix = os.path.join(workdir, "page")
+        try:
+            # stderr captured: poppler's warnings about a slightly
+            # malformed PDF ("Syntax Error: ...") would otherwise land
+            # over the page on screen - and it's what a failure says.
+            run_subprocess(
+                [
+                    "pdftoppm", *self._password_args(self.password), "-r", str(dpi),
+                    "-f", str(page), "-l", str(page),
+                    "-singlefile", self.path, prefix,
+                ],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            img = Image.open(prefix + ".ppm")
+            img.load()
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
         cache._store(key, img)
         return img
