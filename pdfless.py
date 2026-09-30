@@ -2851,6 +2851,10 @@ def search_spans(
 
 
 
+NOT_DISPLAYABLE = "not a PDF, image, text, or Quick-Look-previewable file"
+# (what main() skips a file with, and go_to_file() reports for one)
+
+
 class UnusableFile(Exception):
     """Raised by DocumentHandler.sniff() when a file's format was
     positively identified (e.g. its PDF magic bytes matched) but it
@@ -8040,6 +8044,8 @@ class Viewer:
         # populated by _classify() the first time each lazy (path-string)
         # entry above is actually visited - None means that one turned
         # out not to be a usable file at all.
+        self._unusable_why: dict[int, str] = {}  # file_index -> the UnusableFile
+        # message _classify() got sniffing it, if any (see _unusable_reason()).
         # Background preparation of the file after the one on screen (see
         # _schedule_prefetch()): each index it was started for, with an
         # Event set once it's finished, and the thread doing it (at most
@@ -8278,8 +8284,9 @@ class Viewer:
                 self._handler_cache[index] = _sniff_file(
                     entry, self.tmpdir, debug=self.debug if debug is None else debug,
                 )
-            except UnusableFile:
+            except UnusableFile as e:
                 self._handler_cache[index] = None
+                self._unusable_why[index] = str(e)
         return self._handler_cache[index]
 
     def _schedule_prefetch(self) -> None:
@@ -8334,10 +8341,9 @@ class Viewer:
         if self.debug:
             _debug_log(f"{name}: {outcome}")
 
-    def _is_usable(self, index: int) -> bool:
-        """Whether files[index] can actually be switched to -
-        go_to_file() treats a False return exactly like an
-        out-of-range index. Beyond just being classifiable
+    def _unusable_reason(self, index: int) -> str | None:
+        """Why files[index] can't be switched to, for go_to_file()'s
+        status line - or None if it can. Beyond just being classifiable
         (_classify()), this also forces page_count() to resolve for
         real: for a password-protected PdfDocument, that's where the
         user is actually prompted (see PdfDocument._ensure_unlocked()),
@@ -8345,15 +8351,26 @@ class Viewer:
         moment later inside _set_current_file() - go_to_file()'s own
         step logic then treats a cancelled prompt the same as any
         other unusable file (skipped over by :n/:p's auto-skip, or
-        reported for a direct jump)."""
+        reported for a direct jump).
+
+        Args:
+            index: A valid index into self.files.
+
+        Returns:
+            "no such file" (gone since pdfless started), the UnusableFile
+            message (e.g. a corrupt PDF), NOT_DISPLAYABLE, or None.
+        """
         handler = self._classify(index)
         if handler is None:
-            return False
+            entry = self.files[index]
+            if isinstance(entry, str) and not os.path.isfile(entry):
+                return "no such file"
+            return self._unusable_why.get(index, NOT_DISPLAYABLE)
         try:
             handler.page_count()
-        except UnusableFile:
-            return False
-        return True
+        except UnusableFile as e:
+            return str(e)
+        return None
 
     def _set_current_file(self) -> None:
         """Point path/name/npages/doc_handler/cache at
@@ -8448,21 +8465,24 @@ class Viewer:
 
         `step` (+-1 from next_file()/previous_file(), 0 from a direct
         jump like x/X) says what to do if files[index] turns out not to
-        be usable at all (_is_usable() says no - a lazily-sniffed file,
-        not yet known either way, or a password-protected PDF whose
-        prompt (see _is_usable()) was cancelled): 0 just reports
-        boundary_message right there, the same as an out-of-range index;
-        +-1 instead keeps stepping in that direction looking for the
+        be usable at all (_unusable_reason() says why - a lazily-sniffed
+        file, not yet known either way, or a password-protected PDF
+        whose prompt (see there) was cancelled): 0 just reports that
+        reason, with the file's name, right there; +-1 instead keeps
+        stepping in that direction looking for the
         next usable one, only giving up once the index itself runs out
         of range."""
         while True:
             if index < 0 or index >= len(self.files):
                 self.draw_status(boundary_message)
                 return
-            if self._is_usable(index):
+            reason = self._unusable_reason(index)
+            if reason is None:
                 break
             if step == 0:
-                self.draw_status(boundary_message)
+                entry = self.files[index]
+                path = entry if isinstance(entry, str) else entry.path
+                self.draw_status(f"{os.path.basename(path)}: {reason}")
                 return
             index += step
         if self._copy_mode_saved is not None:
@@ -12023,11 +12043,7 @@ def _collect_files(
         try:
             handler = _sniff_file(path, tmpdir, debug=debug)
             if handler is None:
-                print(
-                    f"pdfless: not a PDF, image, text, or Quick-Look-previewable "
-                    f"file, skipping: {path}",
-                    file=sys.stderr,
-                )
+                print(f"pdfless: {NOT_DISPLAYABLE}, skipping: {path}", file=sys.stderr)
                 continue
             # A None page_count() (an office-kind first file) means
             # its real page count isn't known until Viewer.__init__
