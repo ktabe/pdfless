@@ -322,3 +322,15 @@ def test_a_reload_reads_the_links_again(sample_pdf, tmp_path):
     assert viewer.links.at(5, 5) is None  # no IndexError
     assert len(viewer.links.index) == 7
     assert viewer.links.back  # the history stays
+
+
+def test_w_toggles_wrapping_in_text_mode(sample_text):
+    """W (like B/E/C, uppercase), or less(1)'s -S; "s" and "-s" are the
+    page thumbnails' now."""
+    viewer = make_viewer(pdfless.TextDocument(sample_text))
+    wrap = viewer.text_wrap
+    viewer.handle_key_text("W")
+    assert viewer.text_wrap is not wrap
+    viewer.handle_key_text("s")  # no longer wrapping's
+    assert viewer.text_wrap is not wrap
+    assert "S" in pdfless._PREFIX_BINDINGS["-"] and "s" not in pdfless._PREFIX_BINDINGS["-"]

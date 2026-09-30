@@ -123,7 +123,7 @@ With no filename, or with `-` as the filename, `pdfless` reads standard input.
 | `-B`, `--no-border` | Hide page borders in text mode. |
 | `-E`, `--no-eol-mark` | Hide end-of-line markers in text mode. |
 | `--no-scrollbar` | Hide the scrollbar. |
-| `--sidebar` | Show page thumbnails down the left edge in image mode. Toggle at any time with `S`. |
+| `--sidebar` | Show page thumbnails down the left edge in image mode. Toggle at any time with `S`; `s` moves to them to pick one. |
 | `--wheel-scroll-step N` | Scroll N lines per mouse-wheel step in image mode (default: 2). |
 | `-s`, `--rendering-scale N` | Set the rendering scale for image-based Quick Look previews (default: 1). Higher values improve sharpness at the cost of rendering time. |
 | `-c`, `--continuous` | Scroll through pages continuously, so the bottom of one page and the top of the next can be on screen together. In text mode, a paginated document (PDF, or a format rendered to PDF) is shown as one run of text with a separator line between pages. Toggle at any time with `c`. |
@@ -232,13 +232,14 @@ plain images and previews without extractable text. While a search is active,
 | `t` | Toggle text mode: extracted text for supported documents, raw source for Markdown, or image information and metadata for image files. The view stays at the same place in the document. |
 | `T` | Toggle text mode with a clean display for copying, combining the functions of `t` and `C`. |
 | `B` | Toggle page borders in text mode (on by default, except for plain text files, which never show one). Borders are hidden while lines wrap. |
-| `s`, `-S` | Toggle line wrapping in text mode. Plain text wraps by default; other formats do not. |
+| `W`, `-S` | Toggle line wrapping in text mode. Plain text wraps by default; other formats do not. |
 | `E` | Toggle end-of-line markers in text mode (shown by default). |
 | `#`, `-N` | Toggle line numbers in text mode (hidden by default). |
 | `C` | Toggle a clean text display for copying, restoring previous settings on the second press. |
 | `c` | Toggle continuous view (`-c`/`--continuous`) in image or text mode while keeping the current position. |
 | `r` | Toggle the scrollbar (shown by default). |
-| `S` | Show page thumbnails down the left edge (image mode, in a terminal at least 60 columns wide), ready to pick one: move with `j`/`k`, press `ENTER` to go to that page (`t`/`T`: in text mode), or `q` to leave the thumbnails up and go back to the page. With the thumbnails up, `S` picks again; while picking, `S` closes them. The page being viewed is framed. Clicking a thumbnail also goes to its page; the mouse wheel over them, or their own scrollbar on the right of them, scrolls them. |
+| `S` | Show or hide page thumbnails down the left edge (image mode, in a terminal at least 60 columns wide). The page being viewed is framed. Click a thumbnail to go to its page; the mouse wheel over them, or their own scrollbar on the right of them, scrolls them. |
+| `s` | Move to the page thumbnails (showing them if needed) to pick one: move with `j`/`k`, press `ENTER` to go to that page (`t`/`T`: in text mode), or `q`/`s` to go back to the page with the thumbnails left up. |
 | `F` | Toggle automatic reloading when the current file changes. Follow mode is off at startup unless `-f`/`--follow` is specified. |
 | Click a PDF link | Open a URL in the system browser or follow an internal link. |
 | `[` / `]` | Go back / forward through the positions internal links and the table of contents (`o`) jumped from. |

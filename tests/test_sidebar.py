@@ -131,8 +131,8 @@ def test_no_shift_scrolling_under_it(sample_pdf, monkeypatch, capsys):
 
 def test_s_puts_it_up_ready_to_pick_one(sample_pdf, monkeypatch):
     viewer = make_viewer(sample_pdf, monkeypatch, sidebar=False)
-    viewer.handle_global_key("S")
-    assert viewer.sidebar.picking and viewer.sidebar.picked == 1
+    viewer.handle_global_key("s")
+    assert viewer.sidebar.columns() and viewer.sidebar.picking and viewer.sidebar.picked == 1
     d = pdfless._KeyDispatcher(viewer, -1, [], keep=False)
     for key in ("j", "j", "p"):  # "p" is swallowed: no page turn underneath
         assert d.handle(key)
@@ -142,19 +142,24 @@ def test_s_puts_it_up_ready_to_pick_one(sample_pdf, monkeypatch):
     assert viewer.sidebar.columns()  # still up
 
 
-def test_q_stops_picking_and_s_picks_again_then_closes(sample_pdf, monkeypatch):
+def test_q_or_s_goes_back_to_the_page_and_capital_s_closes(sample_pdf, monkeypatch):
     viewer = make_viewer(sample_pdf, monkeypatch)  # --sidebar: up, not picking
     d = pdfless._KeyDispatcher(viewer, -1, [], keep=False)
     assert not viewer.sidebar.picking
-    d.handle("S")
+    d.handle("s")
     assert viewer.sidebar.picking
     d.handle("G")
     assert viewer.sidebar.picked == viewer.npages
     d.handle("q")
     assert not viewer.sidebar.picking and viewer.page == 1 and viewer.sidebar.columns()
-    d.handle("S")
-    d.handle("S")
-    assert not viewer.sidebar.columns()
+    d.handle("s")
+    d.handle("s")  # s again: back to the page too
+    assert not viewer.sidebar.picking and viewer.sidebar.columns()
+    d.handle("s")
+    d.handle("S")  # closes it, picking or not
+    assert not viewer.sidebar.columns() and not viewer.sidebar.picking
+    d.handle("S")  # S shows it, without moving the keys there
+    assert viewer.sidebar.columns() and not viewer.sidebar.picking
 
 
 def test_the_picked_thumbnail_is_kept_in_view_and_framed(sample_pdf, monkeypatch, capsys):
@@ -207,7 +212,7 @@ def test_clicking_and_dragging_its_scrollbar_scroll_it_alone(sample_pdf, monkeyp
 def test_t_while_picking_goes_to_the_picked_page_in_text_mode(sample_pdf, monkeypatch):
     viewer = make_viewer(sample_pdf, monkeypatch, sidebar=False)
     d = pdfless._KeyDispatcher(viewer, -1, [], keep=False)
-    d.handle("S")
+    d.handle("s")
     d.handle("j")
     d.handle("t")
     assert viewer.text_mode and viewer.page == 2
@@ -231,7 +236,7 @@ def test_nothing_is_drawn_while_the_prompt_takes_input(sample_pdf, monkeypatch, 
 def test_picking_ends_when_the_column_goes(sample_pdf, monkeypatch):
     viewer = make_viewer(sample_pdf, monkeypatch, sidebar=False)
     d = pdfless._KeyDispatcher(viewer, -1, [], keep=False)
-    d.handle("S")
+    d.handle("s")
     viewer.cols = pdfless.SIDEBAR_MIN_TERM_COLS - 1  # the terminal was narrowed
     d.handle("n")  # a page key again, not a pick
     assert not viewer.sidebar.picking and viewer.page == 2
@@ -266,3 +271,12 @@ def test_the_thumbnail_cache_lets_go_of_full_size_images(sample_image, tmp_path)
     assert cache._native_images
     cache.forget_native(1)
     assert not cache._native_images
+
+
+def test_s_in_text_mode_says_the_thumbnails_are_in_image_mode(sample_pdf, monkeypatch, capsys):
+    viewer = make_viewer(sample_pdf, monkeypatch)
+    assert viewer.enter_text_mode()
+    capsys.readouterr()
+    viewer.handle_global_key("s")
+    assert not viewer.sidebar.picking
+    assert "in image mode" in capsys.readouterr().out
