@@ -2375,7 +2375,47 @@ def display_safe(text: str, tab_width: int = 8) -> str:
     return text
 
 
-def read_plain_text_lines(path: str, tab_width: int = 8) -> list[str]:
+# What a text file that isn't UTF-8 is tried as, in turn (see
+# read_text_file()): the encodings Japanese text still often comes in.
+_LEGACY_TEXT_ENCODINGS = ("cp932", "euc_jp")
+_PRIVATE_USE_RE = re.compile("[\ue000-\uf8ff]")
+
+
+def read_text_file(path: str, legacy: bool = True) -> str:
+    """A text file's content: as UTF-8 (a BOM dropped), or failing that
+    as each of _LEGACY_TEXT_ENCODINGS (Shift_JIS as Windows writes it,
+    EUC-JP), or failing those as UTF-8 again with whatever doesn't decode
+    shown as U+FFFD - so a file in some other encoding still opens,
+    rather than crashing text mode or being refused.
+
+    Args:
+        path: the file.
+        legacy: whether to try _LEGACY_TEXT_ENCODINGS - not for a
+            Markdown file, which in practice is always UTF-8.
+
+    Returns:
+        Its text.
+
+    Raises:
+        OSError: if it can't be read.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    for encoding in ("utf-8-sig",) + (_LEGACY_TEXT_ENCODINGS if legacy else ()):
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        # Python's cp932 "decodes" bytes Shift_JIS leaves unused (0xFD-
+        # 0xFF, the user-defined rows) into the Private Use Area - taken
+        # as a sign it isn't Shift_JIS at all, which next to never has them.
+        if encoding != "utf-8-sig" and _PRIVATE_USE_RE.search(text):
+            continue
+        return text
+    return data.decode("utf-8", errors="replace")
+
+
+def read_plain_text_lines(path: str, tab_width: int = 8, legacy: bool = True) -> list[str]:
     """A plain text file's lines, as pdftotext -layout's output is for a
     PDF page: ready to hand straight to the existing text-mode renderer.
     Tabs are expanded (there's no terminal-native tab stop handling in
@@ -2388,9 +2428,9 @@ def read_plain_text_lines(path: str, tab_width: int = 8) -> list[str]:
     words, font/color tables, ...) rather than its document text, which
     is exactly what a plain-text sniff/decode check wants. RtfDocument
     is the one that knows to prefer extract_office_text() over this raw
-    markup for actual display - see RtfDocument.extract_text()."""
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
+    markup for actual display - see RtfDocument.extract_text(). Decoded
+    as read_text_file() decodes it (`legacy` being passed on to it)."""
+    content = read_text_file(path, legacy)
     content = content.expandtabs(tab_width)
     content = _CONTROL_CHAR_RE.sub(_caret_notation, content)
     return content.splitlines()
@@ -3993,9 +4033,12 @@ class _RawTextView:
     (and over RenderedDocument's PDF-delegating ones)."""
 
     path: str  # set by the DocumentHandler it's mixed into
+    # Whether the file may be in a legacy encoding (see read_text_file())
+    # - not a Markdown file, which in practice is always UTF-8.
+    _legacy_encodings = True
 
     def extract_text(self, page: int) -> list[str]:
-        return read_plain_text_lines(self.path)
+        return read_plain_text_lines(self.path, legacy=self._legacy_encodings)
 
     def text_mode_is_paginated(self) -> bool:
         return False
@@ -4018,12 +4061,10 @@ class TextDocument(_RawTextView, DocumentHandler):
 
     @classmethod
     def sniff(cls, path: str, tmpdir: str, debug: bool = False) -> TextDocument | None:
+        # (No need to read it all to see that it decodes: read_text_file()
+        # takes any encoding, one way or another.)
         if not is_probably_text(path):
             return None
-        try:
-            read_plain_text_lines(path)  # just to validate it decodes
-        except Exception as e:
-            raise UnusableFile(f"not valid UTF-8 text ({e})") from e
         return cls(path)
 
     def page_count(self) -> int:
@@ -5090,6 +5131,7 @@ class MarkdownDocument(_RawTextView, RenderedDocument):
     _Search.uses_text_lines())."""
 
     _MARKDOWN_EXTENSIONS = (".md", ".markdown")
+    _legacy_encodings = False  # read as UTF-8 only - see _RawTextView
 
     # Minimal styling for the rendered pages - just enough that
     # headings/code/quotes are visually distinct, deliberately not
@@ -5216,8 +5258,7 @@ img { max-width: 100%; height: auto; }
         from weasyprint import HTML
 
         try:
-            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
-                source = f.read()
+            source = read_text_file(self.path, legacy=False)  # as text mode reads it
         except OSError:
             return False
         body = markdown.markdown(source, extensions=["extra", "sane_lists"])
