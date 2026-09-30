@@ -108,3 +108,21 @@ def test_scrolling_back_from_the_end_follows_the_top_again(sample_pdf):
         viewer.handle_key_text("k")
     viewer.refresh()
     assert viewer.page == viewer._text_page_of_line(viewer._top_text_line())
+
+
+def status_percent(viewer):
+    fields = [text for text, _color in viewer.status_segments()]
+    return next(int(f.strip().rstrip("%")) for f in fields if f.strip().endswith("%"))
+
+
+def test_the_text_mode_percentage_runs_from_0_to_100(sample_pdf):
+    """It ignored text_scroll_min (-1 with the border's row), so the top
+    of a page read " -8%", and a <N>g past the last full screen "325%"."""
+    viewer, _slave = make_viewer(pdfless.PdfDocument(sample_pdf))
+    assert viewer.enter_text_mode()
+    viewer.go_to_page_text(2, 0)
+    assert status_percent(viewer) == 0
+    viewer.text_scroll = viewer.text_scroll_max
+    assert status_percent(viewer) == 100
+    viewer.go_to_text_line(40)  # past the last full screen, on purpose
+    assert status_percent(viewer) == 100

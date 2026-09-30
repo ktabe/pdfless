@@ -10279,10 +10279,14 @@ class Viewer:
     def status_segments(self) -> list[tuple[str, str]]:
         """The default status line, as (text, color) fields in order."""
         if self.text_mode:
+            # Measured from text_scroll_min (-1 while the border's row
+            # shows), and held to 0-100: <N>g can put a line at the top
+            # past text_scroll_max (see go_to_text_line()).
+            span = self.text_scroll_max - self.text_scroll_min
             pct = (
                 100
-                if self.text_scroll_max == 0
-                else int(100 * self.text_scroll / self.text_scroll_max)
+                if span <= 0
+                else max(0, min(100, int(100 * (self.text_scroll - self.text_scroll_min) / span)))
             )
             mode_field = " text "
         elif self.continuous:
