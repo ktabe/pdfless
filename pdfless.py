@@ -1538,7 +1538,7 @@ def _capture_html_screenshot(
         f"--window-size={width},{height}",
         f"--force-device-scale-factor={render_scale}",
         f"--screenshot={out_png}",
-        f"file://{os.path.abspath(html_path)}",
+        _file_url(html_path),
     ]
     if max(physical_w, physical_h) < OfficeVariant.OFFICE_GPU_SAFE_PHYSICAL_PX:
         try:
@@ -1600,7 +1600,7 @@ def _capture_html_pdf(
             [
                 chrome, "--headless", "--disable-gpu", "--no-sandbox",
                 f"--print-to-pdf={out_pdf}", "--print-to-pdf-no-header",
-                f"file://{os.path.abspath(print_path)}",
+                _file_url(print_path),
             ],
             capture_output=True, check=True, timeout=timeout,
         )
@@ -1771,7 +1771,7 @@ def _chrome_dump_title(
     args = [chrome, "--headless", "--no-sandbox"]
     if width is not None:
         args.append(f"--window-size={width},1080")
-    args += ["--dump-dom", "--virtual-time-budget=8000", f"file://{os.path.abspath(measure_path)}"]
+    args += ["--dump-dom", "--virtual-time-budget=8000", _file_url(measure_path)]
     try:
         r = run_subprocess(args, capture_output=True, text=True, timeout=timeout, check=True)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
@@ -5057,13 +5057,13 @@ class SvgDocument(RenderedDocument):
         build_pages()), which needs the image at its own natural size
         instead."""
         style = f"width:{width}px;height:{height}px;" if width and height else ""
-        html = (
+        page = (
             "<!DOCTYPE html><html><head></head><body style=\"margin:0\">"
             f'<img id="svg" style="display:block;{style}" '
-            f'src="file://{os.path.abspath(svg_path)}"></body></html>'
+            f'src="{html.escape(_file_url(svg_path))}"></body></html>'
         )
         with open(wrapper_path, "w", encoding="utf-8") as f:
-            f.write(html)
+            f.write(page)
 
 
 # A fenced code block's opening/closing line (``` or ~~~), an ATX
@@ -5396,6 +5396,21 @@ class RawTerminal:
 # ispeed, ospeed, cc] - tty.LFLAG/tty.CC spell these out, but only since
 # Python 3.12 (pdfless supports 3.9+, see its shebang), hence these.
 _TC_LFLAG, _TC_CC = 3, 6
+
+
+def _file_url(path: str) -> str:
+    """A file:// URL for `path`, percent-encoded - a file name with "#",
+    "?" or "%" in it (they go into the Quick Look preview's own path, see
+    OfficeDocument._generate_ql_preview()) otherwise reads to Chrome as
+    a fragment or a query, and the page doesn't load at all.
+
+    Args:
+        path: the file, relative or absolute.
+
+    Returns:
+        The URL.
+    """
+    return pathlib.Path(os.path.abspath(path)).as_uri()
 
 
 def run_subprocess(

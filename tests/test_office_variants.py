@@ -608,3 +608,33 @@ def test_same_named_documents_get_pdfs_of_their_own(sample_twopage_docx, sample_
     assert docx_pdf != pptx_pdf
     assert os.path.isfile(docx_pdf) and os.path.isfile(pptx_pdf)
     assert docx_text != pptx_text
+
+
+def test_file_urls_are_percent_encoded():
+    """A "#" in a file name read to Chrome as the start of a fragment -
+    the page didn't load, and the document rendered as the failure
+    placeholder."""
+    url = pdfless._file_url("/tmp/Report #3 100%?.key")
+    assert url == "file:///tmp/Report%20%233%20100%25%3F.key"
+
+
+def test_the_svg_wrapper_quotes_the_file_name(tmp_path):
+    """The SVG's path went into the wrapper page's src="..." as it was -
+    a name with a quote in it broke out of the attribute."""
+    wrapper = tmp_path / "wrap.html"
+    pdfless.SvgDocument._write_svg_wrapper(
+        str(wrapper), '/tmp/a"><script>x</script>.svg', None, None,
+    )
+    page = wrapper.read_text()
+    assert "<script>" not in page
+    assert 'src="file:///tmp/a%22%3E%3Cscript%3Ex%3C/script%3E.svg"' in page
+
+
+@requires_office_support
+def test_an_svg_with_a_hash_in_its_name_renders(sample_svg, tmp_path):
+    import shutil
+    path = tmp_path / "figure #1.svg"
+    shutil.copy(sample_svg, path)
+    handler = classify(str(path), tmp_path)
+    assert handler.build_pages(str(tmp_path))
+    assert handler._pdf_delegate is not None
