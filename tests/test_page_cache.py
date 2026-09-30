@@ -25,7 +25,7 @@ def test_image_page_cache_returns_correctly_sized_image(sample_image, tmp_path):
 def test_office_page_cache_reads_from_handler_pages_live(tmp_path):
     """OfficeDocument._source_for_page() must read self.pages fresh
     each call (not a copy captured elsewhere), since Viewer.reload()
-    (after a -F/--follow change) replaces it via a fresh build_pages()
+    (after a -f/--follow change) replaces it via a fresh build_pages()
     call on the very same handler instance."""
     from PIL import Image
 
@@ -40,8 +40,8 @@ def test_office_page_cache_reads_from_handler_pages_live(tmp_path):
     first = cache.get(1, 50, fit="width")
     assert first.getpixel((0, 0))[:3] == (255, 0, 0)
 
-    # Simulate a -F/--follow reload: build_pages() (via
-    # _render_and_remember()) replaces handler.pages, and Viewer clears
+    # Simulate a -f/--follow reload: build_pages() (via
+    # _remember_pages()) replaces handler.pages, and Viewer clears
     # the cache so the new pages actually get (re)loaded.
     handler.pages = [str(page2)]
     cache.clear()

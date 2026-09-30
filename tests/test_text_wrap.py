@@ -165,9 +165,9 @@ def make_long_words_line(n_words):
 
 
 def test_search_match_scrolls_to_correct_display_row_when_wrapped(tmp_path):
-    """Regression check: _goto_search_match() (N/P, and start_search()'s
+    """Regression check: _Search.go_to_match() (N/P, and _Search.start()'s
     own initial jump) must convert a raw line index into a display-row
-    scroll target the same way _scroll_text_to_match() already does -
+    scroll target the same way _Search.scroll_text_to_match() already does -
     not use the raw line index directly as text_scroll, which means
     something different once wrapped (a _display_rows index). Many
     long, heavily-wrapped lines before the match push its display row

@@ -17,10 +17,13 @@ that raster in memory and redrawing the screen - the same "redraw on
 each keypress" approach less(1) uses internally, since a terminal has
 no way to scroll just part of an inline image.
 
-Plain images and text files are supported directly, and (macOS only,
-given a local Chrome/Chromium install) anything else this Mac's Quick
-Look generators can preview - Word, Excel, PowerPoint, Keynote, Pages,
-... - via qlmanage + a headless-Chrome screenshot of its HTML preview.
+Plain images and text files are supported directly; so are Markdown
+(rendered with WeasyPrint), SVG (with a headless Chrome/Chromium), and
+office documents - Word, Excel, PowerPoint and OpenDocument through
+LibreOffice when it's installed, and on macOS anything this Mac's Quick
+Look generators can preview (Keynote, Pages, ...) through qlmanage and
+a headless Chrome/Chromium. Every one of them that renders to a PDF is
+then shown, searched and followed like one.
 """
 
 from __future__ import annotations
@@ -439,6 +442,8 @@ Keys:
                           string always may)
   / ENTER  ? ENTER        repeat the last search pattern, forward / back
   N P                     jump to next / previous search match
+  q ESC                   (while a search is active) clear the search,
+                          rather than quit
                             <CHANGING FILES>
   :n :p  { }              next / previous file, when more than one was
                           given on the command line
@@ -447,17 +452,19 @@ Keys:
   O                       list the files: pick one with j/k and open it
                           with ENTER
                                <ZOOMING>
-  + -                     zoom in / out
+  + = -                   zoom in / out
   0                       reset zoom and pan
   m M                     fit page to terminal height / width
                            <MOUSE OPERATIONS>
   mouse click             (page image, not text mode) on the scrollbar,
-                          jump to the position clicked; otherwise open
-                          a PDF hyperlink under the pointer
+                          jump to the position clicked (drag it to
+                          follow the pointer); otherwise open a
+                          hyperlink under the pointer
   mouse wheel             scroll up / down
                                 <LINKS>
   [ ]                     back / forward, through the positions internal
-                          links (and o below) have jumped from (PDF only)
+                          links (and o below) have jumped from (image
+                          mode)
   o TAB                   table of contents (bookmarks, headings): pick
                           an entry with j/k and jump to it with ENTER
                                <TOGGLES>
@@ -487,7 +494,8 @@ Keys:
                           switch follow mode on
   ^L                      redraw the screen
   F1 :h                   show this help (q to close it)
-  q :q                    quit\
+  ^Z                      suspend (fg to come back)
+  q :q ^C                 quit\
 """
 
 FORWARD_LINE_KEYS = {"e", "\x05", "j", "\x0e", "\r", "DOWN"}
@@ -858,7 +866,7 @@ def find_soffice() -> str | None:
     Chrome --print-to-pdf pipeline (real page breaks, correctly
     rendered embedded pictures of any format, no reliance on Quick
     Look at all) - or None if it isn't installed. Optional: callers
-    (see OfficeDocument._try_soffice_pages()) always fall back to the
+    (see RenderedDocument._try_soffice_pages()) always fall back to the
     qlmanage/Chrome pipeline when this returns None."""
     for path in SOFFICE_CANDIDATES:
         if os.path.isfile(path) and os.access(path, os.X_OK):
@@ -1257,7 +1265,7 @@ def _convert_via_soffice(
     `soffice --convert-to pdf`, natively - no Quick Look/Chrome
     involved at all - returning the output PDF's path, or None on any
     failure (timeout, non-zero exit, or no output file), so callers
-    (see OfficeDocument._try_soffice_pages()) can always fall back to
+    (see RenderedDocument._try_soffice_pages()) can always fall back to
     the qlmanage/Chrome pipeline.
 
     Deliberately does NOT pass --headless: confirmed by hand that
@@ -4666,9 +4674,9 @@ class OfficeDocument(RenderedDocument):
 
     def _cache_key_suffix(self, render_scale: float) -> str:
         """build_pages()'s persistent-cache key suffix (see
-        _cached_render_dir()), or None for no persistent caching. A
-        screenshot-sliced render bakes in -s/--rendering-scale's pixel
-        resolution, so it's part of the key here."""
+        _cached_render_dir()). A screenshot-sliced render bakes in
+        -s/--rendering-scale's pixel resolution, so it's part of the key
+        here."""
         return f":scale={render_scale}"
 
     def _soffice_pages_if_eligible(
@@ -4784,8 +4792,10 @@ class OfficeDocument(RenderedDocument):
         local Chrome/Chromium. `path` isn't necessarily self.path -
         RtfOfficeDocument renders a converted .docx instead (see its
         build_pages()). Returns a list of PNG file paths (one per page,
-        in reading order), or None if qlmanage has no generator for
-        this file or no Chrome is installed. With debug=True
+        in reading order) - or ("pdf", pdf_path, npages) when it went
+        through a real PDF (LibreOffice, or Chrome's --print-to-pdf) -
+        or None if qlmanage has no generator for this file or no Chrome
+        is installed. With debug=True
         (-d/--debug), prints each stage's wall-clock time (and which
         browser got used) to stderr, plus a total at the end.
         `render_scale` is the device-pixel-ratio to rasterize at
@@ -7003,7 +7013,8 @@ class _Search:
     def match_bbox_px(self, match: BBoxMatch) -> tuple[float, float, float, float]:
         """Pixel bounding box (in its own page's image, at the current
         zoom - self.viewer.img when it's on the current page) of a
-        (page, xMin, yMin, xMax, yMax) search match, in points."""
+        (page, xMin, yMin, xMax, yMax) search match, whose own
+        coordinates are in points."""
         page, xmin_pt, ymin_pt, xmax_pt, ymax_pt = match
         img = self.viewer.img if page == self.viewer.page else self.viewer._page_image(page)
         assert self.index is not None  # a bbox match came from it
@@ -8029,12 +8040,16 @@ class Viewer:
         # what keeps startup with a large batch of files from decoding
         # every single one of them just to show the first.
         self.file_index = file_index
-        self._handler_cache: dict[int, DocumentHandler | None] = {}
+        self._handler_cache: dict[int, DocumentHandler | None] = {}  # file_index -> DocumentHandler | None,
+        # populated by _classify() the first time each lazy (path-string)
+        # entry above is actually visited - None means that one turned
+        # out not to be a usable file at all.
         # Background preparation of the file after the one on screen (see
         # _schedule_prefetch()): each index it was started for, with an
         # Event set once it's finished, and the thread doing it (at most
         # one at a time).
         self._prefetching: dict[int, threading.Event] = {}
+        self._prefetch_thread: threading.Thread | None = None
         # And of the page next to the one(s) on screen (see
         # _schedule_page_prefetch()): the thread doing it (at most one at
         # a time), and which way pages were last turned (+1/-1), so the
@@ -8042,10 +8057,6 @@ class Viewer:
         self._page_prefetch_thread: threading.Thread | None = None
         self._page_direction = 1
         self._page_direction_from = 1  # the page that direction was last judged from
-        self._prefetch_thread: threading.Thread | None = None  # file_index -> DocumentHandler | None,
-        # populated by _classify() the first time each lazy (path-string)
-        # entry above is actually visited - None means that one turned
-        # out not to be a usable file at all.
         self.tmpdir = tmpdir
         self.follow = options.follow  # -f/--follow, or toggled at runtime with F
         # (see toggle_follow()) - poll_follow() reloads the file whenever

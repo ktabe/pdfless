@@ -302,8 +302,8 @@ def test_docx_internal_link_click_scrolls_without_crashing(sample_docx_with_inte
     doc_handler is a real PdfDocument - AttributeError for an
     OfficeDocument (even one with a _pdf_delegate, since that's the
     delegate's method, not doc_handler's own). Exercises the exact
-    path a mouse click on this link takes (handle_click() ->
-    _activate_link() -> go_to_link_target()) via a real Viewer,
+    path a mouse click on this link takes (_Mouse.click() ->
+    _Links.activate() -> go_to_link_target()) via a real Viewer,
     checking the click actually jumps to the target page and scrolls
     there instead of crashing or silently doing nothing."""
     _master, slave = pty.openpty()
