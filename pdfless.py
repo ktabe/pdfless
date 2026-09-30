@@ -8109,6 +8109,10 @@ class Viewer:
         # "in text mode", the same rendering PDF's `t` key switches to.
         self.text_mode = self.doc_handler.starts_in_text_mode()
         self.text_lines: list[str] = []
+        # The widest line of text_lines, and the list it was measured for
+        # - see _clamp_text_scroll().
+        self._text_widest = 0
+        self._text_widths_of: list[str] | None = None
         self.text_scroll = 0
         self.text_scroll_min = 0
         self.text_scroll_max = 0
@@ -9641,9 +9645,13 @@ class Viewer:
         # The -N gutter (if on) lives outside this space entirely - see
         # _draw_text_unwrapped() - so the "page" is narrower by that much.
         avail_cols = max(1, self._text_avail_cols() - self._line_number_gutter_width())
-        self.text_max_line_width = max(
-            (display_width(l) for l in self.text_lines), default=0
-        )
+        # Measured once per text_lines (a new list whenever it's loaded):
+        # this runs on every toggle and resize, and a big file's every
+        # line took most of a second each time.
+        if self._text_widths_of is not self.text_lines:
+            self._text_widest = max((display_width(l) for l in self.text_lines), default=0)
+            self._text_widths_of = self.text_lines
+        self.text_max_line_width = self._text_widest
         if self.eol_mark:
             # Otherwise the widest line's own marker (see
             # _draw_text_unwrapped()) would have nowhere to go without
