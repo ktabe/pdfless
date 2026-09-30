@@ -3,7 +3,7 @@ import struct
 import fcntl
 import termios
 import shutil
-import signal
+import subprocess
 import sys
 import time
 import pty
@@ -312,11 +312,32 @@ def sample_md():
     return os.path.join(FIXTURES_DIR, "sample.md")
 
 
+# Run first in the child (see PtySession): make the pty it was given as
+# stdout its controlling terminal - Popen's start_new_session made it a
+# session leader, with none - then become pdfless itself. A pty.fork()
+# would do both, but forking a pytest process that has threads running
+# (WeasyPrint starts some once imported) is what DeprecationWarned
+# "use of forkpty() may lead to deadlocks" on every such test.
+_PTY_CHILD = (
+    "import fcntl, os, sys, termios; "
+    "fcntl.ioctl(1, termios.TIOCSCTTY, 0); "
+    "os.execv(sys.executable, [sys.executable] + sys.argv[1:])"
+)
+
+# The status line's last field, drawn on every normal frame (see
+# Viewer.status_segments()) - the sign a frame's been drawn in full.
+READY = b"for help"
+
+
 class PtySession:
     """Drives a real `pdfless.py <files...>` subprocess through a
     pseudo-terminal - the only way to exercise Viewer end-to-end (it
     needs a real tty for ioctl-based terminal-size queries), the same
-    way this was done by hand throughout development."""
+    way this was done by hand throughout development.
+
+    Tests wait for what they expect to see (wait_for()) rather than
+    sleep a fixed time, and end with quit(), which checks pdfless exits
+    by itself, cleanly - not just that no traceback got printed."""
 
     def __init__(self, args, rows=40, cols=120, stdin_data=None):
         """`stdin_data`, if given, is piped in on fd 0 instead of the pty
@@ -325,84 +346,126 @@ class PtySession:
         is still stdout/stderr/the controlling terminal either way -
         pdfless falls back to /dev/tty for keyboard input once its own
         stdin is a plain pipe rather than a tty."""
+        self.fd, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, cols * 8, rows * 16))
+        # Every test here assumes real image-mode output (an OSC 1337
+        # inline image), which iterm2_like() only turns on given the
+        # right env vars - present when the suite happens to run inside
+        # a real iTerm2 window, but not guaranteed anywhere else (CI, a
+        # plain xterm, ...). Forced here, for the child only, so every
+        # test is deterministic wherever the suite runs.
+        env = {**os.environ, "TERM_PROGRAM": "iTerm.app"}
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", _PTY_CHILD, PDFLESS_PY, *args],
+            stdin=subprocess.PIPE if stdin_data is not None else slave,
+            stdout=slave, stderr=slave, env=env, start_new_session=True,
+        )
+        os.close(slave)
+        self.pid = self.proc.pid
         if stdin_data is not None:
-            stdin_r, stdin_w = os.pipe()
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            if stdin_data is not None:
-                os.dup2(stdin_r, 0)
-                os.close(stdin_r)
-                os.close(stdin_w)
-            # Every test here assumes real image-mode output (an
-            # OSC 1337 inline image), which iterm2_like() only turns on
-            # given the right env vars - present when the suite happens
-            # to run inside a real iTerm2 window, but not guaranteed
-            # anywhere else (CI, a plain xterm, ...). Forcing it here
-            # (only in this forked child, not the pytest process
-            # itself) keeps every test deterministic regardless of
-            # where the suite is actually run from.
-            os.environ["TERM_PROGRAM"] = "iTerm.app"
-            os.execvp(sys.executable, [sys.executable, PDFLESS_PY, *args])
-        else:
-            fcntl.ioctl(
-                self.fd, termios.TIOCSWINSZ,
-                struct.pack("HHHH", rows, cols, cols * 8, rows * 16),
-            )
-            if stdin_data is not None:
-                os.close(stdin_r)
-                os.write(stdin_w, stdin_data)
-                os.close(stdin_w)  # EOF - the whole point being paged
+            self.proc.stdin.write(stdin_data)
+            self.proc.stdin.close()  # EOF - the whole point being paged
+        self._pending = b""  # read, but not yet handed to a caller
 
-    def send(self, data, wait=0.5):
+    def send(self, data, wait=0.0):
         os.write(self.fd, data)
-        time.sleep(wait)
+        if wait:
+            time.sleep(wait)
 
-    def read_all(self, timeout=2.0):
-        """Drain whatever output is currently available, waiting up to
-        `timeout` seconds for more between reads - bounded by design,
-        unlike reading until EOF (which would block forever if the
-        child is still alive and simply idle, e.g. stuck waiting on a
-        keypress it never got)."""
+    def _read(self, timeout):
+        """Whatever arrives within `timeout` seconds, into _pending -
+        False once nothing more will (the child has gone)."""
         import select
 
-        buf = b""
-        while True:
-            ready, _, _ = select.select([self.fd], [], [], timeout)
-            if not ready:
-                break
-            try:
-                chunk = os.read(self.fd, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-        return buf
-
-    def close(self, timeout=5):
-        """Never blocks indefinitely: SIGTERM first, then poll with
-        WNOHANG so a test that leaves pdfless wedged (e.g. stuck
-        waiting for a keypress it never got) can't hang the whole
-        suite - SIGKILL once `timeout` elapses without it exiting."""
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return True
         try:
-            os.kill(self.pid, signal.SIGTERM)
+            chunk = os.read(self.fd, 65536)
         except OSError:
-            pass
+            return False
+        if not chunk:
+            return False
+        self._pending += chunk
+        return True
+
+    def wait_for(self, pattern, timeout=20.0):
+        """Read until `pattern` (bytes) has appeared, and return the
+        output up to the end of it - what came after is kept for the
+        next call - failing, with what did arrive, if it doesn't within
+        `timeout` seconds."""
+        deadline = time.monotonic() + timeout
+        while pattern not in self._pending:
+            left = deadline - time.monotonic()
+            if left <= 0 or not self._read(min(left, 0.2)):
+                if pattern in self._pending:
+                    break
+                raise AssertionError(
+                    f"{pattern!r} never appeared; got: {self._pending[-2000:]!r}"
+                )
+        end = self._pending.index(pattern) + len(pattern)
+        out, self._pending = self._pending[:end], self._pending[end:]
+        return out
+
+    def ready(self, timeout=20.0):
+        """Wait for the first full frame (see READY)."""
+        return self.wait_for(READY, timeout)
+
+    def read_all(self, timeout=0.5):
+        """Drain whatever output comes, until `timeout` seconds pass
+        without any - bounded by design, unlike reading until EOF (which
+        would block forever if the child is still alive and idle)."""
+        while True:
+            before = len(self._pending)
+            if not self._read(timeout) or len(self._pending) == before:
+                break
+        out, self._pending = self._pending, b""
+        return out
+
+    def exited(self, timeout=10.0):
+        """Wait up to `timeout` seconds for the child to exit, draining
+        its output all the while (a big enough write - an inline image,
+        the terminal-reset escapes on the way out - fills the pty and
+        blocks it in write() otherwise). Returns (exit code or None if
+        still running, everything it wrote)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            self._read(0.1)
+            if self.proc.poll() is not None:
+                # Gone - but what it wrote last may still be in the pty.
+                while True:
+                    before = len(self._pending)
+                    if not self._read(0.05) or len(self._pending) == before:
+                        break
+                break
+        out, self._pending = self._pending, b""
+        return self.proc.poll(), out
+
+    def quit(self, keys=b"q"):
+        """Send `keys` (a quit, by default) and check pdfless exits by
+        itself, with status 0 and no traceback - a hang, a crash or an
+        error exit all fail. Returns what it wrote."""
+        self.send(keys)
+        code, out = self.exited()
+        text = out.decode(errors="replace")
+        assert code is not None, f"pdfless didn't exit; last output: {text[-2000:]!r}"
+        assert "Traceback" not in text, text
+        assert code == 0, f"pdfless exited with {code}: {text[-2000:]!r}"
+        return out
+
+    def close(self, timeout=5):
+        """Never blocks indefinitely: SIGTERM first, then SIGKILL once
+        `timeout` elapses without an exit - so a test that leaves
+        pdfless wedged can't hang the whole suite."""
+        if self.proc.poll() is None:
+            self.proc.terminate()
             try:
-                pid, _status = os.waitpid(self.pid, os.WNOHANG)
-            except OSError:
-                return
-            if pid != 0:
-                return
-            time.sleep(0.1)
+                self.proc.wait(timeout)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
         try:
-            os.kill(self.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            os.waitpid(self.pid, 0)
+            os.close(self.fd)
         except OSError:
             pass
 
