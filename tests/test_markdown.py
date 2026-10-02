@@ -225,6 +225,25 @@ def test_a_markdown_file_that_isnt_utf8_still_has_a_text_mode(tmp_path):
 
 
 @requires_markdown_rendering
+def test_an_img_tags_width_is_honored(tmp_path):
+    """<img width="50%"> (a README's scaled-down screenshots) was shown
+    at the full width: WeasyPrint ignores HTML's layout attributes
+    unless asked."""
+    from PIL import Image
+
+    Image.new("RGB", (2000, 400), "red").save(tmp_path / "wide.png")
+    path = tmp_path / "doc.md"
+    path.write_text('# Doc\n\n<img src="wide.png" alt="wide" width="50%">\n')
+    handler = classify(str(path), tmp_path)
+    handler.ensure_pages(str(tmp_path))
+    page = pdfless.PageCache(str(tmp_path), handler).get(1, 600, "width").convert("RGB")
+    reds = {x for x in range(page.width) for y in range(0, page.height, 4)
+            if page.getpixel((x, y))[0] > 200 and page.getpixel((x, y))[1] < 80}
+    assert reds  # it's there...
+    assert (max(reds) - min(reds) + 1) < page.width * 0.5  # ...at half the text's width
+
+
+@requires_markdown_rendering
 def test_a_markdown_file_loads_nothing_from_the_network_unless_asked(sample_image, tmp_path, monkeypatch):
     """An <img> from the network (a README's badges) meant requests just
     from viewing the file - and a wait for each that didn't answer. Local

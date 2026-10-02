@@ -24,21 +24,6 @@
 - 複数のファイルを開いて切り替え．
 - 表示中のファイルが更新された際の自動再読み込み（追従モード有効時）．
 
-## スクリーンショット
-
-| 表示 | スクリーンショット |
-| --- | --- |
-| 幅に合わせて表示 | ![幅に合わせて表示](docs/screenshots/pdfless-width-fit.png) |
-| 高さに合わせて表示 | ![高さに合わせて表示](docs/screenshots/pdfless-height-fit.png) |
-| 拡大と表示位置の移動 | ![拡大と表示位置の移動](docs/screenshots/pdfless-zoom.png) |
-| 画像モードでの検索 | ![画像モードでの検索](docs/screenshots/pdfless-search-pdf-mode.png) |
-| テキストモードでの検索 | ![テキストモードでの検索](docs/screenshots/pdfless-search-text-mode.png) |
-| PDFのハイパーリンク | ![PDFのハイパーリンク](docs/screenshots/pdfless-hyperlinks.png) |
-| 目次 | ![目次](docs/screenshots/pdfless-table-of-contents.png) |
-| 連続表示 | ![連続表示](docs/screenshots/pdfless-continuous-mode.png) |
-| 画像ファイル | ![画像ファイル](docs/screenshots/pdfless-image.png) |
-| キー操作のヘルプ | ![キー操作のヘルプ](docs/screenshots/pdfless-help.png) |
-
 ## インストール
 
 Python 3.9以降，[uv](https://docs.astral.sh/uv/)，および対応するターミナルが必要です．
@@ -97,14 +82,74 @@ pdfless -F document.pdf        # 1画面に収まる場合は表示して終了
 cat document.pdf | pdfless     # 標準入力から読み込む
 ```
 
-デフォルトでは，ページをターミナルの幅に合わせて表示します．
-`j` / `k`でスクロール，`Space` / `b`で1画面分移動，`n` / `p`でページ間を移動します．
-`+` / `-`で拡大・縮小，`/`で検索，`t`でテキストモードへの切り替え，`q`で終了します．
-`F1`または`:h`でキー操作のヘルプを表示します．
-
 複数のファイルを開いている場合は，`:n` / `:p`（または`}` / `{`）でファイルを切り替えます．`O`で一覧から選ぶこともできます．
 ディレクトリを指定すると，その直下のファイルを名前順（`ls`と同じく大文字・小文字を区別しない）に開きます．隠しファイルとサブディレクトリは含みません．
 ファイル名を省略するか，ファイル名として`-`を指定すると，標準入力から読み込みます．
+
+## 操作例
+
+以下では，表示方法の変更や文書内の移動など，よく使う操作を画面例と
+ともに説明します．キーとマウス操作の一覧は，[キーボードとマウスの操作](#キーボードとマウスの操作)を参照してください．
+
+### ページの表示と移動
+
+ページはデフォルトではターミナルの幅に合わせて表示されます．`m`で現在のページをターミナルの高さに合わせ，`M`で幅に合わせた表示に戻します．
+
+<img src="docs/screenshots/pdfless-width-fit.png" alt="幅に合わせて表示" width="80%" style="display: block; margin: 0 auto;">
+
+`+` / `-`で拡大・縮小します．`h` / `l`（または矢印キー）で表示位置を左右に移動し，`0`で拡大率と表示位置をリセットします．
+
+<img src="docs/screenshots/pdfless-height-fit.png" alt="高さに合わせて表示" width="80%" style="display: block; margin: 0 auto;">
+
+<img src="docs/screenshots/pdfless-zoom.png" alt="拡大と表示位置の移動" width="80%" style="display: block; margin: 0 auto;">
+
+### 検索
+
+`/`を押して検索文字列を入力すると順方向に，`?`を押すと逆方向に検索します．画像モードでは一致箇所が枠で囲まれ，テキストモードでは強調表示されます．`n` / `p`で一致箇所の間を移動します．
+
+<img src="docs/screenshots/pdfless-search-pdf-mode.png" alt="画像モードでの検索" width="80%" style="display: block; margin: 0 auto;">
+
+`t`で抽出テキストの表示に切り替えてから検索したり，ターミナルの通常の選択操作でコピーしたりできます．`T`を押すと，コピー用の簡素な表示に直接切り替わります．
+
+<img src="docs/screenshots/pdfless-search-text-mode.png" alt="テキストモードでの検索" width="80%" style="display: block; margin: 0 auto;">
+
+### 目次
+
+`o`または`TAB`で目次を表示します．`j` / `k`またはマウスで見出しを選び，`ENTER`か見出しのクリックでその節に移動します．目次や内部リンクで移動した位置は，`[` / `]`で前後に移動できます．
+
+<img src="docs/screenshots/pdfless-table-of-contents.png" alt="目次" width="80%" style="display: block; margin: 0 auto;">
+
+### PDFのハイパーリンク
+
+PDFのリンクをクリックすると，外部URLはシステムのブラウザで開き，内部リンクは文書内の移動先を表示します．`[` / `]`で移動前後の位置に戻れます．
+
+<img src="docs/screenshots/pdfless-hyperlinks.png" alt="PDFのハイパーリンク" width="80%" style="display: block; margin: 0 auto;">
+
+### ファイル選択
+
+複数のファイルを開いているときに`O`を押すと，ファイル選択画面が表示されます．`j` / `k`またはマウスホイールで選び，`ENTER`かファイルのクリックで開きます．`q`で閉じます．選択画面を開かずに切り替えるには，`:n` / `:p`または`}` / `{`を使います．
+
+<img src="docs/screenshots/pdfless-file-chooser.png" alt="ファイル選択画面" width="80%" style="display: block; margin: 0 auto;">
+
+### ページのサムネイル
+
+画像モードで`S`を押すと，画面左端のページサムネイルを表示・非表示にできます．表示中のページは枠で囲まれ，サムネイルをクリックするとそのページに移動します．`s`を押すとサムネイル欄に移り，`j` / `k`で選んで`ENTER`で開けます．`q`または`s`で，サムネイルを表示したままページに戻ります．サイドバーを表示するには，端末の幅が60桁以上必要です．
+
+<img src="docs/screenshots/pdfless-thumbnail.png" alt="ページのサムネイル" width="80%" style="display: block; margin: 0 auto;">
+
+### その他の表示モード
+
+`c`で連続表示を切り替えます．複数のページを連続して表示し，ページを切り替えずにそのままスクロールできます．
+
+<img src="docs/screenshots/pdfless-continuous-mode.png" alt="連続表示" width="80%" style="display: block; margin: 0 auto;">
+
+画像ファイルはそのまま画像モードで開きます．`t`または`T`でテキストモードに切り替えると，画像情報やメタデータを確認できます．
+
+<img src="docs/screenshots/pdfless-image.png" alt="画像ファイル" width="80%" style="display: block; margin: 0 auto;">
+
+`F1`または`:h`でキー操作のヘルプを表示します．`q`で閉じます．
+
+<img src="docs/screenshots/pdfless-help.png" alt="キー操作のヘルプ" width="80%" style="display: block; margin: 0 auto;">
 
 ### オプション
 
