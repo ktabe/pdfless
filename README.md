@@ -1,4 +1,4 @@
-# pdfless
+# *pdfless*
 
 [日本語](README-ja.md)
 
@@ -25,22 +25,6 @@ It has been tested with [iTerm2](https://iterm2.com) and
 - Show page thumbnails down the left edge, and click one to go to its page.
 - Open multiple files and switch between them.
 - Reload the current file automatically when it changes (in follow mode).
-
-## Screenshots
-
-| View | Screenshot |
-| --- | --- |
-| Fit to width | ![Fit to width](docs/screenshots/pdfless-width-fit.png) |
-| Fit to height | ![Fit to height](docs/screenshots/pdfless-height-fit.png) |
-| Zoom and pan | ![Zoom and pan](docs/screenshots/pdfless-zoom.png) |
-| Search in image mode | ![Search in image mode](docs/screenshots/pdfless-search-pdf-mode.png) |
-| Search in text mode | ![Search in text mode](docs/screenshots/pdfless-search-text-mode.png) |
-| PDF hyperlinks | ![PDF hyperlinks](docs/screenshots/pdfless-hyperlinks.png) |
-| Table of contents | ![Table of contents](docs/screenshots/pdfless-table-of-contents.png) |
-| Continuous mode | ![Continuous mode](docs/screenshots/pdfless-continuous-mode.png) |
-| Image file | ![Image file](docs/screenshots/pdfless-image.png) |
-| Keyboard help | ![Keyboard help](docs/screenshots/pdfless-help.png) |
-
 
 ## Installation
 
@@ -100,14 +84,94 @@ pdfless -F document.pdf        # Quit if the document fits on one screen
 cat document.pdf | pdfless     # Read from standard input
 ```
 
-Pages fit the terminal width by default. Use `j` / `k` to scroll,
-`Space` / `b` to move by a window, and `n` / `p` to move between pages.
-Press `+` / `-` to zoom, `/` to search, `t` to switch to text mode,
-and `q` to quit. `F1` or `:h` opens the keyboard help.
-
 With multiple files open, use `:n` / `:p` (or `}` / `{`) to switch files, or `O` to pick one from a list.
 A directory stands for the files directly in it, sorted by name (ignoring case, as `ls` does); hidden files and subdirectories are left out.
 With no filename, or with `-` as the filename, `pdfless` reads standard input.
+
+## Common operations
+
+The following examples show common ways to adjust the view and move through a
+document. The complete list of keyboard and mouse controls is in
+[Keyboard and mouse controls](#keyboard-and-mouse-controls).
+
+### Fit and navigate pages
+
+Pages fit the terminal width by default. Press `m` to fit the current page to
+the terminal height, or `M` to return to fitting it to the width.
+
+<img src="docs/screenshots/pdfless-width-fit.png" alt="Fit to width" width="80%" style="display: block; margin: 0 auto;">
+
+Press `+` / `-` to zoom in or out. Use `h` / `l` (or the arrow keys) to pan,
+and press `0` to reset the zoom and position.
+
+<img src="docs/screenshots/pdfless-height-fit.png" alt="Fit to height" width="80%" style="display: block; margin: 0 auto;">
+
+<img src="docs/screenshots/pdfless-zoom.png" alt="Zoom and pan" width="80%" style="display: block; margin: 0 auto;">
+
+### Search
+
+Press `/` and enter a pattern to search forward, or `?` to search backward.
+Matches are boxed in image mode and highlighted in text mode. Use `n` / `p` to
+move between matches.
+
+<img src="docs/screenshots/pdfless-search-pdf-mode.png" alt="Search in image mode" width="80%" style="display: block; margin: 0 auto;">
+
+Press `t` to switch to extracted text, then search or copy it using the
+terminal's normal selection controls. Press `T` to switch directly to a clean
+copying view.
+
+<img src="docs/screenshots/pdfless-search-text-mode.png" alt="Search in text mode" width="80%" style="display: block; margin: 0 auto;">
+
+### Table of contents
+
+Press `o` or `TAB` to open the table of contents. Select a heading with `j` /
+`k` or the mouse, then press `ENTER` or click it to jump to that section. Use
+`[` / `]` to go back and forward through positions jumped to from the outline
+or an internal link.
+
+<img src="docs/screenshots/pdfless-table-of-contents.png" alt="Table of contents" width="80%" style="display: block; margin: 0 auto;">
+
+### PDF hyperlinks
+
+Click a PDF link to open an external URL in the system browser or follow an
+internal link. The `[` / `]` keys return to the previous or next position.
+
+<img src="docs/screenshots/pdfless-hyperlinks.png" alt="PDF hyperlinks" width="80%" style="display: block; margin: 0 auto;">
+
+### Choose a file
+
+When multiple files are open, press `O` to show the file chooser. Move with
+`j` / `k` or the mouse wheel, then press `ENTER` or click a file to open it.
+Press `q` to close the chooser. `:n` / `:p` and `}` / `{` switch to the next
+or previous file without opening the chooser.
+
+<img src="docs/screenshots/pdfless-file-chooser.png" alt="File chooser" width="80%" style="display: block; margin: 0 auto;">
+
+### Page thumbnails
+
+In image mode, press `S` to show or hide page thumbnails on the left. The
+current page is framed, and clicking a thumbnail moves to that page. Press
+`s` to move focus to the thumbnails; select one with `j` / `k` and press
+`ENTER` to open it. Press `q` or `s` to return to the page while leaving the
+thumbnails visible. The sidebar requires a terminal at least 60 columns wide.
+
+<img src="docs/screenshots/pdfless-thumbnail.png" alt="Page thumbnails" width="80%" style="display: block; margin: 0 auto;">
+
+### Other display modes
+
+Press `c` to toggle continuous mode. This displays the pages continuously, so
+you can scroll from one page to the next without switching pages.
+
+<img src="docs/screenshots/pdfless-continuous-mode.png" alt="Continuous mode" width="80%" style="display: block; margin: 0 auto;">
+
+Image files open directly in image mode. Press `t` or `T` to view image
+information and metadata in text mode.
+
+<img src="docs/screenshots/pdfless-image.png" alt="Image file" width="80%" style="display: block; margin: 0 auto;">
+
+Press `F1` or `:h` to open the keyboard help. Press `q` to close it.
+
+<img src="docs/screenshots/pdfless-help.png" alt="Keyboard help" width="80%" style="display: block; margin: 0 auto;">
 
 ### Options
 
