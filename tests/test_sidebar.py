@@ -253,6 +253,22 @@ def test_turning_a_page_redraws_the_frame_not_the_thumbnails(sample_pdf, monkeyp
     assert "━ 2 ━" in marks and "\x1b]1337;File=" not in marks
 
 
+def test_ctrl_l_and_a_focus_change_draw_the_thumbnails_again(sample_pdf, monkeypatch, capsys):
+    """They drew the page again, and took the column for unchanged -
+    under tmux, coming back to the pane left it without its thumbnails."""
+    viewer = make_viewer(sample_pdf, monkeypatch)
+    _w, _rows, _slot, slots = viewer.sidebar._layout()
+    render_thumbnails(viewer)
+    viewer.sidebar.poll()
+    images = min(slots, viewer.npages) + 1  # the thumbnails, and the page
+    for key, cleared in (("\x0c", True), ("FOCUS_IN", False)):
+        capsys.readouterr()
+        assert viewer.handle_global_key(key)
+        out = capsys.readouterr().out
+        assert out.count("\x1b]1337;File=") == images
+        assert ("\x1b[2J" in out) == cleared  # ^L clears the screen first
+
+
 def test_only_so_many_thumbnails_are_kept(sample_pdf, monkeypatch):
     monkeypatch.setattr(pdfless, "SIDEBAR_KEPT_THUMBNAILS", 3)
     viewer = make_viewer(sample_pdf, monkeypatch)
