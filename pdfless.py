@@ -5460,8 +5460,13 @@ img { max-width: 100%; height: auto; }
         # file's own directory, the same as a browser would for a page
         # loaded from there.
         base_url = os.path.dirname(os.path.abspath(self.path)) + "/"
+        # presentational_hints: honor HTML's own layout attributes (an
+        # <img width="80%">, a <p align="center">), as a browser - and
+        # GitHub - does; WeasyPrint ignores them unless asked.
         try:
-            HTML(string=html, base_url=base_url, url_fetcher=_markdown_url_fetcher()).write_pdf(out_pdf)
+            HTML(string=html, base_url=base_url, url_fetcher=_markdown_url_fetcher()).write_pdf(
+                out_pdf, presentational_hints=True,
+            )
         except Exception:
             # WeasyPrint can raise a variety of its own exception types for
             # a malformed document/CSS - none of them worth the whole
