@@ -11115,6 +11115,15 @@ class Viewer:
             # why a focus change (under tmux, especially) can otherwise
             # leave this pane blank, and for why only this direction,
             # not FOCUS_OUT, is safe to redraw on.
+            if key == "\x0c":
+                # Asked for: clear the screen and draw all of it again.
+                self._invalidate_screen()
+            else:
+                # The page is drawn again anyway, over itself; the
+                # thumbnails only if they're taken to be gone too (they
+                # are, under tmux) - _draw() skips a column that looks
+                # the same as last time.
+                self.sidebar.forget_drawn()
             self.refresh()
         elif key == "FOCUS_OUT":
             pass
