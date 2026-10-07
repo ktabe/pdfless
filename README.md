@@ -62,7 +62,7 @@ chmod +x /usr/local/bin/pdfless
 Alternatively, install the Python dependencies and run without `uv`:
 
 ```sh
-pip install pillow pypdf markdown weasyprint
+pip install pillow pypdf markdown weasyprint merm
 python3 pdfless.py document.pdf
 ```
 
@@ -357,7 +357,9 @@ requires Poppler.
 - **Chrome/Chromium** enables SVG rendering without Quick Look.
 - **WeasyPrint system libraries** enable Markdown rendering. The Python
   packages `markdown` and `weasyprint` are installed with the other Python
-  dependencies.
+  dependencies. Fenced Mermaid code blocks are rendered to diagrams via
+  `merm` (also installed with those packages); without `merm`, they stay as
+  code blocks.
 
 ```sh
 # macOS (Homebrew)
@@ -388,7 +390,7 @@ Preview quality and pagination depend on the format and available renderer.
 | Visio | `.vsd`, `.vsdx` | LibreOffice required. One page per Visio page. `.vsdx` support has not been manually verified. |
 | WMF | `.wmf` | LibreOffice required. Single-page view. |
 | SVG | `.svg` | Chrome/Chromium. Scalable rendering; links within the SVG are not clickable. Falls back to XML source if Chrome is unavailable. |
-| Markdown | `.md`, `.markdown` | WeasyPrint and its system libraries. Paginated view with search and clickable links. `t` shows the raw Markdown source; falls back to source-only display if rendering is unavailable. |
+| Markdown | `.md`, `.markdown` | WeasyPrint and its system libraries. Paginated view with search and clickable links. Fenced Mermaid diagrams are rendered via `merm` when available. `t` shows the raw Markdown source; falls back to source-only display if rendering is unavailable. |
 
 Formats rendered to PDF support text extraction and search where the resulting
 PDF contains text. Image-based Quick Look previews do not. In Markdown preview
@@ -455,7 +457,7 @@ Run the test suite:
 
 ```sh
 cd tests
-uv run --with pytest --with pytest-timeout --with pillow --with pypdf --with markdown --with weasyprint python -m pytest
+uv run --with pytest --with pytest-timeout --with pillow --with pypdf --with markdown --with weasyprint --with merm python -m pytest
 ```
 
 The suite includes unit tests and terminal-based integration tests.

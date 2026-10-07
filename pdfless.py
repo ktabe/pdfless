@@ -6,6 +6,7 @@
 #     "pypdf",
 #     "markdown",
 #     "weasyprint",
+#     "merm",
 # ]
 # ///
 """pdfless - a less(1)-like full-screen PDF pager for terminals that
@@ -5300,6 +5301,52 @@ def _markdown_url_fetcher() -> Any:
     return fetch
 
 
+# A fenced ```mermaid ... ``` block - language tag case-insensitive,
+# body kept intact for merm. Opening fence must start a line (same
+# shape GitHub/CommonMark use for info-string fences). The closing
+# fence takes an optional \r: read_text_file() keeps a CRLF file's
+# line endings, and $ only matches right before the \n.
+_MERMAID_FENCE_RE = re.compile(
+    r"^```mermaid[ \t]*\r?\n(.*?)^```[ \t]*\r?$",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
+
+
+def _embed_mermaid_diagrams(source: str) -> str:
+    """Turn fenced ```mermaid blocks into inline SVG images before the
+    Markdown -> HTML step.
+
+    WeasyPrint has no JavaScript, so a Mermaid fence would otherwise
+    render as a plain code block. merm (pure Python, no browser) turns
+    each diagram into an SVG string; embedding that as a data: URI
+    image keeps the conversion in-process - no Chrome/mmdc subprocess,
+    no temp files - and data: is already allowed by
+    _markdown_url_fetcher().
+
+    merm is a declared PEP723 dependency (so `uv run` installs it), but
+    the import is still lazy and failures are swallowed per block: a
+    missing merm, or a diagram merm can't parse, leaves that fence as a
+    code block rather than aborting the whole Markdown render."""
+    if "```mermaid" not in source.lower():
+        return source
+    try:
+        from merm import render_diagram
+    except Exception:
+        return source
+
+    def repl(match: re.Match[str]) -> str:
+        try:
+            svg = render_diagram(match.group(1))
+        except Exception:
+            return match.group(0)
+        if not isinstance(svg, str) or "<svg" not in svg[:200].lower():
+            return match.group(0)
+        b64 = base64.standard_b64encode(svg.encode("utf-8")).decode("ascii")
+        return f"![mermaid diagram](data:image/svg+xml;base64,{b64})\n"
+
+    return _MERMAID_FENCE_RE.sub(repl, source)
+
+
 class MarkdownDocument(_RawTextView, RenderedDocument):
     """A Markdown file, rendered to a real PDF via the `markdown` +
     `weasyprint` Python libraries (see _render_markdown_pdf() below) - no
@@ -5308,6 +5355,11 @@ class MarkdownDocument(_RawTextView, RenderedDocument):
     second, against Chrome's own ~1-2s process startup alone), since
     WeasyPrint paginates for real on its own rather than needing a
     measured/injected @page size the way FlowingText/SvgDocument do.
+
+    Fenced ```mermaid blocks are turned into SVG images first via the
+    `merm` library (see _embed_mermaid_diagrams()) - still no browser;
+    a missing merm or an unparseable diagram leaves that fence as a
+    code block.
 
     Falls back to plain text (TextDocument, showing the raw Markdown
     source) if `markdown`/`weasyprint` - or the system libraries
@@ -5453,6 +5505,9 @@ img { max-width: 100%; height: auto; }
             source = read_text_file(self.path, legacy=False)  # as text mode reads it
         except OSError:
             return False
+        # Mermaid first - WeasyPrint can't run JS, so fences have to
+        # become images before markdown.markdown() turns them into <pre>.
+        source = _embed_mermaid_diagrams(source)
         body = markdown.markdown(source, extensions=["extra", "sane_lists"])
         html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{self.MARKDOWN_CSS}</style></head><body>{body}</body></html>'
         # base_url lets a relative-path image reference in the source

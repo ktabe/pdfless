@@ -3,8 +3,11 @@
 Chrome, or LibreOffice - see MarkdownDocument._render_markdown_pdf()
 for why. requires_markdown_rendering gates on both libraries (and
 weasyprint's own Cairo/Pango system libraries) actually being usable;
-see conftest.py.
+see conftest.py. Mermaid fences are turned into SVG images via merm
+before WeasyPrint (see _embed_mermaid_diagrams()).
 """
+
+import pytest
 
 import pdfless
 from conftest import requires_markdown_rendering
@@ -304,3 +307,110 @@ def test_a_search_run_again_on_t_is_drawn_once_and_its_status_kept(sample_md, tm
     capsys.readouterr()
     viewer.toggle_text_mode()
     assert '"## リスト" not found' in capsys.readouterr().out
+
+
+def _merm_available():
+    try:
+        import merm  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+requires_merm = pytest.mark.skipif(
+    not _merm_available(),
+    reason="needs the merm Python library",
+)
+
+
+@requires_merm
+def test_embed_mermaid_diagrams_turns_a_fence_into_a_data_uri_image():
+    """WeasyPrint can't run JS, so ```mermaid has to become an <img>
+    before markdown.markdown() - via merm's in-process SVG render, as a
+    data: URI (already allowed by _markdown_url_fetcher())."""
+    source = (
+        "# Title\n\n"
+        "```mermaid\n"
+        "flowchart TD\n"
+        "  A --> B\n"
+        "```\n\n"
+        "after\n"
+    )
+    out = pdfless._embed_mermaid_diagrams(source)
+    assert "```mermaid" not in out
+    assert "![mermaid diagram](data:image/svg+xml;base64," in out
+    assert "after" in out
+
+
+@requires_merm
+def test_embed_mermaid_diagrams_turns_a_crlf_fence_into_an_image():
+    """A CRLF file's fences end in \\r\\n, which read_text_file() keeps;
+    the closing fence has to match with that \\r still on the line."""
+    source = (
+        "# Title\r\n\r\n"
+        "```mermaid\r\n"
+        "flowchart TD\r\n"
+        "  A --> B\r\n"
+        "```\r\n\r\n"
+        "after\r\n"
+    )
+    out = pdfless._embed_mermaid_diagrams(source)
+    assert "```" not in out
+    assert "![mermaid diagram](data:image/svg+xml;base64," in out
+    assert out.startswith("# Title\r\n\r\n") and out.endswith("after\r\n")
+
+
+@requires_merm
+def test_embed_mermaid_diagrams_leaves_an_unparseable_fence_alone():
+    source = "```mermaid\nthis is not a diagram\n```\n"
+    assert pdfless._embed_mermaid_diagrams(source) == source
+
+
+def test_embed_mermaid_diagrams_is_a_noop_without_merm(monkeypatch):
+    """Missing merm must not abort Markdown rendering - fences stay as
+    code blocks, the same graceful degradation every other optional
+    renderer here gets."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "merm" or name.startswith("merm."):
+            raise ImportError("merm missing (test)")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    source = "```mermaid\nflowchart TD\n  A --> B\n```\n"
+    assert pdfless._embed_mermaid_diagrams(source) == source
+
+
+@requires_markdown_rendering
+@requires_merm
+def test_markdown_mermaid_fence_renders_as_an_embedded_image(tmp_path):
+    """End-to-end: a ```mermaid fence survives WeasyPrint as a real
+    PDF image XObject, not as the diagram's source text in a <pre>."""
+    from pypdf import PdfReader
+
+    path = tmp_path / "diagram.md"
+    path.write_text(
+        "# Diagram\n\n"
+        "```mermaid\n"
+        "flowchart TD\n"
+        "  Start --> End\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    handler = classify(str(path), tmp_path)
+    assert isinstance(handler, pdfless.MarkdownDocument)
+    pages = handler.build_pages(str(tmp_path))
+    assert len(pages) >= 1
+    assert handler._pdf_delegate is not None
+    pdf_path = handler._pdf_delegate.path
+    page = PdfReader(pdf_path).pages[0]
+    resources = page.get("/Resources") or {}
+    xobjects = resources.get("/XObject") or {}
+    assert len(xobjects) >= 1
+    # The node labels must not appear as extractable page text the way
+    # a leftover <pre> code block would leave them.
+    text = page.extract_text() or ""
+    assert "flowchart TD" not in text
