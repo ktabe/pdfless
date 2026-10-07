@@ -60,7 +60,7 @@ chmod +x /usr/local/bin/pdfless
 Pythonパッケージを自分でインストールすれば，`uv`を使わずに実行することもできます．
 
 ```sh
-pip install pillow pypdf markdown weasyprint
+pip install pillow pypdf markdown weasyprint merm
 python3 pdfless.py document.pdf
 ```
 
@@ -318,7 +318,7 @@ GPS位置情報は，10進数の緯度・経度と，Google Mapsに貼り付け�
 - **LibreOffice**：OpenDocument，Visio，WMFの表示に必要です．インストールされている場合は，Word，RTF，PowerPoint，Excelの描画にも優先して使用します．
 - **macOSのQuick LookとChrome/Chromium**：iWorkのプレビューに必要です．LibreOfficeがない場合は，Word，RTF，PowerPoint，Excelの表示にも使用します．
 - **Chrome/Chromium**：SVGの描画に使用します．Quick Lookは不要です．
-- **WeasyPrintが必要とするシステムライブラリ**：Markdownの描画に必要です．Pythonパッケージの`markdown`と`weasyprint`は，他のPython依存パッケージとともにインストールされます．
+- **WeasyPrintが必要とするシステムライブラリ**：Markdownの描画に必要です．Pythonパッケージの`markdown`と`weasyprint`は，他のPython依存パッケージとともにインストールされます．フェンス付きのMermaidコードブロックは`merm`（同じくそれらのパッケージとともにインストールされます）で図に変換します．`merm`がない場合はコードブロックのまま表示します．
 
 ```sh
 # macOS (Homebrew)
@@ -349,7 +349,7 @@ Quick LookプレビューまたはSVGの描画を利用する場合は，Chrome�
 | Visio | `.vsd`, `.vsdx` | LibreOfficeが必要です．Visioの各ページを1ページとして表示します．`.vsdx`の対応は手動では未検証です． |
 | WMF | `.wmf` | LibreOfficeが必要です．1ページとして表示します． |
 | SVG | `.svg` | Chrome/Chromiumを使用します．拡大・縮小に対応しますが，SVG内のリンクはクリックできません．Chromeがない場合はXMLソースを表示します． |
-| Markdown | `.md`, `.markdown` | WeasyPrintとそのシステムライブラリを使用します．ページ単位の表示，検索，クリック可能なリンクに対応します．`t`で生のMarkdownソースを表示します．描画できない場合は最初からソースのみ表示します． |
+| Markdown | `.md`, `.markdown` | WeasyPrintとそのシステムライブラリを使用します．ページ単位の表示，検索，クリック可能なリンクに対応します．フェンス付きのMermaid図は`merm`があれば描画します．`t`で生のMarkdownソースを表示します．描画できない場合は最初からソースのみ表示します． |
 
 PDFに変換して表示する形式では，変換後のPDFにテキストが含まれていれば，テキスト抽出と検索を利用できます．
 画像として表示するQuick Lookプレビューでは利用できません．
@@ -411,7 +411,7 @@ tmux内では，`pdfless`は同期出力（synchronized output）を使いませ
 
 ```sh
 cd tests
-uv run --with pytest --with pytest-timeout --with pillow --with pypdf --with markdown --with weasyprint python -m pytest
+uv run --with pytest --with pytest-timeout --with pillow --with pypdf --with markdown --with weasyprint --with merm python -m pytest
 ```
 
 テストスイートには，単体テストとターミナルを使用する統合テストが含まれます．
