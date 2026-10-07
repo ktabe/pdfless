@@ -5303,9 +5303,11 @@ def _markdown_url_fetcher() -> Any:
 
 # A fenced ```mermaid ... ``` block - language tag case-insensitive,
 # body kept intact for merm. Opening fence must start a line (same
-# shape GitHub/CommonMark use for info-string fences).
+# shape GitHub/CommonMark use for info-string fences). The closing
+# fence takes an optional \r: read_text_file() keeps a CRLF file's
+# line endings, and $ only matches right before the \n.
 _MERMAID_FENCE_RE = re.compile(
-    r"^```mermaid[ \t]*\r?\n(.*?)^```[ \t]*$",
+    r"^```mermaid[ \t]*\r?\n(.*?)^```[ \t]*\r?$",
     re.MULTILINE | re.DOTALL | re.IGNORECASE,
 )
 

@@ -343,6 +343,24 @@ def test_embed_mermaid_diagrams_turns_a_fence_into_a_data_uri_image():
 
 
 @requires_merm
+def test_embed_mermaid_diagrams_turns_a_crlf_fence_into_an_image():
+    """A CRLF file's fences end in \\r\\n, which read_text_file() keeps;
+    the closing fence has to match with that \\r still on the line."""
+    source = (
+        "# Title\r\n\r\n"
+        "```mermaid\r\n"
+        "flowchart TD\r\n"
+        "  A --> B\r\n"
+        "```\r\n\r\n"
+        "after\r\n"
+    )
+    out = pdfless._embed_mermaid_diagrams(source)
+    assert "```" not in out
+    assert "![mermaid diagram](data:image/svg+xml;base64," in out
+    assert out.startswith("# Title\r\n\r\n") and out.endswith("after\r\n")
+
+
+@requires_merm
 def test_embed_mermaid_diagrams_leaves_an_unparseable_fence_alone():
     source = "```mermaid\nthis is not a diagram\n```\n"
     assert pdfless._embed_mermaid_diagrams(source) == source
