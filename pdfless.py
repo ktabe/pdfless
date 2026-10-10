@@ -40,6 +40,7 @@ import functools
 import getpass
 import hashlib
 import html
+import importlib
 import io
 import json
 import logging
@@ -11910,6 +11911,220 @@ def run_viewer(
     return viewer
 
 
+@dataclasses.dataclass(frozen=True)
+class _DoctorCheck:
+    """One line of --doctor's report.
+
+    Attributes:
+        group: the heading it goes under.
+        name: what was looked for.
+        ok: whether it's there (and works).
+        detail: where and which version, if ok; otherwise what pdfless
+            can't do without it, and how to get it.
+        required: whether its absence makes --doctor exit 1.
+    """
+    group: str
+    name: str
+    ok: bool
+    detail: str
+    required: bool = False
+
+
+def _doctor_tool(
+    group: str, name: str, path: str | None, without: str, required: bool = False,
+) -> _DoctorCheck:
+    """--doctor's line for an external program.
+
+    Args:
+        group, name: as _DoctorCheck's.
+        path: where it was found, or None.
+        without: what's lost without it and how to install it - the
+            detail when it's missing.
+        required: as _DoctorCheck's.
+
+    Returns:
+        The line.
+    """
+    return _DoctorCheck(group, name, path is not None, path or without, required)
+
+
+def _doctor_library(group: str, module: str, without: str) -> _DoctorCheck:
+    """--doctor's line for a Python library: whether it imports - which
+    for weasyprint means its system libraries (Pango and the rest) load
+    too, the usual gap (see _markdown_rendering_available(), and for
+    why its own output is swallowed).
+
+    Args:
+        group: as _DoctorCheck's.
+        module: the module to import.
+        without: what's lost without it - the detail when it fails,
+            after the error itself.
+
+    Returns:
+        The line, with the library's version if it has one.
+    """
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            imported = importlib.import_module(module)
+    except Exception as e:
+        reason = (str(e).strip().splitlines() or [type(e).__name__])[0]
+        return _DoctorCheck(group, module, False, f"{without} ({reason})")
+    return _DoctorCheck(group, module, True, str(getattr(imported, "__version__", "found")))
+
+
+def _tmux_option(flags: str, option: str) -> str | None:
+    """A tmux option's value as the running server has it.
+
+    Args:
+        flags: show-options' flags ("-Apv": this pane's, inherited
+            ones included; "-sv": the server's).
+        option: its name.
+
+    Returns:
+        The value ("on", "off", ...), or None if tmux couldn't be asked.
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "show-options", flags, option],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _doctor_checks() -> list[_DoctorCheck]:
+    """Everything --doctor looks at: the programs and libraries pdfless
+    runs or loads, and the terminal it's started in - each as found (or
+    not) the same way the viewer itself would find it.
+
+    Returns:
+        The report's lines, in order.
+    """
+    checks = []
+
+    # poppler: every PDF, and every document shown through one (office
+    # documents, Markdown, SVG), is drawn, measured and read with it.
+    group = "PDF (poppler)"
+    for tool, without in (
+        ("pdftoppm", "PDFs can't be shown"),
+        ("pdfinfo", "PDFs can't be shown"),
+        ("pdftotext", "no text mode or search in PDFs"),
+    ):
+        checks.append(_doctor_tool(
+            group, tool, shutil.which(tool), f"{without} - {POPPLER_INSTALL_HINT}", required=True,
+        ))
+    if shutil.which("pdftoppm") is not None:
+        try:
+            r = subprocess.run(["pdftoppm", "-v"], capture_output=True, text=True, timeout=10)
+            version = (r.stdout + r.stderr).strip().splitlines()[0]
+        except (OSError, subprocess.SubprocessError, IndexError):
+            version = ""
+        # (the same test check_deps() makes: xpdf's pdftoppm has no -png)
+        try:
+            r = subprocess.run(["pdftoppm", "-h"], capture_output=True, text=True, timeout=10)
+            is_poppler = "-png" in r.stdout + r.stderr
+        except (OSError, subprocess.SubprocessError):
+            is_poppler = False
+        checks.append(_DoctorCheck(
+            group, "poppler", is_poppler,
+            version if is_poppler else f"pdftoppm is not poppler's - {POPPLER_INSTALL_HINT}",
+            required=True,
+        ))
+    checks.append(_doctor_tool(
+        group, "pdftocairo", shutil.which("pdftocairo"),
+        f"some pictures embedded in office documents are left out - {POPPLER_INSTALL_HINT}",
+    ))
+
+    group = "Other documents"
+    mac = sys.platform == "darwin"
+    checks.append(_doctor_tool(
+        group, "LibreOffice", find_soffice(),
+        "Word, Excel and PowerPoint files "
+        + ("are shown through Quick Look and Chrome instead" if mac else "can't be shown")
+        + " - install LibreOffice (soffice)",
+    ))
+    checks.append(_doctor_tool(
+        group, "Chrome", find_chrome(),
+        "SVG" + (" and Quick Look previews (Keynote, Pages, ...)" if mac else "")
+        + " can't be shown - install Google Chrome or Chromium",
+    ))
+    if mac:  # (both come with macOS)
+        checks.append(_doctor_tool(
+            group, "qlmanage", shutil.which("qlmanage"),
+            "no Quick Look previews (Keynote, Pages, ...)",
+        ))
+        checks.append(_doctor_tool(
+            group, "textutil", shutil.which("textutil"),
+            "no text mode for Word-family documents",
+        ))
+
+    group = "Python libraries"
+    MarkdownDocument._ensure_homebrew_lib_path_for_weasyprint()
+    for module, without in (
+        ("PIL", "nothing can be shown"),
+        ("pypdf", "no links or table of contents in PDFs"),
+        ("markdown", "Markdown is shown as plain text"),
+        ("weasyprint", "Markdown is shown as plain text"),
+        ("merm", "Mermaid diagrams in Markdown stay code blocks"),
+    ):
+        checks.append(_doctor_library(group, module, without))
+
+    group = "Terminal"
+    terminal = os.environ.get("LC_TERMINAL") or os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or "unknown"
+    checks.append(_DoctorCheck(
+        group, "inline images", iterm2_like(),
+        terminal if iterm2_like()
+        else f"{terminal} isn't known to show iTerm2 inline images (iTerm2 and WezTerm do)",
+    ))
+    if os.environ.get("TMUX"):
+        # An image only gets through tmux as a passthrough (see
+        # wrap_for_tmux()), and only focus events tell pdfless to draw
+        # it again after tmux has redrawn the pane without it.
+        for name, flags, without in (
+            ("allow-passthrough", "-Apv", "images aren't shown"),
+            ("focus-events", "-sv", "a pane switched back to stays blank until ^L"),
+        ):
+            value = _tmux_option(flags, name)
+            if value is None:
+                detail = "couldn't ask tmux for it"
+            elif value in ("on", "all"):
+                detail = value
+            else:
+                detail = f"{value or 'not set'}: {without} - add 'set -g {name} on' to ~/.tmux.conf"
+            checks.append(_DoctorCheck(group, f"tmux {name}", value in ("on", "all"), detail))
+    return checks
+
+
+def _run_doctor() -> int:
+    """--doctor: print what pdfless found of the things it uses, and what
+    it can't do without the ones it didn't.
+
+    Returns:
+        The exit status: 1 if something required is missing, else 0.
+    """
+    checks = _doctor_checks()
+    print(f"pdfless {__version__}, Python {sys.version.split()[0]} on {sys.platform}")
+    width = max(len(check.name) for check in checks)
+    group = None
+    for check in checks:
+        if check.group != group:
+            group = check.group
+            print(f"\n{group}")
+        mark = "ok" if check.ok else "MISSING" if check.required else "missing"
+        print(f"  {mark:<7}  {check.name:<{width}}  {check.detail}")
+    missing = [check for check in checks if not check.ok]
+    required = [check.name for check in missing if check.required]
+    print()
+    if required:
+        print(f"Missing, and needed for PDFs: {', '.join(required)}")
+    elif missing:
+        print("Everything required is there; what's missing is optional.")
+    else:
+        print("Everything is there.")
+    return 1 if required else 0
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     """pdfless's command line: every option main() reads, and --help's
     text (KEY_TABLE included, as its epilog).
@@ -12040,6 +12255,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--clear-cache",
         action="store_true",
         help="delete the persistent cache and exit",
+    )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="check for the programs and libraries pdfless uses and exit",
     )
     return parser
 
@@ -12225,6 +12445,9 @@ def main() -> None:
     run the viewer on the terminal until it quits."""
     parser = _build_arg_parser()
     args = parser.parse_args()
+
+    if args.doctor:
+        sys.exit(_run_doctor())
 
     if args.clear_cache:
         shutil.rmtree(_office_cache_root(), ignore_errors=True)
