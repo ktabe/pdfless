@@ -2,8 +2,8 @@
 
 [日本語](README-ja.md)
 
-A full-screen pager for PDFs and images, with familiar `less(1)` keybindings.
-View documents directly in your terminal, locally or over SSH.
+A full-screen pager for PDFs, Markdown, Office documents, and images, with familiar `less(1)` keybindings.
+View documents directly in your *terminal*, locally or over SSH.
 
 `pdfless` requires a terminal that supports [iTerm2](https://iterm2.com)'s inline image protocol.
 It has been tested with [iTerm2](https://iterm2.com) and
@@ -13,8 +13,7 @@ It has been tested with [iTerm2](https://iterm2.com) and
 
 ## Major Features
 
-- Display PDF, image (PNG/JPEG/GIF...), and plain text files on a terminal.
-- Office documents, SVG, and Markdown are also supported with additional dependencies.
+- Display PDF, Markdown (with Mermaid diagrams), Office documents (Word/Excel/PowerPoint/OpenDocument), SVG, images (PNG/JPEG/GIF...), and plain text files in a terminal.
 - Scroll, zoom, and pan with the keyboard or mouse.
 - View paginated documents continuously, with adjacent pages on screen together.
 - Search PDF text and follow external and internal PDF links.
@@ -133,6 +132,13 @@ Press `o` or `TAB` to open the table of contents. Select a heading with `j` /
 `k` or the mouse, then press `ENTER` or click it to jump to that section. Use
 `[` / `]` to go back and forward through positions jumped to from the outline
 or an internal link.
+
+The table of contents is available for:
+
+- PDF files that have bookmarks;
+- Markdown files, from their headings;
+- Word documents (from their headings) and PowerPoint presentations (from
+  their slide titles), when LibreOffice is installed.
 
 <img src="docs/screenshots/pdfless-table-of-contents.png" alt="Table of contents" width="80%" style="display: block; margin: 0 auto;">
 

@@ -2,8 +2,8 @@
 
 [English](README.md)
 
-`less(1)`と同様のキー操作でPDFや画像を閲覧できる，全画面表示のページャです．
-ローカルでもSSH経由でも，ターミナル上で直接文書を閲覧できます．
+`less(1)`と同様のキー操作でPDF，Markdown，Office文書，画像を閲覧できる，全画面表示のページャです．
+ローカルでもSSH経由でも，*ターミナル*上で直接文書を閲覧できます．
 
 `pdfless`には，[iTerm2](https://iterm2.com)のインライン画像プロトコルに対応したターミナルが必要です．
 [iTerm2](https://iterm2.com)と[WezTerm](https://wezterm.org)で動作確認済みです．
@@ -12,8 +12,7 @@
 
 ## 主な機能
 
-- PDF，画像（PNG／JPEG／GIFなど），プレーンテキストファイルをターミナル上に表示．
-- 追加の依存ソフトウェアを導入すれば，Office文書，SVG，Markdownにも対応．
+- PDF，Markdown（Mermaid図を含む），Office文書（Word／Excel／PowerPoint／OpenDocument），SVG，画像（PNG／JPEG／GIFなど），プレーンテキストファイルをターミナル上に表示．
 - キーボードやマウスによるスクロール，拡大・縮小，表示位置の移動．
 - ページをまたいだ連続表示．
 - PDF内のテキスト検索と，外部・内部リンクへの移動．
@@ -120,6 +119,12 @@ cat document.pdf | pdfless     # 標準入力から読み込む
 ### 目次
 
 `o`または`TAB`で目次を表示します．`j` / `k`またはマウスで見出しを選び，`ENTER`か見出しのクリックでその節に移動します．目次や内部リンクで移動した位置は，`[` / `]`で前後に移動できます．
+
+目次を表示できるのは，次の文書です．
+
+- しおりのあるPDF
+- Markdown（見出しから作成）
+- Word文書（見出しから作成）とPowerPointプレゼンテーション（スライドタイトルから作成）．どちらもLibreOfficeが必要です．
 
 <img src="docs/screenshots/pdfless-table-of-contents.png" alt="目次" width="80%" style="display: block; margin: 0 auto;">
 
