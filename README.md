@@ -66,6 +66,11 @@ pip install pillow pypdf markdown weasyprint merm
 python3 pdfless.py document.pdf
 ```
 
+To check what is installed, run `pdfless --doctor`. It lists the programs and
+Python libraries `pdfless` uses, says what will not work without the missing
+ones, and exits with status 1 if Poppler is missing. Inside tmux, it also
+checks the tmux settings.
+
 For other document types, see [Additional formats](#additional-formats-experimental).
 For use inside tmux, see [Caveats](#caveats).
 
@@ -198,6 +203,7 @@ Press `F1` or `:h` to open the keyboard help. Press `q` to close it.
 | `--remote-resources` | Let a Markdown file load images and stylesheets from the network. By default only local files (such as a relative-path image) are loaded, so viewing a file never makes network requests. |
 | `--no-cache` | Render afresh without reading or writing the persistent cache. |
 | `--clear-cache` | Delete the persistent cache and exit without opening any files. |
+| `--doctor` | Check for the programs and libraries `pdfless` uses, report what is missing, and exit. |
 
 Note that `-h` means **fit to height**; use `--help` for command-line help.
 Follow mode watches only the currently displayed file. Press `F` to toggle
