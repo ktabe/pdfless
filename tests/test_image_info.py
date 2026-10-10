@@ -53,6 +53,66 @@ def test_exif_and_gps(tmp_path):
     assert not any(line.startswith("GPS GPSLatitude:") for line in lines)
 
 
+def phone_jpeg(path):
+    """A JPEG as a phone writes it: fields padded with NULs or left
+    blank, the exposure in the Exif block, and GPS values in pairs."""
+    exif = Image.Exif()
+    exif[0x010E] = "\x00" * 31  # ImageDescription, left blank
+    exif[0x0131] = "Camera App\x00\x00\x00\x00"  # Software, padded
+    exif[39321] = '{"Hdr":"off"}'  # a maker's own tag, in both blocks
+    exif[39424] = "Phone 13\x00\x00"  # another, padded
+    exif[34979] = "{}"  # and one with nothing in it
+    sub = exif.get_ifd(ExifTags.IFD.Exif)
+    sub[0x829A] = 1 / 60  # ExposureTime
+    sub[0x829D] = 1.65  # FNumber
+    sub[0x920A] = 6.14  # FocalLength
+    sub[0x9101] = b"\x01\x02\x03\x00"  # ComponentsConfiguration
+    sub[39321] = '{"Hdr":"off"}'
+    gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+    gps[5] = b"\x00"  # GPSAltitudeRef: above sea level
+    gps[6] = 88.9
+    gps[7] = (2.0, 46.0, 57.0)
+    gps[12] = "K"
+    gps[13] = 0.0
+    gps[29] = "2026:08:01"
+    Image.new("RGB", (64, 48), "white").save(path, exif=exif)
+    return path
+
+
+def test_padding_blank_fields_and_pointers_are_left_out(tmp_path):
+    """The NULs came out as ^@, and ExifOffset as a number."""
+    lines = info_lines(phone_jpeg(tmp_path / "phone.jpg"))
+    assert "Software: Camera App" in lines
+    assert not any(line.startswith(("ImageDescription", "ExifOffset", "GPSInfo")) for line in lines)
+    assert not any("\x00" in line for line in lines)
+
+
+def test_makers_own_tags(tmp_path):
+    """Pillow has no names for them: ExifTool's, where it has one - and
+    an empty "{}" isn't worth a line."""
+    lines = info_lines(phone_jpeg(tmp_path / "phone.jpg"))
+    assert lines.count('XiaomiSettings: {"Hdr":"off"}') == 1  # once, though in both blocks
+    assert "XiaomiModel: Phone 13" in lines
+    assert not any(line.startswith("Tag 34979") for line in lines)
+
+
+def test_the_exposure_is_shown_in_camera_terms(tmp_path):
+    """The Exif block wasn't shown at all."""
+    lines = info_lines(phone_jpeg(tmp_path / "phone.jpg"))
+    assert "ExposureTime: 1/60 s" in lines
+    assert "FNumber: f/1.65" in lines
+    assert "FocalLength: 6.14 mm" in lines
+    assert "ComponentsConfiguration: <binary, 4 bytes>" in lines  # not ^A^B^C
+
+
+def test_gps_pairs_are_one_line_each(tmp_path):
+    lines = info_lines(phone_jpeg(tmp_path / "phone.jpg"))
+    assert "GPS Altitude: 88.9 m" in lines
+    assert "GPS Time: 2026-08-01 02:46:57 UTC" in lines
+    assert "GPS Speed: 0 km/h" in lines
+    assert not any(line.startswith(("GPS GPSAltitude", "GPS GPSTimeStamp", "GPS GPSSpeed", "GPS GPSDateStamp")) for line in lines)
+
+
 def test_exif_text_cant_reach_the_terminal_raw(tmp_path):
     lines = info_lines(jpeg_with_exif(tmp_path / "photo.jpg"))
     artist = next(line for line in lines if line.startswith("Artist:"))
