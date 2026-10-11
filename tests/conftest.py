@@ -39,10 +39,10 @@ def _isolated_office_cache(tmp_path, monkeypatch):
 # gated on macOS (see requires_office_support).
 @pytest.fixture
 def sample_pdf():
-    """A real, small PDF already checked into the repo root (used for
-    screenshots/manual testing too) - avoids depending on any PDF-
+    """A real, small PDF already checked into the repo's samples/ (used
+    for screenshots/manual testing too) - avoids depending on any PDF-
     writing library just to get a valid multi-page-capable sample."""
-    return os.path.join(REPO_ROOT, "lorem_ipsum.pdf")
+    return os.path.join(REPO_ROOT, "samples", "lorem_ipsum.pdf")
 
 
 @pytest.fixture
