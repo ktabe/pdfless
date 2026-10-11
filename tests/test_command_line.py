@@ -17,6 +17,15 @@ def test_the_parser_reads_files_and_options():
     assert args.keep
 
 
+def test_s_is_the_sidebar():
+    """-s was --rendering-scale's; that keeps its long name only."""
+    parser = pdfless._build_arg_parser()
+    assert parser.parse_args(["-s", "a.pdf"]).sidebar is True
+    assert parser.parse_args(["--sidebar", "a.pdf"]).sidebar is True
+    assert parser.parse_args(["a.pdf"]).sidebar is False
+    assert parser.parse_args(["--rendering-scale", "2", "a.pdf"]).rendering_scale == 2.0
+
+
 def test_no_files_means_stdin():
     assert pdfless._build_arg_parser().parse_args([]).files == []
 

@@ -43,4 +43,5 @@ def test_no_file_and_no_piped_stdin_reports_an_error(pty_session):
     session = pty_session([])  # no stdin_data: stdin stays the pty itself
     code, out = session.exited()
     assert b"no file given" in out
+    assert b"--help for help" in out
     assert code not in (None, 0)

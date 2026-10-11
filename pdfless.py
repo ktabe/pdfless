@@ -105,7 +105,7 @@ PageRequest = Tuple[int, int, str]
 # rather than raising some new, still-arbitrary limit.
 Image.MAX_IMAGE_PIXELS = None
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 STATUS_COLOR_ON = "\x1b[44;97m"  # white on blue - used for one-off messages
 # Resets every SGR attribute (color, reverse video, ...) at once - how
@@ -1061,7 +1061,7 @@ def _cached_render_dir(path: str, key_suffix: str = '') -> str:
     given, distinguishes multiple different possible renderings of the
     very same file: the internal continuous=True rendering (a real-PDF
     result differs - one oversized page vs. paginated normally) and
-    -s/--rendering-scale (a
+    --rendering-scale (a
     screenshot-sliced result bakes in a fixed pixel resolution, unlike
     a real-PDF one, always re-rasterized on demand at whatever the
     current zoom needs) - caching one under a key the other could also
@@ -2254,7 +2254,7 @@ class FlowingText(OfficeVariant):
     these documents are usually short and text-heavy enough that
     sharpness matters more than the render-time tradeoff the default
     otherwise makes for a large slide deck - unless the caller
-    (-s/--rendering-scale) asked for a specific scale explicitly (moot
+    (--rendering-scale) asked for a specific scale explicitly (moot
     for the PDF path, which is always re-rasterized at whatever DPI the
     current zoom needs, regardless of any render_scale)."""
 
@@ -4424,7 +4424,7 @@ class RenderedDocument(DocumentHandler):
         """build_pages()'s persistent-cache key suffix (see
         _cached_render_dir()), or None for no persistent caching. By
         default "": a real PDF is re-rasterized at whatever scale the
-        view needs, so one rendering serves every -s/--rendering-scale."""
+        view needs, so one rendering serves every --rendering-scale."""
         return ""
 
     def build_pages(
@@ -4787,7 +4787,7 @@ class OfficeDocument(RenderedDocument):
     def _cache_key_suffix(self, render_scale: float) -> str:
         """build_pages()'s persistent-cache key suffix (see
         _cached_render_dir()). A screenshot-sliced render bakes in
-        -s/--rendering-scale's pixel resolution, so it's part of the key
+        --rendering-scale's pixel resolution, so it's part of the key
         here."""
         return f":scale={render_scale}"
 
@@ -6402,7 +6402,7 @@ class ViewerOptions:
     wheel_scroll_step: int = 2  # --wheel-scroll-step
     incremental_scroll: bool = True  # --no-incremental-scroll
     debug: bool = False  # -d/--debug
-    office_render_scale: float = OFFICE_RENDER_SCALE  # -s/--rendering-scale
+    office_render_scale: float = OFFICE_RENDER_SCALE  # --rendering-scale
     continuous: bool = False  # -c/--continuous
     follow: bool = False  # -f/--follow
     quit_if_one_screen: bool = False  # -F/--quit-if-one-screen
@@ -12328,7 +12328,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="print debugging information to stderr",
     )
     parser.add_argument(
-        "-s", "--rendering-scale", type=float, default=OFFICE_RENDER_SCALE, metavar="N",
+        "--rendering-scale", type=float, default=OFFICE_RENDER_SCALE, metavar="N",
         help="rendering scale for image-based Quick Look previews "
              "(default: %(default)s)",
     )
@@ -12384,7 +12384,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="hide the scrollbar",
     )
     parser.add_argument(
-        "--sidebar",
+        "-s", "--sidebar",
         action="store_true",
         help="show page thumbnails beside the page in image mode",
     )
@@ -12635,7 +12635,7 @@ def main() -> None:
     reading_stdin = not args.files or "-" in args.files
     if reading_stdin and sys.stdin.isatty():
         die("no file given, and stdin is a terminal - pipe something "
-            "into pdfless, or name a file")
+            "into pdfless, or name a file (--help for help)")
 
     tmpdir = tempfile.mkdtemp(prefix="pdfless.")
     tty_fd = None  # /dev/tty, if _open_key_input() opened it - ours to close
