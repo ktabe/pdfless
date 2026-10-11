@@ -2,7 +2,7 @@
 
 [日本語](README-ja.md)
 
-A full-screen pager for PDFs, Markdown, Office documents, and images, with familiar `less(1)` keybindings.
+A full-screen pager for PDFs, Markdown, Office documents, vector graphics, images, and text files, with familiar `less(1)` keybindings.
 View documents directly in your *terminal*, locally or over SSH.
 
 `pdfless` requires a terminal that supports [iTerm2](https://iterm2.com)'s inline image protocol.
@@ -11,19 +11,54 @@ It has been tested with [iTerm2](https://iterm2.com) and
 
 ---
 
+## Contents
+
+- [Major Features](#major-features)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Common operations](#common-operations)
+    - [Fit and navigate pages](#fit-and-navigate-pages)
+    - [Search](#search)
+    - [Table of contents](#table-of-contents)
+    - [PDF hyperlinks](#pdf-hyperlinks)
+    - [Choose a file](#choose-a-file)
+    - [Page thumbnails](#page-thumbnails)
+    - [Markdown](#markdown)
+    - [Other display modes](#other-display-modes)
+    - [Options](#options)
+- [Keyboard and mouse controls](#keyboard-and-mouse-controls)
+    - [Navigation](#navigation)
+    - [Zoom and pan](#zoom-and-pan)
+    - [Search](#search-1)
+    - [Display and interaction](#display-and-interaction)
+- [Additional formats (experimental)](#additional-formats-experimental)
+    - [Image formats](#image-formats)
+    - [Office documents and other formats](#office-documents-and-other-formats)
+- [Cache](#cache)
+- [Caveats](#caveats)
+    - [Encrypted PDFs](#encrypted-pdfs)
+    - [tmux](#tmux)
+- [Development](#development)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+
 ## Major Features
 
-- Display PDF, Markdown (with Mermaid diagrams), Office documents (Word/Excel/PowerPoint/OpenDocument), SVG, images (PNG/JPEG/GIF...), and plain text files in a terminal.
+- Display PDF, Markdown (with Mermaid diagrams), Office documents (Microsoft Office, OpenDocument, iWork), RTF, vector graphics (SVG/WMF/Visio), images (PNG/JPEG/GIF...), and plain text files in a terminal.
 - Scroll, zoom, and pan with the keyboard or mouse.
-- View paginated documents continuously, with adjacent pages on screen together.
-- Search PDF text and follow external and internal PDF links.
+- Show a clickable and draggable scrollbar.
+- View pages one at a time, or continuously with adjacent pages on screen together.
+- Show page thumbnails down the left edge, and click one to go to its page.
 - Jump to a section from the table of contents: a PDF's bookmarks, Markdown
   headings, and Word headings or PowerPoint slide titles (with LibreOffice).
 - Switch to text mode to read or copy extracted text.
-- Show a clickable and draggable scrollbar.
-- Show page thumbnails down the left edge, and click one to go to its page.
+- Show an image's metadata (including EXIF and GPS) in text mode.
+- Search text in image mode or text mode, and follow external and internal links.
 - Open multiple files and switch between them.
 - Reload the current file automatically when it changes (in follow mode).
+
+Note: some formats need additional software (LibreOffice, Chrome, or macOS
+Quick Look). See [Additional formats](#additional-formats-experimental).
 
 ## Installation
 
@@ -167,6 +202,31 @@ current page is framed, and clicking a thumbnail moves to that page. Press
 thumbnails visible. The sidebar requires a terminal at least 60 columns wide.
 
 <img src="docs/screenshots/pdfless-thumbnail.png" alt="Page thumbnails" width="80%" style="display: block; margin: 0 auto;">
+
+### Markdown
+
+A Markdown file is rendered as formatted pages, like a PDF: headings, lists,
+tables, code blocks, and images are laid out and split into pages.
+
+[Mermaid](https://mermaid.js.org) diagrams are drawn as well. Write one in a
+fenced code block marked `mermaid`.
+
+The diagram appears in the rendered pages in place of the code block; press
+`t` to see its source. Diagrams are drawn by the `merm` Python package, which
+is installed with the other Python dependencies and needs no browser. A
+diagram that `merm` cannot draw is shown as its code block instead.
+
+The usual controls work on the rendered pages. Search with `/`, click links,
+and press `o` to jump to a heading from the table of contents. Press `t` to
+see the Markdown source, and `t` again to return to the rendered pages.
+
+With `-f`, the pages are rendered again whenever the file is saved, so
+`pdfless` can serve as a live preview next to an editor.
+
+Images are loaded from local files only. Use `--remote-resources` to also
+load images and stylesheets from the network.
+
+<img src="docs/screenshots/pdfless-markdown.png" alt="Markdown with thumbnail" width="80%" style="display: block; margin: 0 auto;">
 
 ### Other display modes
 
