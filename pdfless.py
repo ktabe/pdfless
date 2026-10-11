@@ -3945,6 +3945,17 @@ class ImageDocument(DocumentHandler):
     # ExifTags.GPSTAGS.
     _GPS_LATITUDE_REF, _GPS_LATITUDE = 1, 2
     _GPS_LONGITUDE_REF, _GPS_LONGITUDE = 3, 4
+    _GPS_ALTITUDE_REF, _GPS_ALTITUDE = 5, 6
+    _GPS_TIME_STAMP, _GPS_DATE_STAMP = 7, 29
+    _GPS_SPEED_REF, _GPS_SPEED = 12, 13
+    _GPS_SPEED_UNITS = {"K": "km/h", "M": "mph", "N": "knots"}
+    # Makers' own tags that Pillow has no name for, by the names ExifTool
+    # gives them.
+    _EXIF_EXTRA_TAG_NAMES = {0x9999: "XiaomiSettings", 0x9A00: "XiaomiModel"}
+    # Tags that only say where in the file another block of tags is.
+    _EXIF_POINTER_TAGS = {
+        ExifTags.IFD.Exif, ExifTags.IFD.GPSInfo, ExifTags.IFD.Interop,
+    }
 
     @classmethod
     def sniff(cls, path: str, tmpdir: str, debug: bool = False) -> ImageDocument | None:
@@ -4032,13 +4043,34 @@ class ImageDocument(DocumentHandler):
             decoded = self._decode_exif_comment(value)
             if decoded is not None:
                 return decoded
+        # What the camera says in plain terms, where the raw number
+        # doesn't: 0.016662672 is 1/60 s.
+        try:
+            if name == "ExposureTime" and float(value) > 0:
+                seconds = float(value)
+                return f"1/{round(1 / seconds)} s" if seconds < 1 else f"{seconds:g} s"
+            if name == "FNumber":
+                return f"f/{float(value):g}"
+            if name in ("FocalLength", "FocalLengthIn35mmFilm"):
+                return f"{float(value):g} mm"
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
         if isinstance(value, bytes):
             if len(value) > 64:
                 return f"<binary, {len(value)} bytes>"
+            # Text kept as bytes ("0220"), padded with NULs or not - or
+            # not text at all (ComponentsConfiguration's 1, 2, 3, 0).
             try:
-                return value.decode("ascii").strip("\x00")
+                text = value.decode("ascii").replace("\x00", "").strip()
             except UnicodeDecodeError:
                 return f"<binary, {len(value)} bytes>"
+            if text.isprintable():
+                return text
+            return f"<binary, {len(value)} bytes>"
+        if isinstance(value, str):
+            # Fixed-size fields are padded out with NULs - or are nothing
+            # but (an ImageDescription the camera left blank).
+            return value.replace("\x00", "").strip()
         return str(value)
 
     def _gps_decimal_degrees(self, dms: Any, ref: str) -> float:
@@ -4061,7 +4093,19 @@ class ImageDocument(DocumentHandler):
         leaves it as. Where both GPSLatitude/GPSLongitude and their Ref are
         present, those four raw DMS tags are replaced with two decimal-
         degrees lines and a single "lat,lon" line ready to paste into
-        Google Maps' search box - see _gps_decimal_degrees()."""
+        Google Maps' search box - see _gps_decimal_degrees().
+
+        The Exif sub-IFD (the exposure, the lens, when it was taken) is
+        listed after the main tags, the same way. Left out: a tag with
+        nothing in it (an empty JSON object, "{}", included - some phones
+        write those), one that only points at another block of tags
+        (ExifOffset), and one already shown with the same value (phones
+        write some to both blocks). A tag Pillow has no name for (a
+        maker's own) is shown as "Tag <number>", unless
+        _EXIF_EXTRA_TAG_NAMES has one.
+
+        Likewise the GPS altitude, time and speed each come as two tags -
+        a value and its reference or date - and are shown as one line."""
         try:
             exif = img.getexif()
         except Exception:
@@ -4069,11 +4113,22 @@ class ImageDocument(DocumentHandler):
         if not exif:
             return []
         lines = []
-        for tag_id in sorted(exif.keys()):
-            if tag_id == ExifTags.IFD.GPSInfo:
-                continue
-            name = ExifTags.TAGS.get(tag_id, str(tag_id))
-            lines.append(f"{name}: {self._format_exif_value(name, exif[tag_id])}")
+        shown = set()  # (tag, text) - see above
+        blocks = [dict(exif)]
+        try:
+            blocks.append(dict(exif.get_ifd(ExifTags.IFD.Exif)))
+        except Exception:
+            pass
+        for block in blocks:
+            for tag_id in sorted(block):
+                if tag_id in self._EXIF_POINTER_TAGS:
+                    continue
+                name = ExifTags.TAGS.get(tag_id) or self._EXIF_EXTRA_TAG_NAMES.get(tag_id, f"Tag {tag_id}")
+                text = self._format_exif_value(name, block[tag_id])
+                if not text or text == "{}" or (tag_id, text) in shown:
+                    continue
+                shown.add((tag_id, text))
+                lines.append(f"{name}: {text}")
         try:
             gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
         except Exception:
@@ -4099,11 +4154,41 @@ class ImageDocument(DocumentHandler):
         if lat_dd is not None and lon_dd is not None:
             lines.append(f"GPS Coordinates (paste into Google Maps): {lat_dd:.6f},{lon_dd:.6f}")
 
+        # Altitude: meters, below sea level if its reference is 1.
+        try:
+            if self._GPS_ALTITUDE in gps:
+                ref = gps.get(self._GPS_ALTITUDE_REF, 0)
+                below = (ref[0] if isinstance(ref, bytes) and ref else ref) == 1
+                lines.append(f"GPS Altitude: {'-' if below else ''}{float(gps[self._GPS_ALTITUDE]):g} m")
+                skip_ids |= {self._GPS_ALTITUDE, self._GPS_ALTITUDE_REF}
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        # Time: (hours, minutes, seconds), always UTC, with its date.
+        try:
+            if self._GPS_TIME_STAMP in gps:
+                hours, minutes, seconds = (float(v) for v in gps[self._GPS_TIME_STAMP])
+                date = str(gps.get(self._GPS_DATE_STAMP, "")).replace("\x00", "").strip().replace(":", "-")
+                clock = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} UTC"
+                lines.append(f"GPS Time: {date} {clock}".replace("  ", " "))
+                skip_ids |= {self._GPS_TIME_STAMP, self._GPS_DATE_STAMP}
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        # Speed, in its reference's unit.
+        try:
+            unit = self._GPS_SPEED_UNITS.get(str(gps.get(self._GPS_SPEED_REF, "")).strip("\x00 "))
+            if self._GPS_SPEED in gps and unit:
+                lines.append(f"GPS Speed: {float(gps[self._GPS_SPEED]):g} {unit}")
+                skip_ids |= {self._GPS_SPEED, self._GPS_SPEED_REF}
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
         for tag_id in sorted(gps):
             if tag_id in skip_ids:
                 continue
-            name = ExifTags.GPSTAGS.get(tag_id, str(tag_id))
-            lines.append(f"GPS {name}: {self._format_exif_value(name, gps[tag_id])}")
+            name = ExifTags.GPSTAGS.get(tag_id, f"Tag {tag_id}")
+            text = self._format_exif_value(name, gps[tag_id])
+            if text:
+                lines.append(f"GPS {name}: {text}")
         return lines
 
     def _image_info_lines(self) -> list[str] | None:
