@@ -260,9 +260,9 @@ Press `F1` or `:h` to open the keyboard help. Press `q` to close it.
 | `-B`, `--no-border` | Hide page borders in text mode. |
 | `-E`, `--no-eol-mark` | Hide end-of-line markers in text mode. |
 | `--no-scrollbar` | Hide the scrollbar. |
-| `--sidebar` | Show page thumbnails down the left edge in image mode. Toggle at any time with `S`; `s` moves to them to pick one. |
+| `-s`, `--sidebar` | Show page thumbnails down the left edge in image mode. Toggle at any time with `S`; `s` moves to them to pick one. |
 | `--wheel-scroll-step N` | Scroll N lines per mouse-wheel step in image mode (default: 2). |
-| `-s`, `--rendering-scale N` | Set the rendering scale for image-based Quick Look previews (default: 1). Higher values improve sharpness at the cost of rendering time. |
+| `--rendering-scale N` | Set the rendering scale for image-based Quick Look previews (default: 1). Higher values improve sharpness at the cost of rendering time. |
 | `-c`, `--continuous` | Scroll through pages continuously, so the bottom of one page and the top of the next can be on screen together. In text mode, a paginated document (PDF, or a format rendered to PDF) is shown as one run of text with a separator line between pages. Toggle at any time with `c`. |
 | `--no-incremental-scroll` | Redraw the full page image on every scroll. |
 | `-d`, `--debug` | Print debugging information to standard error. |
@@ -468,7 +468,7 @@ Formats rendered to PDF support text extraction and search where the resulting
 PDF contains text. Image-based Quick Look previews do not. In Markdown preview
 mode, `/` searches the rendered PDF; press `t` first to search the raw source.
 
-Use `-s` to increase the resolution of image-based Quick Look previews. This
+Use `--rendering-scale` to increase the resolution of image-based Quick Look previews. This
 option does not change the resolution of LibreOffice-only formats or Markdown.
 With LibreOffice, spreadsheets are exported one whole sheet per page
 (LibreOffice's `SinglePageSheets` option) rather than by their print layout.
