@@ -396,7 +396,7 @@ Preview quality and pagination depend on the format and available renderer.
 | Visio | `.vsd`, `.vsdx` | LibreOffice required. One page per Visio page. `.vsdx` support has not been manually verified. |
 | WMF | `.wmf` | LibreOffice required. Single-page view. |
 | SVG | `.svg` | Chrome/Chromium. Scalable rendering; links within the SVG are not clickable. Falls back to XML source if Chrome is unavailable. |
-| Markdown | `.md`, `.markdown` | WeasyPrint and its system libraries. Paginated view with search and clickable links. Fenced Mermaid diagrams are rendered via `merm` when available. `t` shows the raw Markdown source; falls back to source-only display if rendering is unavailable. |
+| Markdown | `.md`, `.markdown` | WeasyPrint and its system libraries. Paginated view with search and clickable links, including links to headings within the file (with the anchors GitHub uses). Fenced Mermaid diagrams are rendered via `merm` when available. `t` shows the raw Markdown source; falls back to source-only display if rendering is unavailable. |
 
 Formats rendered to PDF support text extraction and search where the resulting
 PDF contains text. Image-based Quick Look previews do not. In Markdown preview

@@ -5398,6 +5398,85 @@ _MERMAID_FENCE_RE = re.compile(
 )
 
 
+def github_heading_slug(text: str) -> str:
+    """The anchor GitHub gives a heading with this text, before it
+    numbers duplicates (see _add_heading_ids()): lowercased, everything
+    but letters, digits, "-", "_" and spaces removed, and each space
+    turned into a "-" - so "Additional formats (experimental)" is
+    "additional-formats-experimental", and "Zoom / pan" is "zoom--pan"
+    (two spaces left where the slash was). Letters are any script's:
+    "追加の対応形式（実験的機能）" keeps all but its brackets.
+
+    GitHub publishes no specification for this; it's what its pages do,
+    as the github-slugger library reproduces it.
+
+    Args:
+        text: the heading's text, without markup.
+
+    Returns:
+        The anchor, without the "#". May be "".
+    """
+    kept = []
+    for ch in text.strip().lower():
+        category = unicodedata.category(ch)
+        # Letters, marks (a combining accent goes with its letter) and
+        # numbers, and "_" and its kind (connector punctuation).
+        if ch in "- " or category[0] in "LMN" or category == "Pc":
+            kept.append("-" if ch == " " else ch)
+    return "".join(kept)
+
+
+_HTML_HEADING_RE = re.compile(r"<(h[1-6])((?:\s[^>]*)?)>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
+_HTML_ID_ATTR_RE = re.compile(r"""\sid\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _add_heading_ids(body: str) -> str:
+    """Give every heading in a rendered Markdown file's HTML the id
+    GitHub would - what a link within the file ("[Installation]
+    (#installation)", a README's table of contents) is written against;
+    python-markdown gives a heading none, and the link went nowhere. With
+    the ids, WeasyPrint makes them links within the PDF, followed like a
+    PDF's own (see PdfDocument.build_link_index()).
+
+    A heading whose text has been seen before gets "-1", "-2", ...
+    appended, as GitHub does. One that already has an id (written
+    "## Title {#custom}") keeps it.
+
+    Args:
+        body: the HTML markdown.markdown() made.
+
+    Returns:
+        The HTML, with the ids added.
+    """
+    seen: dict[str, int] = {}  # slug -> how many more headings have asked for it
+
+    def unique(slug: str) -> str:
+        """`slug`, or with the first "-N" not taken yet - github-slugger's
+        way: the count is kept per original slug, and a numbered one
+        counts as taken too."""
+        result = slug
+        while result in seen:
+            seen[slug] += 1
+            result = f"{slug}-{seen[slug]}"
+        seen[result] = 0
+        return result
+
+    def add(match: re.Match[str]) -> str:
+        tag, attrs, inner = match.groups()
+        given = _HTML_ID_ATTR_RE.search(attrs)
+        if given:
+            seen.setdefault(given.group(1) or given.group(2) or "", 0)
+            return match.group(0)
+        text = html.unescape(_HTML_TAG_RE.sub("", inner))
+        slug = unique(github_heading_slug(text))
+        if not slug:
+            return match.group(0)
+        return f'<{tag}{attrs} id="{html.escape(slug, quote=True)}">{inner}</{tag}>'
+
+    return _HTML_HEADING_RE.sub(add, body)
+
+
 def _embed_mermaid_diagrams(source: str) -> str:
     """Turn fenced ```mermaid blocks into inline SVG images before the
     Markdown -> HTML step.
@@ -5594,7 +5673,7 @@ img { max-width: 100%; height: auto; }
         # Mermaid first - WeasyPrint can't run JS, so fences have to
         # become images before markdown.markdown() turns them into <pre>.
         source = _embed_mermaid_diagrams(source)
-        body = markdown.markdown(source, extensions=["extra", "sane_lists"])
+        body = _add_heading_ids(markdown.markdown(source, extensions=["extra", "sane_lists"]))
         html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{self.MARKDOWN_CSS}</style></head><body>{body}</body></html>'
         # base_url lets a relative-path image reference in the source
         # (e.g. "![alt](./diagram.png)") resolve against the Markdown

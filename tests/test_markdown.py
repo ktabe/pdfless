@@ -129,6 +129,46 @@ def test_markdown_link_survives_as_a_real_pdf_link(sample_md, tmp_path):
     assert any(link.get("uri") == "https://example.com/lorem-ipsum" for link in links)
 
 
+def test_a_headings_anchor_is_the_one_github_gives_it():
+    slug = pdfless.github_heading_slug
+    assert slug("Major Features") == "major-features"
+    assert slug("Additional formats (experimental)") == "additional-formats-experimental"
+    assert slug("追加の対応形式（実験的機能）") == "追加の対応形式実験的機能"  # any script's letters
+    assert slug("Zoom / pan") == "zoom--pan"  # a space each side of what went
+    assert slug("Hello_World-2") == "hello_world-2"
+    assert slug("!!!") == ""
+
+
+def test_headings_get_ids_and_repeats_are_numbered():
+    body = (
+        "<h1>Doc</h1><h2>Search</h2><h2>Search</h2>"
+        "<h2><code>less(1)</code> &amp; <em>more</em></h2>"
+        '<h2 id="mine">Custom</h2><h2>!!!</h2>'
+    )
+    assert pdfless._add_heading_ids(body) == (
+        '<h1 id="doc">Doc</h1><h2 id="search">Search</h2><h2 id="search-1">Search</h2>'
+        '<h2 id="less1--more"><code>less(1)</code> &amp; <em>more</em></h2>'  # the text, not the markup
+        '<h2 id="mine">Custom</h2><h2>!!!</h2>'  # its own id kept; nothing to make one from
+    )
+
+
+@requires_markdown_rendering
+def test_a_link_to_a_heading_goes_to_its_page(tmp_path):
+    """A README's own table of contents: its links went nowhere, the
+    headings having no ids to link to."""
+    page_break = '<div style="page-break-before: always"></div>'
+    path = tmp_path / "doc.md"
+    path.write_text(
+        "# Doc\n\n- [Usage](#usage)\n- [使い方](#使い方-と注意)\n\n"
+        f"{page_break}\n\n## Usage\n\ntext\n\n{page_break}\n\n## 使い方 と（注意）\n\ntext\n",
+        encoding="utf-8",
+    )
+    handler = classify(str(path), tmp_path)
+    pages = handler.build_pages(str(tmp_path))
+    links = handler._pdf_delegate.build_link_index(len(pages))[0]["links"]
+    assert [(link["kind"], link["page"]) for link in links] == [("page", 2), ("page", 3)]
+
+
 def test_markdown_falls_back_to_plain_text_without_weasyprint(sample_md, tmp_path, monkeypatch):
     """With markdown/weasyprint unavailable (simulated here rather
     than relying on this machine's actual install state), a .md file
