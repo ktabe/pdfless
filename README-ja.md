@@ -74,12 +74,21 @@ sudo apt install poppler-utils
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-リポジトリをクローンして，ファイルを開きます．
+`pdfless`は次のどちらかの方法で入手します．プログラム本体は`pdfless.py`の1ファイルだけです．
+
+- **リリース版**: [最新のリリース](https://github.com/ktabe/pdfless/releases/latest)からソースコードのアーカイブ（`.tar.gz`または`.zip`）をダウンロードして展開します．
+  `pdfless-`の後ろにバージョン番号が付いた名前のディレクトリができます．
+- **開発版**: リポジトリをクローンします．
+
+  ```sh
+  git clone https://github.com/ktabe/pdfless.git
+  ```
+
+そのディレクトリでファイルを開きます．
 初回実行時に，`uv`が必要なPythonパッケージを自動的にインストールします．
 
 ```sh
-git clone https://github.com/ktabe/pdfless.git
-cd pdfless
+cd pdfless          # または展開したリリースのディレクトリ
 ./pdfless.py document.pdf
 ```
 

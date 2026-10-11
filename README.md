@@ -77,12 +77,24 @@ sudo apt install poppler-utils
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Clone the repository and open a file. `uv` installs the Python dependencies
+Get `pdfless` in one of two ways. The whole program is the single file
+`pdfless.py`.
+
+- **A release**: download the source code archive (`.tar.gz` or `.zip`) from
+  the [latest release](https://github.com/ktabe/pdfless/releases/latest) and
+  unpack it. This creates a directory named `pdfless-` followed by the version
+  number.
+- **The development version**: clone the repository.
+
+  ```sh
+  git clone https://github.com/ktabe/pdfless.git
+  ```
+
+Then open a file from that directory. `uv` installs the Python dependencies
 automatically on the first run.
 
 ```sh
-git clone https://github.com/ktabe/pdfless.git
-cd pdfless
+cd pdfless          # or the unpacked release directory
 ./pdfless.py document.pdf
 ```
 
