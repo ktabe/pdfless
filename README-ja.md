@@ -203,6 +203,30 @@ Markdownファイルは，PDFと同じように，整形したページとして
 
 画像はローカルファイルからのみ読み込みます．ネットワーク上の画像やスタイルシートも読み込むには，`--remote-resources`を指定します．
 
+文字の大きさや表の罫線など，Markdownファイルの見た目を変えるには，CSSのルールをファイルに書いて`--css`で指定します．
+`pdfless`自身のスタイルより優先されます．Markdownファイル中の`<style>`要素は，そのファイルについてはさらに優先されます．
+
+```sh
+pdfless --css ~/.config/pdfless/markdown.css README.md
+```
+
+```css
+/* 余白を小さくする: ページの余白を1cmに（デフォルトは75px），
+   その内側の余白をなくす（デフォルトは2em） */
+@page { margin: 1cm; }
+body { padding: 0; }
+
+/* 文字を小さくする（デフォルトは12pt）．
+   見出し，コード，表もそれに合わせて小さくなる */
+body { font-size: 10pt; }
+
+/* 表の縦罫線を消す: 各セルの左右の罫線をなくし，横罫線だけ残す */
+th, td { border-left: none; border-right: none; }
+
+/* 表の見出し行の背景を薄い灰色にする */
+th { background: #eee; }
+```
+
 <img src="docs/screenshots/pdfless-markdown.png" alt="Markdownとサムネイル" width="80%" style="display: block; margin: 0 auto;">
 
 ### その他の表示モード
@@ -242,6 +266,7 @@ Markdownファイルは，PDFと同じように，整形したページとして
 | `--no-incremental-scroll` | スクロールのたびにページ画像全体を再描画します． |
 | `-d`, `--debug` | デバッグ情報を標準エラー出力に出力します． |
 | `--remote-resources` | Markdownファイル中の画像やスタイルシートをネットワークからも読み込みます．デフォルトでは手元のファイル（相対パスの画像など）だけを読み込み，表示しただけで通信が起きることはありません． |
+| `--css FILE` | FILEに書いたCSSのルールを，`pdfless`自身のスタイルに加えてMarkdownファイルに適用します． |
 | `--no-cache` | 永続キャッシュを読み書きせず，毎回描画し直します． |
 | `--clear-cache` | 永続キャッシュを削除し，ファイルを開かずに終了します． |
 | `--doctor` | `pdfless`が使う外部コマンドとライブラリの有無を調べ，不足しているものを表示して終了します． |

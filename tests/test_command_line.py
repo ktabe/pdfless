@@ -26,6 +26,18 @@ def test_s_is_the_sidebar():
     assert parser.parse_args(["--rendering-scale", "2", "a.pdf"]).rendering_scale == 2.0
 
 
+def test_css_must_be_a_readable_file(tmp_path, monkeypatch, capsys):
+    """A missing stylesheet is reported up front, not silently ignored."""
+    css = tmp_path / "style.css"
+    css.write_text("body { font-size: 14pt; }\n")
+    parser = pdfless._build_arg_parser()
+    monkeypatch.chdir(tmp_path)
+    assert parser.parse_args(["--css", "style.css", "a.md"]).css == os.path.realpath(css)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--css", "missing.css", "a.md"])
+    assert "can't read missing.css" in capsys.readouterr().err
+
+
 def test_no_files_means_stdin():
     assert pdfless._build_arg_parser().parse_args([]).files == []
 

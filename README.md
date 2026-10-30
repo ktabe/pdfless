@@ -238,6 +238,33 @@ With `-f`, the pages are rendered again whenever the file is saved, so
 Images are loaded from local files only. Use `--remote-resources` to also
 load images and stylesheets from the network.
 
+To change how Markdown files look, such as the font size or the borders of
+tables, put CSS rules in a file and give it with `--css`. They override
+`pdfless`'s own style. A `<style>` element in a Markdown file overrides both,
+for that file only.
+
+```sh
+pdfless --css ~/.config/pdfless/markdown.css README.md
+```
+
+```css
+/* Smaller margins: a 1cm page margin (75px by default),
+   and no padding inside it (2em by default) */
+@page { margin: 1cm; }
+body { padding: 0; }
+
+/* Smaller text (12pt by default); headings, code and
+   tables scale with it */
+body { font-size: 10pt; }
+
+/* Tables without vertical lines: remove the left and
+   right borders of every cell, keeping the horizontal ones */
+th, td { border-left: none; border-right: none; }
+
+/* A light gray background for the header row */
+th { background: #eee; }
+```
+
 <img src="docs/screenshots/pdfless-markdown.png" alt="Markdown with thumbnail" width="80%" style="display: block; margin: 0 auto;">
 
 ### Other display modes
@@ -279,6 +306,7 @@ Press `F1` or `:h` to open the keyboard help. Press `q` to close it.
 | `--no-incremental-scroll` | Redraw the full page image on every scroll. |
 | `-d`, `--debug` | Print debugging information to standard error. |
 | `--remote-resources` | Let a Markdown file load images and stylesheets from the network. By default only local files (such as a relative-path image) are loaded, so viewing a file never makes network requests. |
+| `--css FILE` | Style Markdown files with the CSS rules in FILE as well, after `pdfless`'s own. |
 | `--no-cache` | Render afresh without reading or writing the persistent cache. |
 | `--clear-cache` | Delete the persistent cache and exit without opening any files. |
 | `--doctor` | Check for the programs and libraries `pdfless` uses, report what is missing, and exit. |
