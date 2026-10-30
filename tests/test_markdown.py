@@ -286,6 +286,37 @@ def test_an_img_tags_width_is_honored(tmp_path):
     assert (max(reds) - min(reds) + 1) < page.width * 0.5  # ...at half the text's width
 
 
+def _green_fraction(handler, tmp_path):
+    """The share of a rendered first page's pixels that are pure green -
+    the background the --css tests below paint."""
+    handler.ensure_pages(str(tmp_path))
+    page = pdfless.PageCache(str(tmp_path), handler).get(1, 300, "width").convert("RGB")
+    pixels = [page.getpixel((x, y)) for x in range(0, page.width, 5) for y in range(0, page.height, 5)]
+    return sum(1 for p in pixels if p[1] > 200 and p[0] < 60 and p[2] < 60) / len(pixels)
+
+
+@requires_markdown_rendering
+def test_css_styles_a_markdown_file(tmp_path, monkeypatch):
+    path = tmp_path / "doc.md"
+    path.write_text("# Doc\n\nText.\n")
+    css = tmp_path / "style.css"
+    css.write_text("body { background: #00ff00; }\n")
+    assert _green_fraction(classify(str(path), tmp_path), tmp_path) < 0.1
+    monkeypatch.setattr(pdfless, "_MARKDOWN_USER_CSS", str(css))
+    assert _green_fraction(classify(str(path), tmp_path), tmp_path) > 0.5
+
+
+@requires_markdown_rendering
+def test_a_markdown_files_own_style_overrides_css(tmp_path, monkeypatch):
+    """--css sets the default; a <style> in the file has the last word."""
+    path = tmp_path / "doc.md"
+    path.write_text("<style>body { background: white; }</style>\n\n# Doc\n")
+    css = tmp_path / "style.css"
+    css.write_text("body { background: #00ff00; }\n")
+    monkeypatch.setattr(pdfless, "_MARKDOWN_USER_CSS", str(css))
+    assert _green_fraction(classify(str(path), tmp_path), tmp_path) < 0.1
+
+
 @requires_markdown_rendering
 def test_a_markdown_file_loads_nothing_from_the_network_unless_asked(sample_image, tmp_path, monkeypatch):
     """An <img> from the network (a README's badges) meant requests just

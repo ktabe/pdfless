@@ -1,0 +1,23 @@
+/* A sample stylesheet for pdfless's --css option:
+ *
+ *     pdfless --css samples/markdown.css README.md
+ *
+ * Its rules are applied after pdfless's own, so they only need to say
+ * what changes. */
+
+/* Smaller margins. The space around the text is the page's own margin
+   (WeasyPrint's default is 75px) plus pdfless's padding on body (2em);
+   this keeps only a 1cm page margin. */
+@page { margin: 1cm; }
+
+/* Smaller text. Everything else (headings, code, tables) is sized in em
+   and scales with it. */
+body { font-size: 10pt; padding: 0; }
+
+/* Tables with horizontal lines only: no vertical lines between columns,
+   a heavier line above and below the table and under the header row,
+   and a light line between the other rows. */
+table { border-top: 1.5px solid #333; border-bottom: 1.5px solid #333; }
+th, td { border: none; border-bottom: 1px solid #ddd; }
+thead th { border-bottom: 1px solid #333; }
+tbody tr:last-child td { border-bottom: none; }

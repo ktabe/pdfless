@@ -105,7 +105,7 @@ PageRequest = Tuple[int, int, str]
 # rather than raising some new, still-arbitrary limit.
 Image.MAX_IMAGE_PIXELS = None
 
-__version__ = "2.0.0"
+__version__ = "2.1.0-dev"
 
 STATUS_COLOR_ON = "\x1b[44;97m"  # white on blue - used for one-off messages
 # Resets every SGR attribute (color, reverse video, ...) at once - how
@@ -537,6 +537,28 @@ def positive_int(s: str) -> int:
     if n < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return n
+
+
+def readable_file(s: str) -> str:
+    """argparse type for an option naming a file to read (--css).
+
+    Args:
+        s: the path as given on the command line.
+
+    Returns:
+        The path made absolute, so it still names the same file after a
+        later chdir.
+
+    Raises:
+        argparse.ArgumentTypeError: the file can't be opened for reading,
+            so argparse reports it up front, not as a silent no-op later.
+    """
+    try:
+        with open(s, "rb"):
+            pass
+    except OSError as e:
+        raise argparse.ArgumentTypeError(f"can't read {s}: {e.strerror}")
+    return os.path.abspath(s)
 
 
 def _open_in_default_app(path: str) -> bool:
@@ -995,6 +1017,10 @@ OFFICE_CACHE_MAX_ENTRIES = 50  # persistent rendered-pages cache (see
 # --remote-resources: let a Markdown file's images and stylesheets come
 # from the network too - see _markdown_url_fetcher().
 _MARKDOWN_REMOTE_RESOURCES = False
+
+# --css: the absolute path of a stylesheet to apply to every Markdown
+# file after pdfless's own (MarkdownDocument.MARKDOWN_CSS), or None.
+_MARKDOWN_USER_CSS: str | None = None
 
 _OFFICE_CACHE_ENABLED = True  # --no-cache flips this off for the whole
 # process - read directly by _render_result_cached() rather than
@@ -5674,7 +5700,22 @@ img { max-width: 100%; height: auto; }
         # become images before markdown.markdown() turns them into <pre>.
         source = _embed_mermaid_diagrams(source)
         body = _add_heading_ids(markdown.markdown(source, extensions=["extra", "sane_lists"]))
-        html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{self.MARKDOWN_CSS}</style></head><body>{body}</body></html>'
+        # --css comes as a <link> after the built-in rules, so it
+        # overrides them; a url() in it resolves against the stylesheet's
+        # own directory, not the Markdown file's. Being in <head>, it comes
+        # before any <style> the Markdown file itself contains, so that
+        # one still has the last word for its own file. The stylesheet is
+        # read afresh on each render, so -f picks up edits to it along
+        # with the file's (Markdown has no persistent cache to go stale
+        # - see _cache_key_suffix()).
+        user_css = ""
+        if _MARKDOWN_USER_CSS:
+            # as_uri() percent-encodes quotes and "&", so it's safe in an attribute.
+            user_css = f'<link rel="stylesheet" href="{pathlib.Path(_MARKDOWN_USER_CSS).as_uri()}">'
+        html = (
+            f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{self.MARKDOWN_CSS}</style>'
+            f'{user_css}</head><body>{body}</body></html>'
+        )
         # base_url lets a relative-path image reference in the source
         # (e.g. "![alt](./diagram.png)") resolve against the Markdown
         # file's own directory, the same as a browser would for a page
@@ -12411,6 +12452,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="let a Markdown file load images and styles from the network",
     )
     parser.add_argument(
+        "--css", type=readable_file, metavar="FILE",
+        help="style Markdown files with the CSS in FILE as well",
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="render without using the persistent cache",
@@ -12624,6 +12669,9 @@ def main() -> None:
     if args.remote_resources:
         global _MARKDOWN_REMOTE_RESOURCES
         _MARKDOWN_REMOTE_RESOURCES = True
+    if args.css:
+        global _MARKDOWN_USER_CSS
+        _MARKDOWN_USER_CSS = args.css
 
     # Reading from stdin - no file given at all, or "-" given in its
     # place - lets pdfless work as $PAGER: git/man/etc. invoke $PAGER
