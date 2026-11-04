@@ -108,7 +108,7 @@ chmod +x /usr/local/bin/pdfless
 Alternatively, install the Python dependencies and run without `uv`:
 
 ```sh
-pip install pillow pypdf markdown weasyprint merm
+pip install pillow pypdf markdown-it-py mdit-py-plugins linkify-it-py weasyprint merm
 python3 pdfless.py document.pdf
 ```
 
@@ -468,8 +468,8 @@ requires Poppler.
   fallback for Word, RTF, PowerPoint, and Excel when LibreOffice is absent.
 - **Chrome/Chromium** enables SVG rendering without Quick Look.
 - **WeasyPrint system libraries** enable Markdown rendering. The Python
-  packages `markdown` and `weasyprint` are installed with the other Python
-  dependencies. Fenced Mermaid code blocks are rendered to diagrams via
+  packages `markdown-it-py` (with `mdit-py-plugins` and `linkify-it-py`) and
+  `weasyprint` are installed with the other Python dependencies. Fenced Mermaid code blocks are rendered to diagrams via
   `merm` (also installed with those packages); without `merm`, they stay as
   code blocks.
 

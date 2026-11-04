@@ -1,10 +1,10 @@
-"""Markdown support: rendered to a real PDF via the `markdown` +
+"""Markdown support: rendered to a real PDF via the `markdown-it-py` +
 `weasyprint` Python libraries (MarkdownDocument), not Quick Look,
 Chrome, or LibreOffice - see MarkdownDocument._render_markdown_pdf()
 for why. requires_markdown_rendering gates on both libraries (and
 weasyprint's own Cairo/Pango system libraries) actually being usable;
 see conftest.py. Mermaid fences are turned into SVG images via merm
-before WeasyPrint (see _embed_mermaid_diagrams()).
+(see _mermaid_image_html()).
 """
 
 import pytest
@@ -394,50 +394,91 @@ requires_merm = pytest.mark.skipif(
 )
 
 
-@requires_merm
-def test_embed_mermaid_diagrams_turns_a_fence_into_a_data_uri_image():
-    """WeasyPrint can't run JS, so ```mermaid has to become an <img>
-    before markdown.markdown() - via merm's in-process SVG render, as a
-    data: URI (already allowed by _markdown_url_fetcher())."""
+def _markdown_it_available():
+    try:
+        import linkify_it  # noqa: F401
+        import markdown_it  # noqa: F401
+        import mdit_py_plugins  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+requires_markdown_it = pytest.mark.skipif(
+    not _markdown_it_available(),
+    reason="needs the markdown-it-py, mdit-py-plugins and linkify-it-py Python libraries",
+)
+
+
+@requires_markdown_it
+def test_a_code_block_in_a_list_item_stays_in_it():
+    """python-markdown wanted four spaces of indent, and no fence inside
+    a list item: a three-space-indented ``` block (the usual way to
+    write one under "1. ") ended the list and came out as inline code."""
     source = (
-        "# Title\n\n"
-        "```mermaid\n"
-        "flowchart TD\n"
-        "  A --> B\n"
-        "```\n\n"
-        "after\n"
+        "1. Install it:\n\n"
+        "   ```\n"
+        "   brew install go\n"
+        "   ```\n\n"
+        "   Then go on.\n\n"
+        "2. Next step.\n"
     )
-    out = pdfless._embed_mermaid_diagrams(source)
-    assert "```mermaid" not in out
-    assert "![mermaid diagram](data:image/svg+xml;base64," in out
+    out = pdfless._markdown_to_html(source)
+    assert out.count("<ol>") == 1
+    assert "<pre><code>brew install go\n</code></pre>" in out
+    assert out.index("Then go on.") < out.index("Next step.") < out.index("</ol>")
+
+
+@requires_markdown_it
+def test_github_extensions_are_rendered():
+    """Tables, strikethrough, bare URLs, task lists and footnotes, as
+    GitHub has them - and Markdown inside an HTML block."""
+    out = pdfless._markdown_to_html(
+        "| a | b |\n|---|---|\n| 1 | 2 |\n\n"
+        "~~old~~ https://example.com\n\n"
+        "- [x] done\n\n"
+        "Note.[^1]\n\n[^1]: The note.\n\n"
+        '<div align="center">\n\n**bold**\n\n</div>\n'
+    )
+    assert "<table>" in out
+    assert "<s>old</s>" in out
+    assert '<a href="https://example.com">' in out
+    assert 'class="task-list-item-checkbox" checked="checked"' in out
+    assert 'class="footnotes"' in out
+    assert "<strong>bold</strong>" in out
+
+
+@requires_markdown_it
+@requires_merm
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_a_mermaid_fence_becomes_a_data_uri_image(newline):
+    """WeasyPrint can't run JS, so ```mermaid has to become an <img> -
+    via merm's in-process SVG render, as a data: URI (already allowed by
+    _markdown_url_fetcher()). A CRLF file's fences work the same."""
+    source = newline.join(["# Title", "", "```Mermaid", "flowchart TD", "  A --> B", "```", "", "after", ""])
+    out = pdfless._markdown_to_html(source)
+    assert "<pre>" not in out
+    assert '<img src="data:image/svg+xml;base64,' in out
     assert "after" in out
 
 
+@requires_markdown_it
 @requires_merm
-def test_embed_mermaid_diagrams_turns_a_crlf_fence_into_an_image():
-    """A CRLF file's fences end in \\r\\n, which read_text_file() keeps;
-    the closing fence has to match with that \\r still on the line."""
-    source = (
-        "# Title\r\n\r\n"
-        "```mermaid\r\n"
-        "flowchart TD\r\n"
-        "  A --> B\r\n"
-        "```\r\n\r\n"
-        "after\r\n"
-    )
-    out = pdfless._embed_mermaid_diagrams(source)
-    assert "```" not in out
-    assert "![mermaid diagram](data:image/svg+xml;base64," in out
-    assert out.startswith("# Title\r\n\r\n") and out.endswith("after\r\n")
+def test_a_mermaid_fence_in_a_list_item_becomes_an_image():
+    out = pdfless._markdown_to_html("- A diagram:\n\n  ```mermaid\n  flowchart TD\n    A --> B\n  ```\n")
+    assert "<pre>" not in out
+    assert out.index("<li>") < out.index('<img src="data:image/svg+xml') < out.index("</li>")
 
 
+@requires_markdown_it
 @requires_merm
-def test_embed_mermaid_diagrams_leaves_an_unparseable_fence_alone():
-    source = "```mermaid\nthis is not a diagram\n```\n"
-    assert pdfless._embed_mermaid_diagrams(source) == source
+def test_an_unparseable_mermaid_fence_stays_a_code_block():
+    out = pdfless._markdown_to_html("```mermaid\nthis is not a diagram\n```\n")
+    assert '<pre><code class="language-mermaid">this is not a diagram' in out
 
 
-def test_embed_mermaid_diagrams_is_a_noop_without_merm(monkeypatch):
+@requires_markdown_it
+def test_a_mermaid_fence_stays_a_code_block_without_merm(monkeypatch):
     """Missing merm must not abort Markdown rendering - fences stay as
     code blocks, the same graceful degradation every other optional
     renderer here gets."""
@@ -451,8 +492,8 @@ def test_embed_mermaid_diagrams_is_a_noop_without_merm(monkeypatch):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    source = "```mermaid\nflowchart TD\n  A --> B\n```\n"
-    assert pdfless._embed_mermaid_diagrams(source) == source
+    out = pdfless._markdown_to_html("```mermaid\nflowchart TD\n  A --> B\n```\n")
+    assert '<pre><code class="language-mermaid">' in out
 
 
 @requires_markdown_rendering
