@@ -102,7 +102,7 @@ chmod +x /usr/local/bin/pdfless
 Pythonパッケージを自分でインストールすれば，`uv`を使わずに実行することもできます．
 
 ```sh
-pip install pillow pypdf markdown weasyprint merm
+pip install pillow pypdf markdown-it-py mdit-py-plugins linkify-it-py weasyprint merm
 python3 pdfless.py document.pdf
 ```
 
@@ -412,7 +412,7 @@ GPS位置情報は，10進数の緯度・経度と，Google Mapsに貼り付け�
 - **LibreOffice**：OpenDocument，Visio，WMFの表示に必要です．インストールされている場合は，Word，RTF，PowerPoint，Excelの描画にも優先して使用します．
 - **macOSのQuick LookとChrome/Chromium**：iWorkのプレビューに必要です．LibreOfficeがない場合は，Word，RTF，PowerPoint，Excelの表示にも使用します．
 - **Chrome/Chromium**：SVGの描画に使用します．Quick Lookは不要です．
-- **WeasyPrintが必要とするシステムライブラリ**：Markdownの描画に必要です．Pythonパッケージの`markdown`と`weasyprint`は，他のPython依存パッケージとともにインストールされます．フェンス付きのMermaidコードブロックは`merm`（同じくそれらのパッケージとともにインストールされます）で図に変換します．`merm`がない場合はコードブロックのまま表示します．
+- **WeasyPrintが必要とするシステムライブラリ**：Markdownの描画に必要です．Pythonパッケージの`markdown-it-py`（`mdit-py-plugins`と`linkify-it-py`を含む）と`weasyprint`は，他のPython依存パッケージとともにインストールされます．フェンス付きのMermaidコードブロックは`merm`（同じくそれらのパッケージとともにインストールされます）で図に変換します．`merm`がない場合はコードブロックのまま表示します．
 
 ```sh
 # macOS (Homebrew)

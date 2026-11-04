@@ -4,7 +4,9 @@
 # dependencies = [
 #     "pillow",
 #     "pypdf",
-#     "markdown",
+#     "markdown-it-py",
+#     "mdit-py-plugins",
+#     "linkify-it-py",
 #     "weasyprint",
 #     "merm",
 # ]
@@ -5413,17 +5415,6 @@ def _markdown_url_fetcher() -> Any:
     return fetch
 
 
-# A fenced ```mermaid ... ``` block - language tag case-insensitive,
-# body kept intact for merm. Opening fence must start a line (same
-# shape GitHub/CommonMark use for info-string fences). The closing
-# fence takes an optional \r: read_text_file() keeps a CRLF file's
-# line endings, and $ only matches right before the \n.
-_MERMAID_FENCE_RE = re.compile(
-    r"^```mermaid[ \t]*\r?\n(.*?)^```[ \t]*\r?$",
-    re.MULTILINE | re.DOTALL | re.IGNORECASE,
-)
-
-
 def github_heading_slug(text: str) -> str:
     """The anchor GitHub gives a heading with this text, before it
     numbers duplicates (see _add_heading_ids()): lowercased, everything
@@ -5461,16 +5452,16 @@ def _add_heading_ids(body: str) -> str:
     """Give every heading in a rendered Markdown file's HTML the id
     GitHub would - what a link within the file ("[Installation]
     (#installation)", a README's table of contents) is written against;
-    python-markdown gives a heading none, and the link went nowhere. With
+    markdown-it-py gives a heading none, and the link went nowhere. With
     the ids, WeasyPrint makes them links within the PDF, followed like a
     PDF's own (see PdfDocument.build_link_index()).
 
     A heading whose text has been seen before gets "-1", "-2", ...
-    appended, as GitHub does. One that already has an id (written
-    "## Title {#custom}") keeps it.
+    appended, as GitHub does. One that already has an id (an HTML
+    <h2 id="custom"> in the source) keeps it.
 
     Args:
-        body: the HTML markdown.markdown() made.
+        body: the HTML _markdown_to_html() made.
 
     Returns:
         The HTML, with the ids added.
@@ -5503,44 +5494,92 @@ def _add_heading_ids(body: str) -> str:
     return _HTML_HEADING_RE.sub(add, body)
 
 
-def _embed_mermaid_diagrams(source: str) -> str:
-    """Turn fenced ```mermaid blocks into inline SVG images before the
-    Markdown -> HTML step.
+def _markdown_to_html(source: str) -> str:
+    """Convert Markdown to HTML the way GitHub does, as far as a library
+    can: markdown-it-py follows CommonMark, which GitHub's own flavor
+    extends, and its "gfm-like" preset adds GitHub's tables,
+    strikethrough and bare-URL links; footnotes and task lists come from
+    mdit-py-plugins. python-markdown, used before, isn't CommonMark: a
+    list item's continuation needed four spaces of indent, and a fenced
+    code block inside a list item wasn't one at all - a README's
+    "1. Install it:" followed by an indented ``` block came out as a
+    broken list and a run of inline code.
+
+    Raw HTML passes through (as on GitHub, less its sanitizing), and
+    Markdown inside an HTML block is still converted when blank lines
+    set it apart from the tags, so `<div align="center">` around an
+    image works.
+
+    Args:
+        source: the Markdown source.
+
+    Returns:
+        The HTML for the document's body.
+    """
+    from markdown_it import MarkdownIt
+    from mdit_py_plugins.footnote import footnote_plugin
+    from mdit_py_plugins.tasklists import tasklists_plugin
+
+    md = MarkdownIt("gfm-like").use(footnote_plugin).use(tasklists_plugin)
+    default_fence = md.renderer.rules["fence"]
+
+    def fence(renderer: Any, tokens: Any, idx: int, options: Any, env: Any) -> str:
+        """A ```mermaid fence as its diagram (see _mermaid_image_html()),
+        any other - or one merm can't draw - as the usual code block.
+        The language is the info string's first word, any case."""
+        token = tokens[idx]
+        if token.info.lower().split()[:1] == ["mermaid"]:
+            image = _mermaid_image_html(token.content)
+            if image is not None:
+                return image
+        return default_fence(tokens, idx, options, env)
+
+    md.add_render_rule("fence", fence)
+    return md.render(source)
+
+
+def _mermaid_image_html(code: str) -> str | None:
+    """The HTML that shows a ```mermaid fence as its diagram - called by
+    _markdown_to_html() for each such fence, wherever it is (inside a
+    list item too).
 
     WeasyPrint has no JavaScript, so a Mermaid fence would otherwise
     render as a plain code block. merm (pure Python, no browser) turns
-    each diagram into an SVG string; embedding that as a data: URI
+    the diagram into an SVG string; embedding that as a data: URI
     image keeps the conversion in-process - no Chrome/mmdc subprocess,
     no temp files - and data: is already allowed by
-    _markdown_url_fetcher().
+    _markdown_url_fetcher(). It's written as an <img> tag, not as
+    Markdown's ![](...): markdown-it-py refuses a data:image/svg+xml
+    link (an SVG can carry script).
 
     merm is a declared PEP723 dependency (so `uv run` installs it), but
-    the import is still lazy and failures are swallowed per block: a
-    missing merm, or a diagram merm can't parse, leaves that fence as a
-    code block rather than aborting the whole Markdown render."""
-    if "```mermaid" not in source.lower():
-        return source
+    the import is still lazy and failures are swallowed per block.
+
+    Args:
+        code: the fence's content, the diagram's source.
+
+    Returns:
+        A paragraph holding the image, or None - merm is missing, or
+        can't draw this diagram - for the fence to stay a code block
+        rather than the whole Markdown render failing.
+    """
     try:
         from merm import render_diagram
     except Exception:
-        return source
-
-    def repl(match: re.Match[str]) -> str:
-        try:
-            svg = render_diagram(match.group(1))
-        except Exception:
-            return match.group(0)
-        if not isinstance(svg, str) or "<svg" not in svg[:200].lower():
-            return match.group(0)
-        b64 = base64.standard_b64encode(svg.encode("utf-8")).decode("ascii")
-        return f"![mermaid diagram](data:image/svg+xml;base64,{b64})\n"
-
-    return _MERMAID_FENCE_RE.sub(repl, source)
+        return None
+    try:
+        svg = render_diagram(code)
+    except Exception:
+        return None
+    if not isinstance(svg, str) or "<svg" not in svg[:200].lower():
+        return None
+    b64 = base64.standard_b64encode(svg.encode("utf-8")).decode("ascii")
+    return f'<p><img src="data:image/svg+xml;base64,{b64}" alt="mermaid diagram"></p>\n'
 
 
 class MarkdownDocument(_RawTextView, RenderedDocument):
-    """A Markdown file, rendered to a real PDF via the `markdown` +
-    `weasyprint` Python libraries (see _render_markdown_pdf() below) - no
+    """A Markdown file, rendered to a real PDF via the `markdown-it-py`
+    + `weasyprint` Python libraries (see _render_markdown_pdf() below) - no
     Quick Look, Chrome, or LibreOffice involved at all, and
     dramatically faster than either (confirmed by hand: well under a
     second, against Chrome's own ~1-2s process startup alone), since
@@ -5548,12 +5587,12 @@ class MarkdownDocument(_RawTextView, RenderedDocument):
     measured/injected @page size the way FlowingText/SvgDocument do.
 
     Fenced ```mermaid blocks are turned into SVG images first via the
-    `merm` library (see _embed_mermaid_diagrams()) - still no browser;
+    `merm` library (see _mermaid_image_html()) - still no browser;
     a missing merm or an unparseable diagram leaves that fence as a
     code block.
 
     Falls back to plain text (TextDocument, showing the raw Markdown
-    source) if `markdown`/`weasyprint` - or the system libraries
+    source) if markdown-it-py/`weasyprint` - or the system libraries
     WeasyPrint itself needs (Cairo/Pango/GLib, not something pip can
     install on its own) - aren't available; see sniff().
 
@@ -5581,6 +5620,8 @@ class MarkdownDocument(_RawTextView, RenderedDocument):
     # cell ran on into the next column (confirmed with WeasyPrint 70 and
     # this README's format table). As atomic boxes, the spans wrap
     # between one another as the column width expects.
+    # A task list item ("- [ ] todo") shows its checkbox in place of the
+    # bullet, as on GitHub.
     MARKDOWN_CSS = """
 body { line-height: 1.5; padding: 2em; }
 h1, h2, h3, h4, h5, h6 { line-height: 1.2; margin-top: 1em; }
@@ -5593,6 +5634,8 @@ table { border-collapse: collapse; max-width: 100%; }
 th, td { border: 1px solid #ccc; padding: 0.3em 0.6em; }
 th code, td code { display: inline-block; }
 img { max-width: 100%; height: auto; }
+li.task-list-item { list-style: none; }
+.task-list-item-checkbox { margin: 0 0.4em 0 -1.4em; vertical-align: middle; }
 """
 
     @staticmethod
@@ -5627,7 +5670,8 @@ img { max-width: 100%; height: auto; }
     @staticmethod
     def _markdown_rendering_available() -> bool:
         """Whether MarkdownDocument can even attempt to render at all -
-        both the `markdown` and `weasyprint` libraries import cleanly.
+        markdown-it-py (with its plugins and linkify-it-py, which its
+        "gfm-like" preset needs) and `weasyprint` all import cleanly.
         Cheap to call more than once: a successful import is cached by
         Python itself (sys.modules), so only the first call actually pays
         for it. See _render_markdown_pdf() for why this has to be a
@@ -5657,7 +5701,9 @@ img { max-width: 100%; height: auto; }
         MarkdownDocument._ensure_homebrew_lib_path_for_weasyprint()
         try:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                import markdown  # noqa: F401
+                import linkify_it  # noqa: F401
+                import markdown_it  # noqa: F401
+                import mdit_py_plugins  # noqa: F401
                 import weasyprint  # noqa: F401
         except Exception:
             return False
@@ -5665,7 +5711,8 @@ img { max-width: 100%; height: auto; }
 
     def _render_markdown_pdf(self, out_pdf: str) -> bool:
         """Convert self.path (a Markdown file) to a real PDF via the
-        `markdown` (Markdown -> HTML) and `weasyprint` (HTML+CSS -> PDF)
+        `markdown-it-py` (Markdown -> HTML, see _markdown_to_html()) and
+        `weasyprint` (HTML+CSS -> PDF)
         libraries - no headless Chrome or LibreOffice involved at all, and
         dramatically faster than either (confirmed by hand: a whole
         conversion takes well under a second, against Chrome's own ~1-2s
@@ -5689,17 +5736,13 @@ img { max-width: 100%; height: auto; }
         raises, so this is always safe for a caller to attempt speculatively."""
         if not self._markdown_rendering_available():
             return False
-        import markdown
         from weasyprint import HTML
 
         try:
             source = read_text_file(self.path, legacy=False)  # as text mode reads it
         except OSError:
             return False
-        # Mermaid first - WeasyPrint can't run JS, so fences have to
-        # become images before markdown.markdown() turns them into <pre>.
-        source = _embed_mermaid_diagrams(source)
-        body = _add_heading_ids(markdown.markdown(source, extensions=["extra", "sane_lists"]))
+        body = _add_heading_ids(_markdown_to_html(source))
         # --css comes as a <link> after the built-in rules, so it
         # overrides them; a url() in it resolves against the stylesheet's
         # own directory, not the Markdown file's. Being in <head>, it comes
@@ -12269,7 +12312,9 @@ def _doctor_checks() -> list[_DoctorCheck]:
     for module, without in (
         ("PIL", "nothing can be shown"),
         ("pypdf", "no links or table of contents in PDFs"),
-        ("markdown", "Markdown is shown as plain text"),
+        ("markdown_it", "Markdown is shown as plain text"),
+        ("mdit_py_plugins", "Markdown is shown as plain text"),
+        ("linkify_it", "Markdown is shown as plain text"),
         ("weasyprint", "Markdown is shown as plain text"),
         ("merm", "Mermaid diagrams in Markdown stay code blocks"),
     ):
