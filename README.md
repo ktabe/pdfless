@@ -135,7 +135,7 @@ pdfless -F document.pdf        # Quit if the document fits on one screen
 cat document.pdf | pdfless     # Read from standard input
 ```
 
-With multiple files open, use `:n` / `:p` (or `}` / `{`) to switch files, or `O` to pick one from a list.
+With multiple files open, use `:n` / `:p` (or `}` / `{`) to switch files, or `O` to pick one from a list. Coming back to a file shows it where you left it.
 A directory stands for the files directly in it, sorted by name (ignoring case, as `ls` does); hidden files and subdirectories are left out.
 With no filename, or with `-` as the filename, `pdfless` reads standard input.
 

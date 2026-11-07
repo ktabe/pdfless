@@ -187,3 +187,50 @@ def test_copy_mode_stays_with_its_own_file(sample_pdf, tmp_path, monkeypatch):
     assert viewer._copy_mode_saved is None
     assert (viewer.eol_mark, viewer.scrollbar, viewer.line_numbers) == before
     assert viewer.base_width_px == width  # the scrollbar's column is back
+
+
+def test_coming_back_to_a_file_is_back_where_it_was(sample_pdf, sample_text, tmp_path, monkeypatch):
+    """Switching files ({, }, O) started the file switched back to over
+    at its first page."""
+    long_text = tmp_path / "long.txt"
+    long_text.write_text("".join(f"line {i}\n" for i in range(200)))
+    other = tmp_path / "b.pdf"
+    shutil.copy(sample_pdf, other)
+    viewer = make_viewer([pdfless.PdfDocument(sample_pdf), str(long_text), str(other)], monkeypatch)
+    viewer.go_page(2, 0)
+    viewer.scroll_down(viewer.cell_h_px * 3)
+    pdf_place = (viewer.page, viewer.scroll)
+    assert pdf_place[1] > 0
+
+    viewer.next_file()  # the text file, never shown before: its start
+    assert viewer.text_mode and viewer._top_text_line() == 0
+    viewer.text_scroll_down(5)
+    text_line = viewer._top_text_line()
+    assert text_line > 0
+
+    viewer.previous_file()
+    assert not viewer.text_mode
+    assert (viewer.page, viewer.scroll) == pdf_place
+
+    viewer.next_file()
+    assert viewer._top_text_line() == text_line
+
+    viewer.next_file()  # the other PDF, never shown before: its first page
+    assert (viewer.page, viewer.scroll) == (1, 0)
+
+
+def test_coming_back_to_a_file_read_in_text_mode_is_back_in_text_mode(
+    sample_pdf, sample_text, tmp_path, monkeypatch,
+):
+    viewer = three_files(sample_pdf, sample_text, tmp_path, monkeypatch)
+    viewer.go_page(2, 0)
+    assert viewer.enter_text_mode()
+    viewer.text_scroll_down(3)
+    place = (viewer.page, viewer._top_text_line())
+
+    viewer.go_to_file(2)
+    assert not viewer.text_mode  # its own default, not the first file's mode
+
+    viewer.go_to_file(0)
+    assert viewer.text_mode
+    assert (viewer.page, viewer._top_text_line()) == place
