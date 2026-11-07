@@ -8325,6 +8325,33 @@ class _Sidebar:
                 sys.stdout.flush()
 
 
+@dataclasses.dataclass
+class _FilePlace:
+    """Where the view was in a file when another file was switched to
+    (see Viewer.go_to_file()), for coming back to the same place.
+
+    Attributes:
+        text_mode: whether it was in text mode.
+        page: the page.
+        zoom: the image mode zoom.
+        scroll: how far down the page image mode was scrolled (px).
+        x_offset: image mode's horizontal pan (px).
+        text_line: in text mode, the raw text line at the top of the
+            screen - a line rather than text_scroll's display row, so
+            the place survives a terminal resized in the meantime,
+            which wraps the text differently.
+        text_x_offset: text mode's horizontal pan (columns).
+    """
+
+    text_mode: bool
+    page: int
+    zoom: float
+    scroll: int
+    x_offset: int
+    text_line: int
+    text_x_offset: int
+
+
 class Viewer:
     def __init__(
         self, files: list[DocumentHandler | str], file_index: int, page: int, tmpdir: str, fd: int,
@@ -8353,6 +8380,8 @@ class Viewer:
         # populated by _classify() the first time each lazy (path-string)
         # entry above is actually visited - None means that one turned
         # out not to be a usable file at all.
+        self._places: dict[int, _FilePlace] = {}  # file_index -> where the view
+        # was when another file was switched to - see go_to_file().
         self._unusable_why: dict[int, str] = {}  # file_index -> the UnusableFile
         # message _classify() got sniffing it, if any (see _unusable_reason()).
         # Background preparation of the file after the one on screen (see
@@ -8767,10 +8796,12 @@ class Viewer:
     def go_to_file(
         self, index: int, boundary_message: str = 'no such file', step: int = 0,
     ) -> None:
-        """Switch to files[index], starting fresh at its first page -
-        zoom, search, link history, and text mode all reset, the same
-        as if pdfless had been started fresh on that file. A no-op
-        (with a status message) if index is out of range.
+        """Switch to files[index]: back to where the view was in it
+        (page, scroll, pan, zoom and text mode - see _FilePlace) if it's
+        been shown before, or else at its first page, the same as if
+        pdfless had been started fresh on that file. Search, link
+        history and copy mode reset either way. A no-op (with a status
+        message) if index is out of range.
 
         `step` (+-1 from next_file()/previous_file(), 0 from a direct
         jump like x/X) says what to do if files[index] turns out not to
@@ -8806,6 +8837,14 @@ class Viewer:
             self._copy_mode_saved = None
             if self.scrollbar != scrollbar:
                 self._recompute_geometry()  # its column comes back from the page's width
+        # Remembered after copy mode is undone, which can change which
+        # line is at the top (line numbers, the border).
+        self._places[self.file_index] = _FilePlace(
+            text_mode=self.text_mode, page=self.page, zoom=self.zoom,
+            scroll=self.scroll, x_offset=self.x_offset,
+            text_line=self._top_text_line() if self.text_mode else 0,
+            text_x_offset=self.text_x_offset,
+        )
         self.file_index = index
         self._set_current_file()
         self.encode_cache.clear()
@@ -8827,11 +8866,31 @@ class Viewer:
         self.page = 1
         self.scroll = 0
         self.x_offset = 0
+        place = self._places.get(index)
+        if place is not None:
+            # Back to where it was. A file that has changed since may
+            # have fewer pages now, so the page is clamped, and the
+            # loads below clamp the scroll and pan to what's there.
+            self.page = max(1, min(self.npages, place.page)) if self.npages else 1
+            self.zoom = place.zoom
+            # Text mode is entered as such, not by enter_text_mode(),
+            # which would map image mode's place onto the text - unless
+            # there's no text to show any more, which leaves image mode.
+            if place.text_mode and not self.text_mode and self.can_enter_text_mode():
+                self.text_mode = True
+                sys.stdout.write(MOUSE_OFF)
         self._invalidate_screen()
         if self.text_mode:
             self._load_text_page()
+            if place is not None and place.text_mode:
+                self.text_x_offset = place.text_x_offset
+                self._scroll_to_text_line(place.text_line)  # clamps the pan too
+                self._sync_text_page()
         else:
             self._load_page()
+            if place is not None and not place.text_mode:
+                self.scroll = self._clamp_image_scroll(place.scroll)
+                self._set_x_offset(place.x_offset)
         self.refresh()  # its normal status line already includes "file i/N"
         self._schedule_prefetch()
 
