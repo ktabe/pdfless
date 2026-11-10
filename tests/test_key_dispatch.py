@@ -390,3 +390,100 @@ def test_only_web_and_mail_links_are_opened(sample_pdf, monkeypatch, capsys):
         viewer.links.activate({"kind": "uri", "uri": uri})
     assert opened == ["https://example.com/", "mailto:a@example.com"]
     assert "not opened" in capsys.readouterr().out
+
+
+
+def test_a_search_after_the_file_changed_reloads_it_first(sample_pdf, tmp_path):
+    """The index was built from the file as it is now, the pages on
+    screen were the version before - follow mode checks only every few
+    seconds, and without it not at all - so the box for a match landed
+    where the text is in the new version, over the old page."""
+    import shutil
+
+    new_pdf = os.path.join(os.path.dirname(__file__), "fixtures", "sample_search_variants.pdf")
+    path = tmp_path / "doc.pdf"
+    shutil.copy(sample_pdf, path)
+    viewer = make_viewer(pdfless.PdfDocument(str(path)))
+    assert viewer.npages != pdfless.PdfDocument(new_pdf).page_count()
+
+    shutil.copy(new_pdf, path)
+    os.utime(path, (1, 1))  # a different mtime, however fast the copy was
+    dispatcher = pdfless._KeyDispatcher(viewer, -1, [], keep=False)
+    for key in "/表記ゆれ":
+        dispatcher.handle(key)
+    dispatcher.handle("\r")
+
+    # Reloaded before searching: the pages are the new version's, the
+    # same version the match came from.
+    assert viewer.npages == pdfless.PdfDocument(new_pdf).page_count()
+    assert viewer.search.matches
+
+def test_a_redraw_after_resuming_reloads_a_changed_file(sample_pdf, tmp_path):
+    """^Z and fg (or a resize) rasterized the pages again from the file
+    as it is now, while the search index, the page count and the rest
+    stayed the old version's - follow mode off, for good - so a search
+    drew its boxes over pages of another version."""
+    import shutil
+
+    new_pdf = os.path.join(os.path.dirname(__file__), "fixtures", "sample_search_variants.pdf")
+    path = tmp_path / "doc.pdf"
+    shutil.copy(sample_pdf, path)
+    viewer = make_viewer(pdfless.PdfDocument(str(path)))
+    viewer.search.ensure_index()
+    assert not viewer.follow
+
+    shutil.copy(new_pdf, path)
+    os.utime(path, (1, 1))
+    viewer.request_resize()  # what _suspend() does once resumed
+    viewer.refresh()
+
+    assert viewer.npages == pdfless.PdfDocument(new_pdf).page_count()
+    assert viewer.search.index is None  # dropped, to be built from the new version
+    assert not viewer.resized
+
+    # Unchanged since: a plain resize reads nothing again.
+    viewer.request_resize()
+    viewer.refresh()
+    assert not viewer.resized
+
+
+def _replaced_under_a_viewer(sample_pdf, tmp_path, continuous=False):
+    """A viewer showing a 7-page PDF that has since been replaced on disk
+    by a 3-page one, follow mode off - and the 3-page one's page count."""
+    import shutil
+
+    new_pdf = os.path.join(os.path.dirname(__file__), "fixtures", "sample_search_variants.pdf")
+    path = tmp_path / "doc.pdf"
+    shutil.copy(sample_pdf, path)
+    viewer = make_viewer(pdfless.PdfDocument(str(path)))
+    if continuous:
+        viewer.toggle_continuous()
+    viewer.search.ensure_index()
+    shutil.copy(new_pdf, path)
+    os.utime(path, (1, 1))
+    return viewer, pdfless.PdfDocument(new_pdf).page_count()
+
+
+def test_going_to_another_page_reloads_a_changed_file(sample_pdf, tmp_path):
+    """A page not shown before was rasterized from the file as it is now,
+    next to the old version's search index and page count."""
+    viewer, new_npages = _replaced_under_a_viewer(sample_pdf, tmp_path)
+    assert viewer.npages != new_npages
+    viewer.go_page(2, 0)
+    assert viewer.npages == new_npages
+    assert viewer.page == 2
+    assert viewer.search.index is None  # dropped, to be built from the new version
+
+
+def test_going_to_another_page_in_text_mode_reloads_a_changed_file(sample_pdf, tmp_path):
+    viewer, new_npages = _replaced_under_a_viewer(sample_pdf, tmp_path)
+    assert viewer.enter_text_mode()
+    assert viewer.npages == new_npages  # entering reads the text from the file too
+
+
+def test_scrolling_on_in_continuous_mode_reloads_a_changed_file(sample_pdf, tmp_path):
+    """The pages below are read from the file as they come into view."""
+    viewer, new_npages = _replaced_under_a_viewer(sample_pdf, tmp_path, continuous=True)
+    viewer.scroll_down(viewer.cell_h_px)
+    viewer.refresh()
+    assert viewer.npages == new_npages

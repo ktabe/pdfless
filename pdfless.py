@@ -8995,6 +8995,7 @@ class Viewer:
             _debug_log(f"page {page}: {outcome}")
 
     def _load_page(self) -> None:
+        self.catch_up_with_file()  # this page is read from the file again
         self.encode_cache.clear()
         self.img = self._page_image(self.page)
         self.crop_width = min(self.img.width, self.base_width_px)
@@ -9089,6 +9090,9 @@ class Viewer:
         (self._view_width, the widest page on screen - pages can differ
         in width under fit-to-height), self.crop_width/x_offset clamped
         to it, and self._view_height."""
+        # The pages below the current one may be read from the file for
+        # the first time (or were, by the page prefetch, already).
+        self.catch_up_with_file()
         gap = self._continuous_gap_px()
         layout = []
         top = -self.scroll
@@ -9376,8 +9380,8 @@ class Viewer:
             self.resized = False
             if loaded:
                 # (Not read again: a resize, or ^Z and fg - see
-                # _suspend() - isn't a change to the file; -f/--follow
-                # is what notices those.)
+                # _suspend() - isn't a change to the file; refresh()
+                # reloads it first if it has changed.)
                 self._scroll_to_text_line(top_line)
                 if at_top:
                     self.text_scroll = self.text_scroll_min
@@ -9402,6 +9406,14 @@ class Viewer:
                 # stay blank, and try again on the next redraw.
                 self.mark_file_missing()
             return
+        if self.resized:
+            # A resize, or ^Z and fg (see _suspend()), re-rasterizes the
+            # pages from the file on disk: if that has changed, reload it
+            # properly first (see catch_up_with_file()). A reload that
+            # went through drew everything at the new size already.
+            self.catch_up_with_file()
+            if not self.resized:
+                return
         self._load_content()
         if self.overlays.active is not None:
             self.overlays.draw()
@@ -9743,6 +9755,7 @@ class Viewer:
         self.page = self._text_page_of_line(self._top_text_line())
 
     def _load_text_page(self) -> None:
+        self.catch_up_with_file()  # the text is read from the file again
         if self._text_continuous():
             # extract_text_pages() is one pdftotext run over the whole
             # document - fetched once per file and kept (see __init__),
@@ -11372,6 +11385,47 @@ class Viewer:
         except OSError:
             return None
 
+    def catch_up_with_file(self) -> None:
+        """Reload the file if it has changed on disk since what's on
+        screen was read from it - before anything that reads it again
+        while follow mode may not have noticed the change yet: it only
+        checks every FOLLOW_INTERVAL seconds, and without it the file
+        isn't watched at all.
+
+        - A search about to be started (see _KeyDispatcher): its index
+          is built from the file as it is now (see _Search.ensure_index()),
+          while the pages on screen were the old version's - so the box
+          for a match landed where the text is in the new version, over
+          the old page.
+        - A redraw after a resize, or after ^Z and fg (see refresh()):
+          the page images are rasterized again, from the file as it is
+          now, while the search index, the page count, the text and the
+          links would stay the old version's - and, follow mode off,
+          stay so for good.
+        - A page about to be shown (see _load_page(),
+          _build_continuous_layout() and _load_text_page()): one not
+          shown before is read from the file as it is now - or was
+          already, by the page prefetch, so whether it's cached says
+          nothing - the same mix of versions. A reload is what follow
+          mode would have done; this does it at the moment it matters.
+
+        Cheap enough to call that often: one stat(), and a reload only
+        when the file has changed. Called on the main thread only (none
+        of those run on the prefetch threads), and a no-op inside the
+        reload itself, which has caught up by then.
+
+        Reloading keeps everything the same version - in either mode,
+        since a box in the wrong place is wrong either way.
+
+        A file that can't be read just now (mid save-as-replace) is left
+        to follow mode's own check, which knows what to do about it.
+        """
+        if self.file_missing:
+            return
+        mtime = self._current_mtime()
+        if mtime is not None and mtime != self._displayed_mtime:
+            self._reload_if_changed()
+
     def _start_following(self) -> None:
         """(Re)start follow mode's watch on the current file - whenever
         follow is turned on (-f, F, v) or switches to watching a
@@ -12021,6 +12075,7 @@ class _KeyDispatcher:
             self.search_editor = None
             if query:
                 self.last_search_query = query
+                viewer.catch_up_with_file()
                 viewer.search.start(query, backward=self.search_backward, multiline=editor.multiline)
             else:
                 viewer.draw_status()
